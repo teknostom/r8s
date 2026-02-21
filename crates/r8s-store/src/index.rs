@@ -1,11 +1,13 @@
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde_json::Value;
 
-#[derive(Default)]
+type LabelMap = FxHashMap<String, FxHashMap<String, FxHashSet<String>>>;
+
+#[derive(Default, Clone)]
 pub struct LabelIndex {
-    index: Mutex<FxHashMap<String, FxHashMap<String, FxHashSet<String>>>>,
+    index: Arc<Mutex<LabelMap>>,
 }
 
 pub struct FieldSelector {
@@ -39,12 +41,8 @@ impl LabelSelector {
             Requirement::NotEquals(key, value) => {
                 labels.and_then(|l| l.get(key)).and_then(|v| v.as_str()) != Some(value.as_str())
             }
-            Requirement::Exists(key) => {
-                labels.is_some_and(|l| l.contains_key(key))
-            }
-            Requirement::NotExists(key) => {
-                !labels.is_some_and(|l| l.contains_key(key))
-            }
+            Requirement::Exists(key) => labels.is_some_and(|l| l.contains_key(key)),
+            Requirement::NotExists(key) => !labels.is_some_and(|l| l.contains_key(key)),
         })
     }
 
@@ -120,7 +118,7 @@ fn extract_field(obj: &serde_json::Value, path: &str) -> Option<String> {
 impl LabelIndex {
     pub fn new() -> Self {
         Self {
-            index: Mutex::new(FxHashMap::default()),
+            index: Arc::new(Mutex::new(FxHashMap::default())),
         }
     }
 

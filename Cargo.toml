@@ -26,6 +26,7 @@ kube-core = "0.99"
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
+tokio-util = { version = "0.7", features = ["rt"] }
 
 # HTTP server
 axum = "0.8"
@@ -65,6 +66,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
+rand = "0.9"
 
 # Internal crates
 r8s-types = { path = "crates/r8s-types" }

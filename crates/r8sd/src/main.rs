@@ -1,8 +1,10 @@
 use std::{net::SocketAddr, path::PathBuf};
 
 use r8s_api::{ApiServer, bootstrap::bootstrap_namespaces};
+use r8s_controllers::ControllerManager;
 use r8s_store::Store;
 use r8s_types::registry::ResourceRegistry;
+use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -21,6 +23,13 @@ async fn main() -> anyhow::Result<()> {
 
     bootstrap_namespaces(&store)?;
 
+    let shutdown = CancellationToken::new();
+
+    // Start controllers before API server so watches are subscribed
+    // before any API-driven mutations
+    let mut controller_manager = ControllerManager::new(store.clone(), shutdown.clone());
+    controller_manager.start();
+
     let registry = ResourceRegistry::default_mvp();
     let server = ApiServer::new(store, registry);
     let addr: SocketAddr = "127.0.0.1:6443".parse()?;
@@ -36,7 +45,9 @@ async fn main() -> anyhow::Result<()> {
     // Wait for shutdown signal
     tokio::signal::ctrl_c().await?;
     tracing::info!("r8sd shutting down...");
+    shutdown.cancel();
     server_handle.abort();
+    controller_manager.shutdown().await;
 
     Ok(())
 }

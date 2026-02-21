@@ -16,6 +16,7 @@ const RESOURCES: TableDefinition<&str, &[u8]> = TableDefinition::new("resources"
 const REVISIONS: TableDefinition<u64, &[u8]> = TableDefinition::new("revisions");
 
 /// The main storage backend, wrapping redb with K8s-compatible semantics.
+#[derive(Clone)]
 pub struct Store {
     db: Arc<Database>,
     revision: RevisionCounter,

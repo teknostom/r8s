@@ -18,6 +18,7 @@ r8s-runtime.workspace = true
 r8s-network.workspace = true
 
 tokio.workspace = true
+tokio-util.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

@@ -1,5 +1,5 @@
 use std::collections::hash_map::Entry::*;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use rustc_hash::FxHashMap;
 use tokio::sync::broadcast;
@@ -20,15 +20,15 @@ pub struct WatchEvent {
     pub object: serde_json::Value,
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct WatchHub {
-    channels: Mutex<FxHashMap<String, broadcast::Sender<WatchEvent>>>,
+    channels: Arc<Mutex<FxHashMap<String, broadcast::Sender<WatchEvent>>>>,
 }
 
 impl WatchHub {
     pub fn new() -> Self {
         Self {
-            channels: Mutex::new(FxHashMap::default()),
+            channels: Arc::new(Mutex::new(FxHashMap::default())),
         }
     }
 
