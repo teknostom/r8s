@@ -846,13 +846,16 @@ name = "r8s-kubelet"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "k8s-openapi",
  "r8s-runtime",
  "r8s-store",
  "r8s-types",
+ "rustc-hash",
  "serde_json",
  "thiserror",
  "tokio",
+ "tokio-util",
  "tracing",
 ]
 
@@ -885,10 +888,13 @@ name = "r8s-scheduler"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "k8s-openapi",
  "r8s-store",
  "r8s-types",
+ "serde_json",
  "tokio",
+ "tokio-util",
  "tracing",
 ]
 

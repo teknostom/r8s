@@ -1,7 +1,8 @@
-use std::{net::SocketAddr, path::PathBuf};
+use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 
 use r8s_api::{ApiServer, bootstrap::bootstrap_namespaces};
 use r8s_controllers::ControllerManager;
+use r8s_runtime::MockRuntime;
 use r8s_store::Store;
 use r8s_types::registry::ResourceRegistry;
 use tokio_util::sync::CancellationToken;
@@ -30,6 +31,23 @@ async fn main() -> anyhow::Result<()> {
     let mut controller_manager = ControllerManager::new(store.clone(), shutdown.clone());
     controller_manager.start();
 
+    let scheduler_store = store.clone();
+    let scheduler_shutdown = shutdown.clone();
+    let scheduler_handle = tokio::spawn(async move {
+        if let Err(e) = r8s_scheduler::run(scheduler_store, scheduler_shutdown).await {
+            tracing::error!("scheduler error: {e}")
+        }
+    });
+
+    let runtime = Arc::new(MockRuntime::new());
+    let kubelet_store = store.clone();
+    let kubelet_shutdown = shutdown.clone();
+    let kubelet_handle = tokio::spawn(async move {
+        if let Err(e) = r8s_kubelet::run(kubelet_store, runtime, kubelet_shutdown).await {
+            tracing::error!("kubelet error: {e}");
+        }
+    });
+
     let registry = ResourceRegistry::default_mvp();
     let server = ApiServer::new(store, registry);
     let addr: SocketAddr = "127.0.0.1:6443".parse()?;
@@ -48,6 +66,8 @@ async fn main() -> anyhow::Result<()> {
     shutdown.cancel();
     server_handle.abort();
     controller_manager.shutdown().await;
+    let _ = scheduler_handle.await;
+    let _ = kubelet_handle.await;
 
     Ok(())
 }

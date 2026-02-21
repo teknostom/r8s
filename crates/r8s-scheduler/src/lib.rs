@@ -1,3 +1,3 @@
-pub mod scheduler;
+mod scheduler;
 
-pub use scheduler::Scheduler;
+pub use scheduler::run;

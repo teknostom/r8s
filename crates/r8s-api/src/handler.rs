@@ -66,7 +66,7 @@ fn create_impl(
     state: &AppState,
     ctx: &RouteContext,
     namespace: Option<&str>,
-    body: serde_json::Value,
+    mut body: serde_json::Value,
 ) -> Response {
     let name = match body["metadata"]["name"].as_str() {
         Some(n) => n.to_string(),
@@ -78,6 +78,10 @@ fn create_impl(
             );
         }
     };
+    // Ensure metadata.namespace matches the URL path namespace
+    if let Some(ns) = namespace {
+        body["metadata"]["namespace"] = serde_json::json!(ns);
+    }
     let resource_ref = ResourceRef {
         gvr: &ctx.resource_type.gvr,
         namespace,
