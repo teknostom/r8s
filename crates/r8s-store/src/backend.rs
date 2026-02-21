@@ -85,7 +85,7 @@ impl Store {
         let rev = self.revision.next();
         let metadata = obj["metadata"]
             .as_object_mut()
-            .expect("objects must have metadata");
+            .ok_or_else(|| anyhow::anyhow!("metadata must be an object"))?;
 
         metadata.insert(
             "resourceVersion".to_string(),
@@ -181,7 +181,7 @@ impl Store {
                     gvr: resource.gvr.key_prefix(),
                     name: resource.name.to_string(),
                     message: format!(
-                        "resourceVersion missmatch: stored={stored_rv}, incoming={incoming_rv}"
+                        "resourceVersion mismatch: stored={stored_rv}, incoming={incoming_rv}"
                     ),
                 }
                 .into());
@@ -193,7 +193,7 @@ impl Store {
         let mut obj = object.clone();
         let metadata = obj["metadata"]
             .as_object_mut()
-            .expect("objects must have metadata");
+            .ok_or_else(|| anyhow::anyhow!("metadata must be an object"))?;
 
         metadata.insert(
             "resourceVersion".to_string(),
@@ -249,7 +249,7 @@ impl Store {
         {
             let mut table = w_transaction.open_table(REVISIONS)?;
             let rev_entry = serde_json::json!({
-                "type": "DELETE",
+                "type": "DELETED",
                 "key": key,
                 "object": obj,
             });
@@ -328,8 +328,13 @@ impl Store {
                 continue;
             }
             let item: serde_json::Value = serde_json::from_slice(value.value())?;
+            if let Some(ls) = label_selector
+                && !ls.matches(&item)
+            {
+                continue;
+            }
             if let Some(fs) = field_selector
-                && !(fs.matches(&item))
+                && !fs.matches(&item)
             {
                 continue;
             }

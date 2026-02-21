@@ -29,6 +29,25 @@ pub struct LabelSelector {
 }
 
 impl LabelSelector {
+    /// Check if an object's labels satisfy all requirements.
+    pub fn matches(&self, object: &serde_json::Value) -> bool {
+        let labels = object["metadata"]["labels"].as_object();
+        self.requirements.iter().all(|req| match req {
+            Requirement::Equals(key, value) => {
+                labels.and_then(|l| l.get(key)).and_then(|v| v.as_str()) == Some(value.as_str())
+            }
+            Requirement::NotEquals(key, value) => {
+                labels.and_then(|l| l.get(key)).and_then(|v| v.as_str()) != Some(value.as_str())
+            }
+            Requirement::Exists(key) => {
+                labels.is_some_and(|l| l.contains_key(key))
+            }
+            Requirement::NotExists(key) => {
+                !labels.is_some_and(|l| l.contains_key(key))
+            }
+        })
+    }
+
     pub fn parse(s: &str) -> anyhow::Result<Self> {
         if s.is_empty() {
             return Ok(Self {

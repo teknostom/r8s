@@ -23,7 +23,7 @@ pub async fn get_version() -> Response {
         "major": "1",
         "minor": "32",
         "gitVersion": "v1.32.0-r8s",
-        "platform": "linux/amd64",
+        "platform": format!("{}/{}", std::env::consts::OS, std::env::consts::ARCH),
     }))
 }
 
