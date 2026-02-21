@@ -25,6 +25,7 @@ kube-core = "0.99"
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
 
 # HTTP server
 axum = "0.8"

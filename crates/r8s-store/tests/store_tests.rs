@@ -186,10 +186,7 @@ async fn update_existing() {
     // resourceVersion must have changed
     assert_ne!(rv1, rv2);
     // Image should be updated
-    assert_eq!(
-        updated["spec"]["containers"][0]["image"],
-        "nginx:latest"
-    );
+    assert_eq!(updated["spec"]["containers"][0]["image"], "nginx:latest");
 }
 
 #[tokio::test]
@@ -308,7 +305,9 @@ async fn list_all_in_namespace() {
         store.create(rref, &obj).unwrap();
     }
 
-    let result = store.list(&gvr, Some("default"), None, None, None, None).unwrap();
+    let result = store
+        .list(&gvr, Some("default"), None, None, None, None)
+        .unwrap();
     assert_eq!(result.items.len(), 3);
     assert!(result.continue_token.is_none());
 }
@@ -335,7 +334,9 @@ async fn list_filters_by_namespace() {
     };
     store.create(rref, &obj_b).unwrap();
 
-    let result = store.list(&gvr, Some("ns-a"), None, None, None, None).unwrap();
+    let result = store
+        .list(&gvr, Some("ns-a"), None, None, None, None)
+        .unwrap();
     assert_eq!(result.items.len(), 1);
     assert_eq!(result.items[0]["metadata"]["name"], "pod-a");
 
@@ -558,7 +559,10 @@ async fn revision_survives_reopen() {
         .parse()
         .unwrap();
 
-    assert!(rv2 > rv1, "revision should be higher after reopen (rv1={rv1}, rv2={rv2})");
+    assert!(
+        rv2 > rv1,
+        "revision should be higher after reopen (rv1={rv1}, rv2={rv2})"
+    );
 }
 
 // ── LabelSelector parsing ────────────────────────────────────────────

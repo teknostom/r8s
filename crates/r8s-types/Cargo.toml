@@ -6,5 +6,6 @@ edition.workspace = true
 [dependencies]
 k8s-openapi.workspace = true
 kube-core.workspace = true
+rustc-hash.workspace = true
 serde.workspace = true
 serde_json.workspace = true

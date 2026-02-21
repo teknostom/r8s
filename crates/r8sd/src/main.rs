@@ -1,3 +1,8 @@
+use std::{net::SocketAddr, path::PathBuf};
+
+use r8s_api::{ApiServer, bootstrap::bootstrap_namespaces};
+use r8s_store::Store;
+use r8s_types::registry::ResourceRegistry;
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -8,18 +13,30 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("r8sd starting...");
 
-    // TODO: Phase 1 - Initialize store (redb)
-    // TODO: Phase 2 - Start API server (axum)
-    // TODO: Phase 3 - Bootstrap default resources (namespaces, node)
-    // TODO: Phase 4 - Start kubelet (container runtime)
-    // TODO: Phase 5 - Start controllers
-    // TODO: Phase 6 - Start networking (proxy, DNS)
+    let data_dir =
+        PathBuf::from(std::env::var("R8S_DATA_DIR").unwrap_or_else(|_| "/tmp/r8s".to_string()));
+
+    std::fs::create_dir_all(&data_dir)?;
+    let store = Store::open(&data_dir.join("store.db"))?;
+
+    bootstrap_namespaces(&store)?;
+
+    let registry = ResourceRegistry::default_mvp();
+    let server = ApiServer::new(store, registry);
+    let addr: SocketAddr = "127.0.0.1:6443".parse()?;
+
+    let server_handle = tokio::spawn(async move {
+        if let Err(e) = server.serve(addr).await {
+            tracing::error!("API server error: {e}");
+        }
+    });
 
     tracing::info!("r8sd ready");
 
     // Wait for shutdown signal
     tokio::signal::ctrl_c().await?;
     tracing::info!("r8sd shutting down...");
+    server_handle.abort();
 
     Ok(())
 }
