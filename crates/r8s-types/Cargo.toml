@@ -1,0 +1,10 @@
+[package]
+name = "r8s-types"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+k8s-openapi.workspace = true
+kube-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true

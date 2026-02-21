@@ -1,0 +1,23 @@
+[package]
+name = "r8sd"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "r8sd"
+path = "src/main.rs"
+
+[dependencies]
+r8s-types.workspace = true
+r8s-store.workspace = true
+r8s-api.workspace = true
+r8s-controllers.workspace = true
+r8s-scheduler.workspace = true
+r8s-kubelet.workspace = true
+r8s-runtime.workspace = true
+r8s-network.workspace = true
+
+tokio.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

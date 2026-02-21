@@ -1,0 +1,76 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/r8s",
+    "crates/r8sd",
+    "crates/r8s-types",
+    "crates/r8s-store",
+    "crates/r8s-api",
+    "crates/r8s-controllers",
+    "crates/r8s-scheduler",
+    "crates/r8s-kubelet",
+    "crates/r8s-runtime",
+    "crates/r8s-network",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+# K8s types
+k8s-openapi = { version = "0.24", features = ["v1_32"] }
+kube-core = "0.99"
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# HTTP server
+axum = "0.8"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+hyper = { version = "1", features = ["full"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+
+# Storage
+redb = "2"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Networking
+# rtnetlink = "0.14"
+# nftnl = "0.6"
+# hickory-server = "0.25"
+
+# Container runtime
+# oci-spec = "0.7"
+
+# Encoding
+base64 = "0.22"
+
+# Hashing
+rustc-hash = "2"
+
+# Utilities
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+
+# Internal crates
+r8s-types = { path = "crates/r8s-types" }
+r8s-store = { path = "crates/r8s-store" }
+r8s-api = { path = "crates/r8s-api" }
+r8s-controllers = { path = "crates/r8s-controllers" }
+r8s-scheduler = { path = "crates/r8s-scheduler" }
+r8s-kubelet = { path = "crates/r8s-kubelet" }
+r8s-runtime = { path = "crates/r8s-runtime" }
+r8s-network = { path = "crates/r8s-network" }

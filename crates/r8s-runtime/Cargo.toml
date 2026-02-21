@@ -1,0 +1,12 @@
+[package]
+name = "r8s-runtime"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tokio.workspace = true
+rustc-hash.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+serde.workspace = true

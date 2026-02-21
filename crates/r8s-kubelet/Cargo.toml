@@ -1,0 +1,16 @@
+[package]
+name = "r8s-kubelet"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+r8s-types.workspace = true
+r8s-store.workspace = true
+r8s-runtime.workspace = true
+
+tokio.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+k8s-openapi.workspace = true
+serde_json.workspace = true
