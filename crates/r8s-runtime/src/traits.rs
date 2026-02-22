@@ -53,4 +53,6 @@ pub trait ContainerRuntime: Send + Sync {
         &self,
         id: &ContainerId,
     ) -> impl Future<Output = anyhow::Result<ContainerStatus>> + Send;
+
+    fn container_pid(&self, id: &ContainerId) -> impl Future<Output = anyhow::Result<u32>> + Send;
 }

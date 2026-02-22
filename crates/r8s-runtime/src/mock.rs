@@ -90,4 +90,8 @@ impl ContainerRuntime for MockRuntime {
             None => anyhow::bail!("container not found: {}", id.0),
         }
     }
+
+    async fn container_pid(&self, _id: &ContainerId) -> anyhow::Result<u32> {
+        anyhow::bail!("mock runtime has no container PIDs")
+    }
 }

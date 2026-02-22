@@ -256,7 +256,12 @@ pub fn extract_cells(resource: &str, obj: &Value) -> Vec<Value> {
             let secret_type = obj["type"].as_str().unwrap_or("Opaque");
             let data_count = obj["data"].as_object().map(|m| m.len()).unwrap_or(0);
             let age = format_age(obj["metadata"]["creationTimestamp"].as_str());
-            vec![json!(name), json!(secret_type), json!(data_count), json!(age)]
+            vec![
+                json!(name),
+                json!(secret_type),
+                json!(data_count),
+                json!(age),
+            ]
         }
         "endpoints" => {
             let name = obj["metadata"]["name"].as_str().unwrap_or("");

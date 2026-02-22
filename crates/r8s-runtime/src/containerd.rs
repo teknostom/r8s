@@ -7,8 +7,8 @@ use containerd_client::{
         content_client::ContentClient,
         images_client::ImagesClient,
         snapshots::{
-            snapshots_client::SnapshotsClient, MountsRequest, PrepareSnapshotRequest,
-            RemoveSnapshotRequest,
+            MountsRequest, PrepareSnapshotRequest, RemoveSnapshotRequest,
+            snapshots_client::SnapshotsClient,
         },
         tasks_client::TasksClient,
         transfer_client::TransferClient,
@@ -21,7 +21,7 @@ use containerd_client::{
 };
 use oci_spec::runtime::{
     Capability, LinuxBuilder, LinuxCapabilitiesBuilder, LinuxNamespaceBuilder, LinuxNamespaceType,
-    ProcessBuilder, RootBuilder, SpecBuilder, get_default_mounts,
+    MountBuilder, ProcessBuilder, RootBuilder, SpecBuilder, get_default_mounts,
 };
 use sha2::{Digest, Sha256};
 
@@ -149,7 +149,11 @@ struct ImageInfo {
 fn json_string_array(value: &serde_json::Value) -> Vec<String> {
     value
         .as_array()
-        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -160,7 +164,12 @@ fn normalize_image_ref(image: &str) -> String {
         format!("docker.io/library/{image}")
     };
 
-    if with_registry.split('/').next_back().unwrap_or("").contains(':') {
+    if with_registry
+        .split('/')
+        .next_back()
+        .unwrap_or("")
+        .contains(':')
+    {
         with_registry
     } else {
         format!("{with_registry}:latest")
@@ -274,7 +283,18 @@ fn build_oci_spec(config: &ContainerConfig, image: &ImageInfo) -> anyhow::Result
                 .capabilities(capabilities)
                 .build()?,
         )
-        .mounts(get_default_mounts())
+        .mounts({
+            let mut mounts = get_default_mounts();
+            mounts.push(
+                MountBuilder::default()
+                .destination("/etc/resolv.conf")
+                .source("/tmp/r8s/resolv.conf")
+                .typ("bind")
+                .options(vec!["rbind".into(), "ro".into()])
+                .build()?,
+            );
+            mounts
+        })
         .linux(
             LinuxBuilder::default()
                 .namespaces(vec![
@@ -455,11 +475,8 @@ impl ContainerRuntime for ContainerdRuntime {
             container_id: id.0.clone(),
             ..Default::default()
         };
-        let wait_result = tokio::time::timeout(
-            timeout,
-            tasks.wait(with_namespace!(wait_req, NAMESPACE)),
-        )
-        .await;
+        let wait_result =
+            tokio::time::timeout(timeout, tasks.wait(with_namespace!(wait_req, NAMESPACE))).await;
 
         if wait_result.is_err() {
             // Timeout — force kill
@@ -504,9 +521,7 @@ impl ContainerRuntime for ContainerdRuntime {
             .await;
 
         // Delete container metadata
-        let req = DeleteContainerRequest {
-            id: id.0.clone(),
-        };
+        let req = DeleteContainerRequest { id: id.0.clone() };
         let _ = ContainersClient::new(self.channel.clone())
             .delete(with_namespace!(req, NAMESPACE))
             .await;
@@ -547,5 +562,20 @@ impl ContainerRuntime for ContainerdRuntime {
                 _ => None,
             },
         })
+    }
+
+    async fn container_pid(&self, id: &ContainerId) -> anyhow::Result<u32> {
+        let req = GetRequest {
+            container_id: id.0.clone(),
+            ..Default::default()
+        };
+        let resp = TasksClient::new(self.channel.clone())
+            .get(with_namespace!(req, NAMESPACE))
+            .await?;
+        let process = resp
+            .into_inner()
+            .process
+            .ok_or_else(|| anyhow::anyhow!("no process info"))?;
+        Ok(process.pid)
     }
 }

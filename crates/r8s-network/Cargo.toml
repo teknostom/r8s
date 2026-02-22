@@ -8,6 +8,8 @@ r8s-types.workspace = true
 r8s-store.workspace = true
 
 tokio.workspace = true
+tokio-util.workspace = true
+serde_json.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

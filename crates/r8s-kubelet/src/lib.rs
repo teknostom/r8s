@@ -210,6 +210,18 @@ async fn reconcile_pod<R: ContainerRuntime>(
         container_ids.push(container_id);
     }
 
+    if !container_ids.is_empty() {
+        match runtime.container_pid(&container_ids[0]).await {
+            Ok(pid) => {
+                let pod_ip = format!("10.244.0.{pod_ip_num}");
+                if let Err(e) = r8s_network::bridge::setup_pod_network(pid, &pod_ip, pod_name) {
+                    tracing::error!("pod '{pod_name}': network setup failed: {e}");
+                }
+            }
+            Err(e) => tracing::warn!("pod '{pod_name}': network setup failed: {e}"),
+        }
+    }
+
     pod_containers.insert(pod_uid.clone(), PodContainers { container_ids });
     update_pod_status(
         store,
@@ -336,6 +348,7 @@ async fn handle_pod_deleted<R: ContainerRuntime>(
             let _ = runtime.stop_container(cid, Duration::from_secs(10)).await;
             let _ = runtime.remove_container(cid).await;
         }
+        r8s_network::bridge::teardown_pod_network(pod_name);
         tracing::info!(
             "pod '{pod_name}: cleaned up {} containers",
             pc.container_ids.len()

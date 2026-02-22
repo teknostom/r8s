@@ -39,6 +39,32 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
+    r8s_network::bridge::setup_bridge()?;
+    r8s_network::proxy::setup_nat_table()?;
+
+    let dns_store = store.clone();
+    let dns_shutdown = shutdown.clone();
+    let dns_handle = tokio::spawn(async move {
+        if let Err(e) = r8s_network::dns::run_dns_server(dns_store, dns_shutdown).await {
+            tracing::error!("DNS server error: {e}");
+        }
+    });
+
+    let proxy_store = store.clone();
+    let proxy_shutdown = shutdown.clone();
+    let proxy_handle = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = proxy_shutdown.cancelled() => break,
+                _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                    if let Err(e) = r8s_network::proxy::sync_service_rules(&proxy_store) {
+                        tracing::warn!("service proxy sync: {e}");
+                    }
+                }
+            }
+        }
+    });
+
     let runtime_type = std::env::var("R8S_RUNTIME").unwrap_or_else(|_| "containerd".to_string());
     let kubelet_handle = match runtime_type.as_str() {
         "mock" => {
@@ -71,10 +97,14 @@ async fn main() -> anyhow::Result<()> {
     tokio::signal::ctrl_c().await?;
     tracing::info!("r8sd shutting down...");
     shutdown.cancel();
+    r8s_network::bridge::cleanup();
+    r8s_network::proxy::cleanup();
     server_handle.abort();
     controller_manager.shutdown().await;
     let _ = scheduler_handle.await;
     let _ = kubelet_handle.await;
+    let _ = dns_handle.await;
+    let _ = proxy_handle.await;
 
     Ok(())
 }

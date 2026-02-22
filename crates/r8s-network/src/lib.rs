@@ -1,6 +1,9 @@
 //! Pod networking, service proxy, and embedded DNS.
 //!
-//! - `cni`: bridge + veth pair setup for pod networking (via rtnetlink)
-//! - `proxy`: nftables DNAT rules for Service ClusterIP/NodePort
-//! - `dns`: embedded hickory-dns server for cluster service discovery
-//! - `allocator`: IP and port allocation from configured CIDRs
+//! - `bridge`: bridge + veth pair setup for pod networking (shells out to `ip`/`nsenter`)
+//! - `proxy`: nftables DNAT rules for Service ClusterIP (shells out to `nft`)
+//! - `dns`: embedded UDP DNS server for cluster service discovery
+
+pub mod bridge;
+pub mod dns;
+pub mod proxy;
