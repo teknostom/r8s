@@ -540,3 +540,197 @@ pub async fn pod_logs_ns(
         .body(Body::from(output))
         .unwrap()
 }
+
+/// Look up a [`RouteContext`] for a dynamically registered CRD resource.
+fn lookup_crd_context(
+    state: &AppState,
+    group: &str,
+    version: &str,
+    resource: &str,
+) -> Option<RouteContext> {
+    let gvr = r8s_types::GroupVersionResource::new(group, version, resource);
+    state
+        .registry
+        .read()
+        .expect("registry lock poisoned")
+        .get_by_gvr(&gvr)
+        .map(|rt| RouteContext {
+            resource_type: Arc::new(rt.clone()),
+        })
+}
+
+fn crd_not_found(resource: &str) -> Response {
+    status_error(
+        StatusCode::NOT_FOUND,
+        "NotFound",
+        &format!("the server doesn't have a resource type '{resource}'"),
+    )
+}
+
+// ── Dynamic handlers for cluster-scoped CRD resources ──────────────────────
+
+pub async fn dynamic_list_cluster(
+    State(state): State<AppState>,
+    Path((group, version, resource)): Path<(String, String, String)>,
+    Query(params): Query<ListParams>,
+    headers: HeaderMap,
+) -> Response {
+    let ctx = match lookup_crd_context(&state, &group, &version, &resource) {
+        Some(c) => c,
+        None => return crd_not_found(&resource),
+    };
+    list_impl(&state, &ctx, None, params, &headers)
+}
+
+pub async fn dynamic_create_cluster(
+    State(state): State<AppState>,
+    Path((group, version, resource)): Path<(String, String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let body = match require_json(&headers, &body) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let ctx = match lookup_crd_context(&state, &group, &version, &resource) {
+        Some(c) => c,
+        None => return crd_not_found(&resource),
+    };
+    create_impl(&state, &ctx, None, body)
+}
+
+pub async fn dynamic_get_cluster(
+    State(state): State<AppState>,
+    Path((group, version, resource, name)): Path<(String, String, String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    let ctx = match lookup_crd_context(&state, &group, &version, &resource) {
+        Some(c) => c,
+        None => return crd_not_found(&resource),
+    };
+    get_impl(&state, &ctx, None, &name, &headers)
+}
+
+pub async fn dynamic_update_cluster(
+    State(state): State<AppState>,
+    Path((group, version, resource, name)): Path<(String, String, String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let body = match require_json(&headers, &body) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let ctx = match lookup_crd_context(&state, &group, &version, &resource) {
+        Some(c) => c,
+        None => return crd_not_found(&resource),
+    };
+    update_impl(&state, &ctx, None, &name, body)
+}
+
+pub async fn dynamic_patch_cluster(
+    State(state): State<AppState>,
+    Path((group, version, resource, name)): Path<(String, String, String, String)>,
+    body: Bytes,
+) -> Response {
+    let ctx = match lookup_crd_context(&state, &group, &version, &resource) {
+        Some(c) => c,
+        None => return crd_not_found(&resource),
+    };
+    patch_impl(&state, &ctx, None, &name, body)
+}
+
+pub async fn dynamic_delete_cluster(
+    State(state): State<AppState>,
+    Path((group, version, resource, name)): Path<(String, String, String, String)>,
+) -> Response {
+    let ctx = match lookup_crd_context(&state, &group, &version, &resource) {
+        Some(c) => c,
+        None => return crd_not_found(&resource),
+    };
+    delete_impl(&state, &ctx, None, &name)
+}
+
+// ── Dynamic handlers for namespace-scoped CRD resources ────────────────────
+
+pub async fn dynamic_list_ns(
+    State(state): State<AppState>,
+    Path((group, version, ns, resource)): Path<(String, String, String, String)>,
+    Query(params): Query<ListParams>,
+    headers: HeaderMap,
+) -> Response {
+    let ctx = match lookup_crd_context(&state, &group, &version, &resource) {
+        Some(c) => c,
+        None => return crd_not_found(&resource),
+    };
+    list_impl(&state, &ctx, Some(&ns), params, &headers)
+}
+
+pub async fn dynamic_create_ns(
+    State(state): State<AppState>,
+    Path((group, version, ns, resource)): Path<(String, String, String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let body = match require_json(&headers, &body) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let ctx = match lookup_crd_context(&state, &group, &version, &resource) {
+        Some(c) => c,
+        None => return crd_not_found(&resource),
+    };
+    create_impl(&state, &ctx, Some(&ns), body)
+}
+
+pub async fn dynamic_get_ns(
+    State(state): State<AppState>,
+    Path((group, version, ns, resource, name)): Path<(String, String, String, String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    let ctx = match lookup_crd_context(&state, &group, &version, &resource) {
+        Some(c) => c,
+        None => return crd_not_found(&resource),
+    };
+    get_impl(&state, &ctx, Some(&ns), &name, &headers)
+}
+
+pub async fn dynamic_update_ns(
+    State(state): State<AppState>,
+    Path((group, version, ns, resource, name)): Path<(String, String, String, String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let body = match require_json(&headers, &body) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let ctx = match lookup_crd_context(&state, &group, &version, &resource) {
+        Some(c) => c,
+        None => return crd_not_found(&resource),
+    };
+    update_impl(&state, &ctx, Some(&ns), &name, body)
+}
+
+pub async fn dynamic_patch_ns(
+    State(state): State<AppState>,
+    Path((group, version, ns, resource, name)): Path<(String, String, String, String, String)>,
+    body: Bytes,
+) -> Response {
+    let ctx = match lookup_crd_context(&state, &group, &version, &resource) {
+        Some(c) => c,
+        None => return crd_not_found(&resource),
+    };
+    patch_impl(&state, &ctx, Some(&ns), &name, body)
+}
+
+pub async fn dynamic_delete_ns(
+    State(state): State<AppState>,
+    Path((group, version, ns, resource, name)): Path<(String, String, String, String, String)>,
+) -> Response {
+    let ctx = match lookup_crd_context(&state, &group, &version, &resource) {
+        Some(c) => c,
+        None => return crd_not_found(&resource),
+    };
+    delete_impl(&state, &ctx, Some(&ns), &name)
+}

@@ -1,3 +1,4 @@
+pub mod crd;
 pub mod deployment;
 pub mod endpoints;
 pub mod gc;

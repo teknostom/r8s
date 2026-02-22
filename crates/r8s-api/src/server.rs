@@ -16,8 +16,13 @@ use crate::{
         get_group_version_resources, get_version,
     },
     handler::{
-        RouteContext, create_cluster, create_ns, delete_cluster, delete_ns, get_cluster, get_ns,
-        list_all_ns, list_cluster, list_ns, patch_cluster, patch_ns, update_cluster, update_ns, pod_logs_ns
+        RouteContext,
+        create_cluster, create_ns, delete_cluster, delete_ns, get_cluster, get_ns,
+        list_all_ns, list_cluster, list_ns, patch_cluster, patch_ns, update_cluster, update_ns,
+        pod_logs_ns,
+        dynamic_create_cluster, dynamic_create_ns, dynamic_delete_cluster, dynamic_delete_ns,
+        dynamic_get_cluster, dynamic_get_ns, dynamic_list_cluster, dynamic_list_ns,
+        dynamic_patch_cluster, dynamic_patch_ns, dynamic_update_cluster, dynamic_update_ns,
     },
 };
 
@@ -43,7 +48,7 @@ pub struct ApiServer {
 }
 
 impl ApiServer {
-    pub fn new(store: Store, registry: ResourceRegistry) -> Self {
+    pub fn new(store: Store, registry: Arc<std::sync::RwLock<ResourceRegistry>>) -> Self {
         Self {
             state: Arc::new(ApiState { store, registry }),
         }
@@ -64,7 +69,7 @@ impl ApiServer {
                 "/apis/authorization.k8s.io/v1/selfsubjectrulesreviews",
                 post(self_subject_rules_review),
             );
-        for rt in self.state.registry.iter() {
+        for rt in self.state.registry.read().expect("registry lock poisoned").iter().cloned().collect::<Vec<_>>() {
             let ctx = RouteContext {
                 resource_type: Arc::new(rt.clone()),
             };
@@ -116,6 +121,32 @@ impl ApiServer {
                     );
             }
         }
+
+        // Dynamic routes for CRD-defined custom resources.
+        // These have lower priority than the static routes registered above for MVP resources.
+        router = router
+            .route(
+                "/apis/{group}/{version}/{resource}",
+                get(dynamic_list_cluster).post(dynamic_create_cluster),
+            )
+            .route(
+                "/apis/{group}/{version}/{resource}/{name}",
+                get(dynamic_get_cluster)
+                    .put(dynamic_update_cluster)
+                    .patch(dynamic_patch_cluster)
+                    .delete(dynamic_delete_cluster),
+            )
+            .route(
+                "/apis/{group}/{version}/namespaces/{ns}/{resource}",
+                get(dynamic_list_ns).post(dynamic_create_ns),
+            )
+            .route(
+                "/apis/{group}/{version}/namespaces/{ns}/{resource}/{name}",
+                get(dynamic_get_ns)
+                    .put(dynamic_update_ns)
+                    .patch(dynamic_patch_ns)
+                    .delete(dynamic_delete_ns),
+            );
 
         let router = router
             .with_state(self.state)

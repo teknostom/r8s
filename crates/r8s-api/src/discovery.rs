@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use axum::{
     extract::{Path, State},
@@ -15,7 +15,7 @@ pub type AppState = Arc<ApiState>;
 
 pub struct ApiState {
     pub store: Store,
-    pub registry: ResourceRegistry,
+    pub registry: Arc<RwLock<ResourceRegistry>>,
 }
 
 pub async fn get_version() -> Response {
@@ -41,7 +41,7 @@ pub async fn get_api_groups(State(state): State<AppState>) -> Response {
     let mut seen = FxHashSet::default();
     let mut groups = Vec::new();
 
-    for rt in state.registry.iter() {
+    for rt in state.registry.read().expect("registry lock poisoned").iter() {
         if rt.gvr.group.is_empty() || !seen.insert(rt.gvr.group.clone()) {
             continue;
         }
@@ -118,6 +118,8 @@ fn api_resource_list(state: &ApiState, group: &str, version: &str) -> Response {
 
     let resources: Vec<serde_json::Value> = state
         .registry
+        .read()
+        .expect("registry lock poisoned")
         .resources_for_group_version(group, version)
         .into_iter()
         .map(|rt| {

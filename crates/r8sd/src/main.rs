@@ -26,9 +26,15 @@ async fn main() -> anyhow::Result<()> {
 
     let shutdown = CancellationToken::new();
 
+    // Shared registry: both the controller manager (CRD controller) and the
+    // API server hold a reference so that CRDs created at runtime are
+    // immediately visible to the dynamic API routes.
+    let registry = Arc::new(std::sync::RwLock::new(ResourceRegistry::default_mvp()));
+
     // Start controllers before API server so watches are subscribed
     // before any API-driven mutations
-    let mut controller_manager = ControllerManager::new(store.clone(), shutdown.clone());
+    let mut controller_manager =
+        ControllerManager::new(store.clone(), shutdown.clone(), registry.clone());
     controller_manager.start();
 
     let scheduler_store = store.clone();
@@ -55,7 +61,6 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    let registry = ResourceRegistry::default_mvp();
     let server = ApiServer::new(store, registry);
     let addr: SocketAddr = "127.0.0.1:6443".parse()?;
 
