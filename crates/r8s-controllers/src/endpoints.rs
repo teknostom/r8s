@@ -13,6 +13,10 @@ fn ep_gvr() -> GroupVersionResource {
     GroupVersionResource::new("", "v1", "endpoints")
 }
 
+fn es_gvr() -> GroupVersionResource {
+    GroupVersionResource::new("discovery.k8s.io", "v1", "endpointslices")
+}
+
 fn pods_gvr() -> GroupVersionResource {
     GroupVersionResource::new("", "v1", "pods")
 }
@@ -161,6 +165,49 @@ fn reconcile_service(store: &Store, service: &serde_json::Value) -> anyhow::Resu
         }
         None => {
             let _ = store.create(rref, &ep);
+        }
+    }
+
+    // Also create/update EndpointSlice (used by Traefik v3 and newer controllers)
+    let es_gvr = es_gvr();
+    let es_ref = ResourceRef {
+        gvr: &es_gvr,
+        namespace: svc_ns,
+        name: svc_name,
+    };
+    let es = serde_json::json!({
+        "apiVersion": "discovery.k8s.io/v1",
+        "kind": "EndpointSlice",
+        "metadata": {
+            "name": svc_name,
+            "namespace": svc_ns,
+            "labels": {
+                "kubernetes.io/service-name": svc_name,
+            },
+            "ownerReferences": [{
+                "apiVersion": "v1",
+                "kind": "Service",
+                "name": svc_name,
+                "uid": svc_uid,
+                "controller": true,
+                "blockOwnerDeletion": true,
+            }],
+        },
+        "addressType": "IPv4",
+        "endpoints": addresses.iter().map(|a| {
+            serde_json::json!({
+                "addresses": [a["ip"]],
+                "conditions": {"ready": true},
+            })
+        }).collect::<Vec<_>>(),
+        "ports": ports,
+    });
+    match store.get(&es_ref)? {
+        Some(_) => {
+            let _ = store.update(&es_ref, &es);
+        }
+        None => {
+            let _ = store.create(es_ref, &es);
         }
     }
 

@@ -155,6 +155,16 @@ pub fn sync_service_rules(store: &Store) -> anyhow::Result<()> {
                 "to",
                 &dnat_target,
             ]);
+            // LoadBalancer: DNAT external traffic (non-bridge) on the service port to the pod
+            let svc_type = svc["spec"]["type"].as_str().unwrap_or("ClusterIP");
+            if svc_type == "LoadBalancer" {
+                let _ = nft(&[
+                    "add", "rule", "ip", "r8s", "prerouting",
+                    "iifname", "!=", "r8s0",
+                    &proto, "dport", &svc_port_str,
+                    "dnat", "to", &dnat_target,
+                ]);
+            }
         }
     }
 

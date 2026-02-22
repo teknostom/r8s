@@ -1,6 +1,6 @@
 use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 
-use r8s_api::{ApiServer, bootstrap::bootstrap_namespaces};
+use r8s_api::{ApiServer, bootstrap::{bootstrap_namespaces, bootstrap_traefik}};
 use r8s_controllers::ControllerManager;
 use r8s_runtime::{ContainerRuntime, MockRuntime, containerd::ContainerdRuntime};
 use r8s_store::Store;
@@ -23,6 +23,7 @@ async fn main() -> anyhow::Result<()> {
     let store = Store::open(&data_dir.join("store.db"))?;
 
     bootstrap_namespaces(&store)?;
+    bootstrap_traefik(&store)?;
 
     let shutdown = CancellationToken::new();
 
@@ -83,7 +84,7 @@ async fn main() -> anyhow::Result<()> {
 
     let registry = ResourceRegistry::default_mvp();
     let server = ApiServer::new(store, registry);
-    let addr: SocketAddr = "127.0.0.1:6443".parse()?;
+    let addr: SocketAddr = "0.0.0.0:6443".parse()?;
 
     let server_handle = tokio::spawn(async move {
         if let Err(e) = server.serve(addr).await {

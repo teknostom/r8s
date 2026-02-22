@@ -172,18 +172,24 @@ async fn reconcile_pod<R: ContainerRuntime>(
                         .collect()
                 })
                 .unwrap_or_default(),
-            env: container_spec["env"]
-                .as_array()
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|e| {
-                            let name = e["name"].as_str()?;
-                            let value = e["value"].as_str().unwrap_or("");
-                            Some((name.to_string(), value.to_string()))
-                        })
-                        .collect()
-                })
-                .unwrap_or_default(),
+            env: {
+                let mut env: Vec<(String, String)> = container_spec["env"]
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|e| {
+                                let name = e["name"].as_str()?;
+                                let value = e["value"].as_str().unwrap_or("");
+                                Some((name.to_string(), value.to_string()))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                env.push(("KUBERNETES_SERVICE_HOST".into(), "10.244.0.1".into()));
+                env.push(("KUBERNETES_SERVICE_PORT".into(), "443".into()));
+                env.push(("KUBERNETES_SERVICE_PORT_HTTPS".into(), "443".into()));
+                env
+            },
             working_dir: container_spec["workingDir"].as_str().map(String::from),
         };
 

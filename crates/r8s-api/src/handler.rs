@@ -413,10 +413,17 @@ fn watch_impl(state: &AppState, ctx: &RouteContext, namespace: Option<&str>) -> 
         .map(|obj| Ok::<_, std::io::Error>(response::watch_event_line("ADDED", &obj)));
     let initial_stream = tokio_stream::iter(initial);
 
+    let api_version = if ctx.resource_type.gvr.group.is_empty() {
+        ctx.resource_type.gvr.version.clone()
+    } else {
+        format!("{}/{}", ctx.resource_type.gvr.group, ctx.resource_type.gvr.version)
+    };
     let bookmark = tokio_stream::iter(std::iter::once(Ok::<_, std::io::Error>(
         response::watch_event_line(
             "BOOKMARK",
             &serde_json::json!({
+                "apiVersion": api_version,
+                "kind": ctx.resource_type.kind,
                 "metadata": {"resourceVersion": rv.to_string()}
             }),
         ),

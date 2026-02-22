@@ -293,6 +293,14 @@ fn build_oci_spec(config: &ContainerConfig, image: &ImageInfo) -> anyhow::Result
                     .options(vec!["rbind".into(), "ro".into()])
                     .build()?,
             );
+            mounts.push(
+                MountBuilder::default()
+                    .destination("/var/run/secrets/kubernetes.io/serviceaccount")
+                    .source("/tmp/r8s/serviceaccount")
+                    .typ("bind")
+                    .options(vec!["rbind".into(), "ro".into()])
+                    .build()?,
+            );
             mounts
         })
         .linux(
