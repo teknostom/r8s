@@ -2,7 +2,7 @@ use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 
 use r8s_api::{ApiServer, bootstrap::bootstrap_namespaces};
 use r8s_controllers::ControllerManager;
-use r8s_runtime::MockRuntime;
+use r8s_runtime::{ContainerRuntime, MockRuntime, containerd::ContainerdRuntime};
 use r8s_store::Store;
 use r8s_types::registry::ResourceRegistry;
 use tokio_util::sync::CancellationToken;
@@ -39,14 +39,21 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    let runtime = Arc::new(MockRuntime::new());
-    let kubelet_store = store.clone();
-    let kubelet_shutdown = shutdown.clone();
-    let kubelet_handle = tokio::spawn(async move {
-        if let Err(e) = r8s_kubelet::run(kubelet_store, runtime, kubelet_shutdown).await {
-            tracing::error!("kubelet error: {e}");
+    let runtime_type = std::env::var("R8S_RUNTIME").unwrap_or_else(|_| "containerd".to_string());
+    let kubelet_handle = match runtime_type.as_str() {
+        "mock" => {
+            tracing::info!("using mock container runtime");
+            let runtime = Arc::new(MockRuntime::new());
+            spawn_kubelet(store.clone(), runtime, shutdown.clone())
         }
-    });
+        _ => {
+            let socket = std::env::var("CONTAINERD_SOCKET")
+                .unwrap_or_else(|_| "/run/containerd/containerd.sock".to_string());
+            tracing::info!(socket, "using containerd runtime");
+            let runtime = Arc::new(ContainerdRuntime::new(&socket).await?);
+            spawn_kubelet(store.clone(), runtime, shutdown.clone())
+        }
+    };
 
     let registry = ResourceRegistry::default_mvp();
     let server = ApiServer::new(store, registry);
@@ -70,4 +77,16 @@ async fn main() -> anyhow::Result<()> {
     let _ = kubelet_handle.await;
 
     Ok(())
+}
+
+fn spawn_kubelet<R: ContainerRuntime + 'static>(
+    store: Store,
+    runtime: Arc<R>,
+    shutdown: CancellationToken,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        if let Err(e) = r8s_kubelet::run(store, runtime, shutdown).await {
+            tracing::error!("kubelet error: {e}");
+        }
+    })
 }

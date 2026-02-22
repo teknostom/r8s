@@ -263,8 +263,8 @@ fn update_pod_status(
             serde_json::json!({
                 "name": name,
                 "image": image,
-                "imageID": format!("mock://{image}"),
-                "containerID": format!("mock://{}", cid.0),
+                "imageID": image,
+                "containerID": &cid.0,
                 "ready": true,
                 "started": true,
                 "restartCount": 0,

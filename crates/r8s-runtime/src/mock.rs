@@ -16,12 +16,18 @@ struct MockContainer {
     running: bool,
 }
 
-impl MockRuntime {
-    pub fn new() -> Self {
+impl Default for MockRuntime {
+    fn default() -> Self {
         Self {
             containers: Mutex::new(FxHashMap::default()),
             next_id: Mutex::new(0),
         }
+    }
+}
+
+impl MockRuntime {
+    pub fn new() -> Self {
+        Self::default()
     }
 }
 
