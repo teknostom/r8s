@@ -39,24 +39,24 @@ pub struct LogParams {
     pub tail_lines: Option<u64>,
 }
 
-fn require_json(headers: &HeaderMap, body: &Bytes) -> Result<serde_json::Value, Response> {
+fn require_json(headers: &HeaderMap, body: &Bytes) -> Result<serde_json::Value, Box<Response>> {
     let content_type = headers
         .get("content-type")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     if !content_type.contains("json") {
-        return Err(status_error(
+        return Err(Box::new(status_error(
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
             "UnsupportedMediaType",
             &format!("unsupported content type: {content_type}"),
-        ));
+        )));
     }
     serde_json::from_slice(body).map_err(|e| {
-        status_error(
+        Box::new(status_error(
             StatusCode::BAD_REQUEST,
             "Invalid",
             &format!("invalid body: {e}"),
-        )
+        ))
     })
 }
 
@@ -158,7 +158,7 @@ pub async fn create_ns(
 ) -> Response {
     let body = match require_json(&headers, &body) {
         Ok(v) => v,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
     create_impl(&state, &ctx, Some(&ns), body)
 }
@@ -171,7 +171,7 @@ pub async fn create_cluster(
 ) -> Response {
     let body = match require_json(&headers, &body) {
         Ok(v) => v,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
     create_impl(&state, &ctx, None, body)
 }
@@ -203,7 +203,7 @@ pub async fn update_ns(
 ) -> Response {
     let body = match require_json(&headers, &body) {
         Ok(v) => v,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
     update_impl(&state, &ctx, Some(&ns), &name, body)
 }
@@ -217,7 +217,7 @@ pub async fn update_cluster(
 ) -> Response {
     let body = match require_json(&headers, &body) {
         Ok(v) => v,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
     update_impl(&state, &ctx, None, &name, body)
 }

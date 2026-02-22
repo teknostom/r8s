@@ -1296,6 +1296,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "k8s-openapi",
+ "r8s-network",
  "r8s-runtime",
  "r8s-store",
  "r8s-types",
@@ -1314,8 +1315,10 @@ dependencies = [
  "anyhow",
  "r8s-store",
  "r8s-types",
+ "serde_json",
  "thiserror",
  "tokio",
+ "tokio-util",
  "tracing",
 ]
 

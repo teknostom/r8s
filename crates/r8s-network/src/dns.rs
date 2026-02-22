@@ -14,8 +14,8 @@ fn services_gvr() -> GroupVersionResource {
 /// Resolves `<service>.<namespace>.svc.cluster.local` by looking up Service
 /// objects in the store. Forwards all other queries to the host's upstream resolver.
 pub async fn run_dns_server(store: Store, shutdown: CancellationToken) -> anyhow::Result<()> {
-    let upstream = std::fs::read_to_string("/tmp/r8s/upstream_dns")
-        .unwrap_or_else(|_| "8.8.8.8".to_string());
+    let upstream =
+        std::fs::read_to_string("/tmp/r8s/upstream_dns").unwrap_or_else(|_| "8.8.8.8".to_string());
     let upstream = upstream.trim().to_string();
 
     let socket = UdpSocket::bind("10.244.0.1:53").await?;

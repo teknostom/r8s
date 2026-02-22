@@ -287,11 +287,11 @@ fn build_oci_spec(config: &ContainerConfig, image: &ImageInfo) -> anyhow::Result
             let mut mounts = get_default_mounts();
             mounts.push(
                 MountBuilder::default()
-                .destination("/etc/resolv.conf")
-                .source("/tmp/r8s/resolv.conf")
-                .typ("bind")
-                .options(vec!["rbind".into(), "ro".into()])
-                .build()?,
+                    .destination("/etc/resolv.conf")
+                    .source("/tmp/r8s/resolv.conf")
+                    .typ("bind")
+                    .options(vec!["rbind".into(), "ro".into()])
+                    .build()?,
             );
             mounts
         })

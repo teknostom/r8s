@@ -95,10 +95,14 @@ fn reconcile_service(store: &Store, service: &serde_json::Value) -> anyhow::Resu
     let addresses: Vec<serde_json::Value> = matching
         .iter()
         .filter_map(|pod| {
+            let pod_ip = pod["status"]["podIP"].as_str()?;
+            if pod["status"]["phase"].as_str() != Some("Running") {
+                return None;
+            }
             let pod_name = pod["metadata"]["name"].as_str()?;
             let pod_ns = pod["metadata"]["namespace"].as_str().unwrap_or("default");
             Some(serde_json::json!({
-                "ip": "0.0.0.0",
+                "ip": pod_ip,
                 "targetRef": {
                     "kind": "Pod",
                     "name": pod_name,

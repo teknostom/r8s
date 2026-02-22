@@ -19,21 +19,40 @@ pub fn setup_nat_table() -> anyhow::Result<()> {
 
     nft(&["add", "table", "ip", "r8s"])?;
     nft(&[
-        "add", "chain", "ip", "r8s", "prerouting",
+        "add",
+        "chain",
+        "ip",
+        "r8s",
+        "prerouting",
         "{ type nat hook prerouting priority -100 ; }",
     ])?;
     nft(&[
-        "add", "chain", "ip", "r8s", "output",
+        "add",
+        "chain",
+        "ip",
+        "r8s",
+        "output",
         "{ type nat hook output priority -100 ; }",
     ])?;
     nft(&[
-        "add", "chain", "ip", "r8s", "postrouting",
+        "add",
+        "chain",
+        "ip",
+        "r8s",
+        "postrouting",
         "{ type nat hook postrouting priority 100 ; }",
     ])?;
     // Masquerade outbound pod traffic for internet access
     nft(&[
-        "add", "rule", "ip", "r8s", "postrouting",
-        "ip", "saddr", "10.244.0.0/24", "masquerade",
+        "add",
+        "rule",
+        "ip",
+        "r8s",
+        "postrouting",
+        "ip",
+        "saddr",
+        "10.244.0.0/24",
+        "masquerade",
     ])?;
 
     tracing::info!("nftables NAT table ready");
@@ -103,16 +122,38 @@ pub fn sync_service_rules(store: &Store) -> anyhow::Result<()> {
 
             // DNAT in prerouting (for traffic from other pods)
             let _ = nft(&[
-                "add", "rule", "ip", "r8s", "prerouting",
-                "ip", "daddr", cluster_ip, &proto, "dport", &svc_port_str,
-                "dnat", "to", &dnat_target,
+                "add",
+                "rule",
+                "ip",
+                "r8s",
+                "prerouting",
+                "ip",
+                "daddr",
+                cluster_ip,
+                &proto,
+                "dport",
+                &svc_port_str,
+                "dnat",
+                "to",
+                &dnat_target,
             ]);
 
             // DNAT in output (for traffic from the host itself)
             let _ = nft(&[
-                "add", "rule", "ip", "r8s", "output",
-                "ip", "daddr", cluster_ip, &proto, "dport", &svc_port_str,
-                "dnat", "to", &dnat_target,
+                "add",
+                "rule",
+                "ip",
+                "r8s",
+                "output",
+                "ip",
+                "daddr",
+                cluster_ip,
+                &proto,
+                "dport",
+                &svc_port_str,
+                "dnat",
+                "to",
+                &dnat_target,
             ]);
         }
     }
