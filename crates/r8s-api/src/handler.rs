@@ -14,6 +14,7 @@ use r8s_store::{
     watch::WatchEventType,
 };
 use r8s_types::ResourceType;
+use serde::Deserialize;
 use tokio_stream::wrappers::BroadcastStream;
 
 use crate::{
@@ -29,6 +30,13 @@ use tokio_stream::StreamExt;
 #[derive(Clone)]
 pub struct RouteContext {
     pub resource_type: Arc<ResourceType>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct LogParams {
+    pub container: Option<String>,
+    #[serde(rename = "tailLines")]
+    pub tail_lines: Option<u64>,
 }
 
 fn require_json(headers: &HeaderMap, body: &Bytes) -> Result<serde_json::Value, Response> {
@@ -469,4 +477,66 @@ pub async fn list_all_ns(
     headers: HeaderMap,
 ) -> Response {
     list_impl(&state, &ctx, None, params, &headers)
+}
+
+pub async fn pod_logs_ns(
+    State(state): State<AppState>,
+    Path((ns, name)): Path<(String, String)>,
+    Query(params): Query<LogParams>,
+) -> Response {
+    let gvr = r8s_types::GroupVersionResource::new("", "v1", "pods");
+    let resource_ref = r8s_store::backend::ResourceRef {
+        gvr: &gvr,
+        namespace: Some(&ns),
+        name: &name,
+    };
+
+    let pod = match state.store.get(&resource_ref) {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            return status_error(
+                StatusCode::NOT_FOUND,
+                "NotFound",
+                &format!("pod '{name}' not found"),
+            );
+        }
+        Err(e) => return response::anyhow_error_response(e),
+    };
+
+    let statuses = pod["status"]["containerStatuses"].as_array();
+    let status = statuses.and_then(|s| {
+        if let Some(ref c) = params.container {
+            s.iter().find(|cs| cs["name"].as_str() == Some(c.as_str()))
+        } else {
+            s.first()
+        }
+    });
+
+    let container_id = match status.and_then(|s| s["containerID"].as_str()) {
+        Some(id) => id,
+        None => {
+            return Response::builder()
+                .status(200)
+                .header("content-type", "text/plain")
+                .body(Body::empty())
+                .unwrap();
+        }
+    };
+
+    let log_path = format!("/tmp/r8s/logs/{container_id}.stdout");
+    let content = std::fs::read_to_string(&log_path).unwrap_or_default();
+
+    let output = if let Some(tail) = params.tail_lines {
+        let lines: Vec<&str> = content.lines().collect();
+        let start = lines.len().saturating_sub(tail as usize);
+        lines[start..].join("\n")
+    } else {
+        content
+    };
+
+    Response::builder()
+        .status(200)
+        .header("content-type", "text/plain")
+        .body(Body::from(output))
+        .unwrap()
 }

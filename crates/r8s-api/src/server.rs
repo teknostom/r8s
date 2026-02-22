@@ -17,7 +17,7 @@ use crate::{
     },
     handler::{
         RouteContext, create_cluster, create_ns, delete_cluster, delete_ns, get_cluster, get_ns,
-        list_all_ns, list_cluster, list_ns, patch_cluster, patch_ns, update_cluster, update_ns,
+        list_all_ns, list_cluster, list_ns, patch_cluster, patch_ns, update_cluster, update_ns, pod_logs_ns
     },
 };
 
@@ -92,6 +92,10 @@ impl ApiServer {
                             .layer(Extension(ctx.clone())),
                     )
                     .route(&all_ns, get(list_all_ns).layer(Extension(ctx)));
+                    if rt.gvr.resource == "pods" {
+                        let log_route = format!("{base}/namespaces/{{ns}}/{}/{{name}}/log", rt.gvr.resource);
+                        router = router.route(&log_route, get(pod_logs_ns))
+                    }
             } else {
                 let collection = format!("{base}/{}", rt.gvr.resource);
                 let item = format!("{base}/{}/{{name}}", rt.gvr.resource);
