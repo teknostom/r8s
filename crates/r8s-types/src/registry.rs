@@ -104,7 +104,14 @@ impl ResourceRegistry {
             singular: "ingressclass".to_string(),
             subresources: vec![],
         });
-        r.register(ResourceType { gvr: GroupVersionResource::new("discovery.k8s.io", "v1", "endpointslices"), kind: "EndpointSlice".to_string(), namespaced: true, short_names: vec![], singular: "endpointslice".to_string(), subresources: vec![] });
+        r.register(ResourceType {
+            gvr: GroupVersionResource::new("discovery.k8s.io", "v1", "endpointslices"),
+            kind: "EndpointSlice".to_string(),
+            namespaced: true,
+            short_names: vec![],
+            singular: "endpointslice".to_string(),
+            subresources: vec![],
+        });
 
         r.register(ResourceType {
             gvr: GroupVersionResource::new(

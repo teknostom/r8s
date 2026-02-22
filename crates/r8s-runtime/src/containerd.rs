@@ -30,13 +30,45 @@ const SNAPSHOTTER: &str = "overlayfs";
 
 pub struct ContainerdRuntime {
     channel: Channel,
+    data_dir: std::path::PathBuf,
 }
 
 impl ContainerdRuntime {
-    pub async fn new(socket_path: &str) -> anyhow::Result<Self> {
+    pub async fn new(socket_path: &str, data_dir: std::path::PathBuf) -> anyhow::Result<Self> {
         Ok(Self {
             channel: connect(socket_path).await?,
+            data_dir,
         })
+    }
+
+    /// Remove any stale task, container, and snapshot for a given name.
+    /// All errors are ignored — the resources may not exist.
+    async fn cleanup_stale(&self, name: &str) {
+        let mut tasks = TasksClient::new(self.channel.clone());
+        let kill = KillRequest {
+            container_id: name.to_string(),
+            signal: 9,
+            ..Default::default()
+        };
+        let _ = tasks.kill(with_namespace!(kill, NAMESPACE)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let del = DeleteTaskRequest {
+            container_id: name.to_string(),
+        };
+        let _ = tasks.delete(with_namespace!(del, NAMESPACE)).await;
+        let del = DeleteContainerRequest {
+            id: name.to_string(),
+        };
+        let _ = ContainersClient::new(self.channel.clone())
+            .delete(with_namespace!(del, NAMESPACE))
+            .await;
+        let rm = RemoveSnapshotRequest {
+            snapshotter: SNAPSHOTTER.to_string(),
+            key: name.to_string(),
+        };
+        let _ = SnapshotsClient::new(self.channel.clone())
+            .remove(with_namespace!(rm, NAMESPACE))
+            .await;
     }
 
     /// Read the image config from containerd's content store.
@@ -204,7 +236,11 @@ fn compute_chain_id(diff_ids: &[String]) -> anyhow::Result<String> {
 }
 
 #[allow(clippy::disallowed_types)] // oci_spec::Capabilities requires std HashSet
-fn build_oci_spec(config: &ContainerConfig, image: &ImageInfo) -> anyhow::Result<Vec<u8>> {
+fn build_oci_spec(
+    config: &ContainerConfig,
+    image: &ImageInfo,
+    data_dir: &std::path::Path,
+) -> anyhow::Result<Vec<u8>> {
     // K8s semantics: pod command overrides ENTRYPOINT, pod args overrides CMD.
     // If neither is set, use image defaults.
     let args = if !config.command.is_empty() {
@@ -288,7 +324,7 @@ fn build_oci_spec(config: &ContainerConfig, image: &ImageInfo) -> anyhow::Result
             mounts.push(
                 MountBuilder::default()
                     .destination("/etc/resolv.conf")
-                    .source("/tmp/r8s/resolv.conf")
+                    .source(data_dir.join("resolv.conf"))
                     .typ("bind")
                     .options(vec!["rbind".into(), "ro".into()])
                     .build()?,
@@ -296,7 +332,7 @@ fn build_oci_spec(config: &ContainerConfig, image: &ImageInfo) -> anyhow::Result
             mounts.push(
                 MountBuilder::default()
                     .destination("/var/run/secrets/kubernetes.io/serviceaccount")
-                    .source("/tmp/r8s/serviceaccount")
+                    .source(data_dir.join("serviceaccount"))
                     .typ("bind")
                     .options(vec!["rbind".into(), "ro".into()])
                     .build()?,
@@ -373,6 +409,9 @@ impl ContainerRuntime for ContainerdRuntime {
         // Read image config to get chain ID and default command/env
         let image_info = self.image_info(&image_ref).await?;
 
+        // Clean up any stale state from a previous run (task → container → snapshot)
+        self.cleanup_stale(&config.name).await;
+
         // Prepare a writable snapshot for this container
         let snapshot_key = config.name.clone();
         let req = PrepareSnapshotRequest {
@@ -386,7 +425,7 @@ impl ContainerRuntime for ContainerdRuntime {
             .await?;
 
         // Build OCI runtime spec and wrap in protobuf Any
-        let spec_json = build_oci_spec(config, &image_info)?;
+        let spec_json = build_oci_spec(config, &image_info, &self.data_dir)?;
         let spec = prost_types::Any {
             type_url: "types.containerd.io/opencontainers/runtime-spec/1/Spec".to_string(),
             value: spec_json,
@@ -428,7 +467,7 @@ impl ContainerRuntime for ContainerdRuntime {
         let mounts = resp.into_inner().mounts;
 
         // Set up log files for stdout/stderr (must exist before task creation)
-        let log_dir = std::path::PathBuf::from("/tmp/r8s/logs");
+        let log_dir = self.data_dir.join("logs");
         std::fs::create_dir_all(&log_dir)?;
         let stdout_path = log_dir.join(format!("{}.stdout", id.0));
         let stderr_path = log_dir.join(format!("{}.stderr", id.0));

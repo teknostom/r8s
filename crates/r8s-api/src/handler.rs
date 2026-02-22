@@ -416,7 +416,10 @@ fn watch_impl(state: &AppState, ctx: &RouteContext, namespace: Option<&str>) -> 
     let api_version = if ctx.resource_type.gvr.group.is_empty() {
         ctx.resource_type.gvr.version.clone()
     } else {
-        format!("{}/{}", ctx.resource_type.gvr.group, ctx.resource_type.gvr.version)
+        format!(
+            "{}/{}",
+            ctx.resource_type.gvr.group, ctx.resource_type.gvr.version
+        )
     };
     let bookmark = tokio_stream::iter(std::iter::once(Ok::<_, std::io::Error>(
         response::watch_event_line(
@@ -530,7 +533,10 @@ pub async fn pod_logs_ns(
         }
     };
 
-    let log_path = format!("/tmp/r8s/logs/{container_id}.stdout");
+    let log_path = state
+        .data_dir
+        .join("logs")
+        .join(format!("{container_id}.stdout"));
     let content = std::fs::read_to_string(&log_path).unwrap_or_default();
 
     let output = if let Some(tail) = params.tail_lines {

@@ -16,6 +16,7 @@ pub type AppState = Arc<ApiState>;
 pub struct ApiState {
     pub store: Store,
     pub registry: ResourceRegistry,
+    pub data_dir: std::path::PathBuf,
 }
 
 pub async fn get_version() -> Response {

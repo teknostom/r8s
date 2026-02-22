@@ -44,9 +44,13 @@ pub struct ApiServer {
 }
 
 impl ApiServer {
-    pub fn new(store: Store, registry: ResourceRegistry) -> Self {
+    pub fn new(store: Store, registry: ResourceRegistry, data_dir: std::path::PathBuf) -> Self {
         Self {
-            state: Arc::new(ApiState { store, registry }),
+            state: Arc::new(ApiState {
+                store,
+                registry,
+                data_dir,
+            }),
         }
     }
 

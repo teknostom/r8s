@@ -1240,12 +1240,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
- "r8s-types",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
- "tracing-subscriber",
+ "libc",
 ]
 
 [[package]]
@@ -1389,6 +1384,7 @@ name = "r8sd"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "clap",
  "r8s-api",
  "r8s-controllers",
  "r8s-kubelet",

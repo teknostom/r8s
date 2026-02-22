@@ -87,9 +87,9 @@ pub fn bootstrap_namespaces(store: &Store) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn bootstrap_traefik(store: &Store) -> anyhow::Result<()> {
-    let sa_dir = std::path::Path::new("/tmp/r8s/serviceaccount");
-    std::fs::create_dir_all(sa_dir)?;
+pub fn bootstrap_traefik(store: &Store, data_dir: &std::path::Path) -> anyhow::Result<()> {
+    let sa_dir = data_dir.join("serviceaccount");
+    std::fs::create_dir_all(&sa_dir)?;
     std::fs::write(sa_dir.join("token"), "dummy")?;
     std::fs::write(sa_dir.join("ca.crt"), "")?;
     std::fs::write(sa_dir.join("namespace"), "default")?;

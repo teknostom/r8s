@@ -5,10 +5,9 @@ const BRIDGE_CIDR: &str = "10.244.0.1/24";
 
 /// Create the r8s0 bridge and enable IP forwarding.
 /// Idempotent — safe to call if the bridge already exists.
-pub fn setup_bridge() -> anyhow::Result<()> {
+pub fn setup_bridge(data_dir: &std::path::Path) -> anyhow::Result<()> {
     // Create resolv.conf for containers (must exist before any container is created)
-    let resolv_dir = std::path::Path::new("/tmp/r8s");
-    std::fs::create_dir_all(resolv_dir)?;
+    std::fs::create_dir_all(data_dir)?;
 
     // Preserve host resolver for DNS forwarding
     let host_resolv = std::fs::read_to_string("/etc/resolv.conf").unwrap_or_default();
@@ -16,10 +15,10 @@ pub fn setup_bridge() -> anyhow::Result<()> {
         .lines()
         .find_map(|l| l.strip_prefix("nameserver ").map(|s| s.trim().to_string()))
         .unwrap_or_else(|| "1.1.1.1".to_string());
-    std::fs::write(resolv_dir.join("upstream_dns"), &upstream)?;
+    std::fs::write(data_dir.join("upstream_dns"), &upstream)?;
 
     std::fs::write(
-        resolv_dir.join("resolv.conf"),
+        data_dir.join("resolv.conf"),
         "nameserver 10.244.0.1\nsearch default.svc.cluster.local svc.cluster.local cluster.local\noptions ndots:5\n",
     )?;
 
@@ -103,7 +102,7 @@ fn run_ignore_exists(cmd: &str, args: &[&str]) -> anyhow::Result<()> {
     let output = Command::new(cmd).args(args).output()?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        if !stderr.contains("File exists") {
+        if !stderr.contains("File exists") && !stderr.contains("already") {
             anyhow::bail!("{cmd} {}: {stderr}", args.join(" "));
         }
     }

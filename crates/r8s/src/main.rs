@@ -1,14 +1,18 @@
+use std::io::{BufRead, BufReader, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
 #[command(name = "r8s", about = "Lightweight single-node Kubernetes in Rust")]
 struct Cli {
     #[command(subcommand)]
-    command: Command,
+    command: Cmd,
 }
 
 #[derive(Subcommand)]
-enum Command {
+enum Cmd {
     /// Create a new cluster
     Create {
         /// Cluster name
@@ -16,7 +20,7 @@ enum Command {
     },
     /// Start a cluster
     Up {
-        /// Cluster name (defaults to last used or only cluster)
+        /// Cluster name
         name: Option<String>,
         /// Run in foreground instead of daemonizing
         #[arg(long)]
@@ -54,52 +58,305 @@ enum Command {
     },
 }
 
+fn base_dir() -> PathBuf {
+    PathBuf::from("/var/lib/r8s/clusters")
+}
+
+fn cluster_dir(name: &str) -> PathBuf {
+    base_dir().join(name)
+}
+
+/// Resolve cluster name: use provided name, or if omitted, pick the only existing cluster.
+fn resolve_name(name: Option<String>) -> anyhow::Result<String> {
+    if let Some(n) = name {
+        return Ok(n);
+    }
+    let base = base_dir();
+    if !base.exists() {
+        anyhow::bail!("no clusters exist. Create one with: r8s create <name>");
+    }
+    let entries: Vec<String> = std::fs::read_dir(&base)?
+        .filter_map(|e| {
+            let e = e.ok()?;
+            if e.file_type().ok()?.is_dir() {
+                Some(e.file_name().to_string_lossy().to_string())
+            } else {
+                None
+            }
+        })
+        .collect();
+    match entries.len() {
+        0 => anyhow::bail!("no clusters exist. Create one with: r8s create <name>"),
+        1 => Ok(entries.into_iter().next().unwrap()),
+        _ => anyhow::bail!(
+            "multiple clusters exist ({}). Specify which one.",
+            entries.join(", ")
+        ),
+    }
+}
+
+fn pid_file(dir: &Path) -> PathBuf {
+    dir.join("r8sd.pid")
+}
+
+fn read_pid(dir: &Path) -> Option<u32> {
+    std::fs::read_to_string(pid_file(dir))
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+}
+
+fn is_running(pid: u32) -> bool {
+    Path::new(&format!("/proc/{pid}")).exists()
+}
+
+fn write_kubeconfig(dir: &Path, name: &str) -> anyhow::Result<()> {
+    let content = format!(
+        r#"apiVersion: v1
+kind: Config
+clusters:
+- cluster:
+    server: http://127.0.0.1:6443
+  name: r8s-{name}
+contexts:
+- context:
+    cluster: r8s-{name}
+    user: r8s-admin
+  name: r8s-{name}
+current-context: r8s-{name}
+users:
+- name: r8s-admin
+  user: {{}}
+"#
+    );
+    std::fs::write(dir.join("kubeconfig"), content)?;
+    Ok(())
+}
+
+fn r8sd_binary() -> PathBuf {
+    // Look next to the r8s binary first
+    let self_path = std::env::current_exe().unwrap_or_default();
+    let sibling = self_path.parent().unwrap_or(Path::new(".")).join("r8sd");
+    if sibling.exists() {
+        return sibling;
+    }
+    // Fall back to PATH
+    PathBuf::from("r8sd")
+}
+
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Create { name } => {
+        Cmd::Create { name } => {
             let name = name.unwrap_or_else(|| "default".to_string());
-            println!("Creating cluster '{name}'...");
-            // TODO: implement cluster creation
+            let dir = cluster_dir(&name);
+            if dir.exists() {
+                anyhow::bail!("cluster '{name}' already exists");
+            }
+            std::fs::create_dir_all(dir.join("logs"))?;
+            std::fs::create_dir_all(dir.join("serviceaccount"))?;
+            println!("Cluster '{name}' created.");
+            println!("Start it with: sudo r8s up {name}");
         }
-        Command::Up { name, foreground } => {
-            let name = name.unwrap_or_else(|| "default".to_string());
-            println!(
-                "Starting cluster '{name}'{}...",
-                if foreground { " (foreground)" } else { "" }
-            );
-            // TODO: start r8sd daemon
+
+        Cmd::Up { name, foreground } => {
+            check_root()?;
+            let name = resolve_name(name)?;
+            let dir = cluster_dir(&name);
+            if !dir.exists() {
+                anyhow::bail!("cluster '{name}' does not exist. Create it with: r8s create {name}");
+            }
+
+            // Check if already running
+            if let Some(pid) = read_pid(&dir) {
+                if is_running(pid) {
+                    anyhow::bail!("cluster '{name}' is already running (pid {pid})");
+                }
+            }
+
+            write_kubeconfig(&dir, &name)?;
+
+            if foreground {
+                println!("Starting cluster '{name}' in foreground...");
+                let status = Command::new(r8sd_binary())
+                    .arg("--data-dir")
+                    .arg(&dir)
+                    .status()?;
+                if !status.success() {
+                    anyhow::bail!("r8sd exited with {status}");
+                }
+            } else {
+                let log_file = std::fs::File::create(dir.join("r8sd.log"))?;
+                let stderr_file = log_file.try_clone()?;
+                let child = Command::new(r8sd_binary())
+                    .arg("--data-dir")
+                    .arg(&dir)
+                    .stdout(log_file)
+                    .stderr(stderr_file)
+                    .spawn()?;
+
+                std::fs::write(pid_file(&dir), child.id().to_string())?;
+
+                let kc = dir.join("kubeconfig");
+                println!("Cluster '{name}' started (pid {}).", child.id());
+                println!("export KUBECONFIG={}", kc.display());
+            }
         }
-        Command::Down { name } => {
-            let name = name.unwrap_or_else(|| "default".to_string());
-            println!("Stopping cluster '{name}'...");
-            // TODO: stop r8sd daemon
+
+        Cmd::Down { name } => {
+            check_root()?;
+            let name = resolve_name(name)?;
+            let dir = cluster_dir(&name);
+
+            let pid = match read_pid(&dir) {
+                Some(pid) if is_running(pid) => pid,
+                _ => {
+                    println!("Cluster '{name}' is not running.");
+                    return Ok(());
+                }
+            };
+
+            // Send SIGTERM
+            unsafe {
+                libc::kill(pid as i32, libc::SIGTERM);
+            }
+
+            // Wait for exit (up to 10 seconds)
+            for _ in 0..100 {
+                if !is_running(pid) {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+
+            if is_running(pid) {
+                eprintln!("warning: r8sd (pid {pid}) did not exit, sending SIGKILL");
+                unsafe {
+                    libc::kill(pid as i32, libc::SIGKILL);
+                }
+            }
+
+            let _ = std::fs::remove_file(pid_file(&dir));
+            println!("Cluster '{name}' stopped.");
         }
-        Command::Delete { name } => {
-            println!("Deleting cluster '{name}'...");
-            // TODO: stop daemon + remove data
+
+        Cmd::Delete { name } => {
+            let dir = cluster_dir(&name);
+            if !dir.exists() {
+                anyhow::bail!("cluster '{name}' does not exist");
+            }
+
+            // Stop if running
+            if let Some(pid) = read_pid(&dir) {
+                if is_running(pid) {
+                    check_root()?;
+                    unsafe {
+                        libc::kill(pid as i32, libc::SIGTERM);
+                    }
+                    for _ in 0..50 {
+                        if !is_running(pid) {
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                }
+            }
+
+            std::fs::remove_dir_all(&dir)?;
+            println!("Cluster '{name}' deleted.");
         }
-        Command::List => {
-            println!("No clusters configured yet.");
-            // TODO: list clusters
+
+        Cmd::List => {
+            let base = base_dir();
+            if !base.exists() {
+                println!("No clusters.");
+                return Ok(());
+            }
+            let mut entries: Vec<(String, &str)> = Vec::new();
+            for entry in std::fs::read_dir(&base)? {
+                let entry = entry?;
+                if !entry.file_type()?.is_dir() {
+                    continue;
+                }
+                let name = entry.file_name().to_string_lossy().to_string();
+                let dir = entry.path();
+                let status = match read_pid(&dir) {
+                    Some(pid) if is_running(pid) => "running",
+                    _ => "stopped",
+                };
+                entries.push((name, status));
+            }
+            if entries.is_empty() {
+                println!("No clusters.");
+            } else {
+                println!("{:<20} {}", "NAME", "STATUS");
+                for (name, status) in &entries {
+                    println!("{:<20} {}", name, status);
+                }
+            }
         }
-        Command::Status { name } => {
-            let name = name.unwrap_or_else(|| "default".to_string());
-            println!("Cluster '{name}': not running");
-            // TODO: show cluster status
+
+        Cmd::Status { name } => {
+            let name = resolve_name(name)?;
+            let dir = cluster_dir(&name);
+            if !dir.exists() {
+                anyhow::bail!("cluster '{name}' does not exist");
+            }
+            match read_pid(&dir) {
+                Some(pid) if is_running(pid) => {
+                    println!("Cluster '{name}': running (pid {pid})");
+                    println!("Kubeconfig: {}", dir.join("kubeconfig").display());
+                }
+                _ => {
+                    println!("Cluster '{name}': stopped");
+                }
+            }
         }
-        Command::Kubeconfig { name } => {
-            let name = name.unwrap_or_else(|| "default".to_string());
-            println!("~/.local/share/r8s/{name}/kubeconfig");
-            // TODO: actual kubeconfig path
+
+        Cmd::Kubeconfig { name } => {
+            let name = resolve_name(name)?;
+            let kc = cluster_dir(&name).join("kubeconfig");
+            if !kc.exists() {
+                anyhow::bail!("kubeconfig not found. Start the cluster first: sudo r8s up {name}");
+            }
+            println!("{}", kc.display());
         }
-        Command::Logs { name, follow: _ } => {
-            let name = name.unwrap_or_else(|| "default".to_string());
-            println!("No logs for cluster '{name}' (not running)");
-            // TODO: tail daemon logs
+
+        Cmd::Logs { name, follow } => {
+            let name = resolve_name(name)?;
+            let log_path = cluster_dir(&name).join("r8sd.log");
+            if !log_path.exists() {
+                anyhow::bail!("no logs for cluster '{name}'");
+            }
+
+            if follow {
+                let mut file = std::fs::File::open(&log_path)?;
+                // Seek to end, then tail
+                file.seek(SeekFrom::End(0))?;
+                let mut reader = BufReader::new(file);
+                loop {
+                    let mut line = String::new();
+                    match reader.read_line(&mut line) {
+                        Ok(0) => std::thread::sleep(std::time::Duration::from_millis(100)),
+                        Ok(_) => print!("{line}"),
+                        Err(e) => {
+                            eprintln!("error reading log: {e}");
+                            break;
+                        }
+                    }
+                }
+            } else {
+                print!("{}", std::fs::read_to_string(&log_path)?);
+            }
         }
     }
 
+    Ok(())
+}
+
+fn check_root() -> anyhow::Result<()> {
+    if unsafe { libc::getuid() } != 0 {
+        anyhow::bail!("r8s requires root. Run with sudo.");
+    }
     Ok(())
 }
