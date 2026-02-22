@@ -1,9 +1,10 @@
 use std::sync::Arc;
 
 use axum::{
-    Extension, Json,
+    Extension,
     body::{Body, Bytes},
     extract::{Path, State},
+    http::HeaderMap,
     response::Response,
 };
 use hyper::StatusCode;
@@ -20,6 +21,7 @@ use crate::{
     params::ListParams,
     patch::json_merge_patch,
     response::{self, status_error},
+    table,
 };
 use axum::extract::Query;
 use tokio_stream::StreamExt;
@@ -29,14 +31,58 @@ pub struct RouteContext {
     pub resource_type: Arc<ResourceType>,
 }
 
-fn get_impl(state: &AppState, ctx: &RouteContext, namespace: Option<&str>, name: &str) -> Response {
+fn require_json(headers: &HeaderMap, body: &Bytes) -> Result<serde_json::Value, Response> {
+    let content_type = headers
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if !content_type.contains("json") {
+        return Err(status_error(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "UnsupportedMediaType",
+            &format!("unsupported content type: {content_type}"),
+        ));
+    }
+    serde_json::from_slice(body).map_err(|e| {
+        status_error(
+            StatusCode::BAD_REQUEST,
+            "Invalid",
+            &format!("invalid body: {e}"),
+        )
+    })
+}
+
+fn wants_table(headers: &HeaderMap) -> bool {
+    headers
+        .get("accept")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|accept| accept.contains("as=Table") && accept.contains("g=meta.k8s.io"))
+}
+
+fn get_impl(
+    state: &AppState,
+    ctx: &RouteContext,
+    namespace: Option<&str>,
+    name: &str,
+    headers: &HeaderMap,
+) -> Response {
     let resource_ref = ResourceRef {
         gvr: &ctx.resource_type.gvr,
         namespace,
         name,
     };
     match state.store.get(&resource_ref) {
-        Ok(Some(obj)) => response::object_response(&obj),
+        Ok(Some(obj)) => {
+            if wants_table(headers) {
+                table::single_object_table_response(
+                    &table::columns_for(&ctx.resource_type.gvr.resource),
+                    &obj,
+                    &ctx.resource_type.gvr.resource,
+                )
+            } else {
+                response::object_response(&obj)
+            }
+        }
         Ok(None) => response::status_error(
             StatusCode::NOT_FOUND,
             "NotFound",
@@ -50,16 +96,18 @@ pub async fn get_ns(
     State(state): State<AppState>,
     Extension(ctx): Extension<RouteContext>,
     Path((ns, name)): Path<(String, String)>,
+    headers: HeaderMap,
 ) -> Response {
-    get_impl(&state, &ctx, Some(&ns), &name)
+    get_impl(&state, &ctx, Some(&ns), &name, &headers)
 }
 
 pub async fn get_cluster(
     State(state): State<AppState>,
     Extension(ctx): Extension<RouteContext>,
     Path(name): Path<String>,
+    headers: HeaderMap,
 ) -> Response {
-    get_impl(&state, &ctx, None, &name)
+    get_impl(&state, &ctx, None, &name, &headers)
 }
 
 fn create_impl(
@@ -97,16 +145,26 @@ pub async fn create_ns(
     State(state): State<AppState>,
     Extension(ctx): Extension<RouteContext>,
     Path(ns): Path<String>,
-    Json(body): Json<serde_json::Value>,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> Response {
+    let body = match require_json(&headers, &body) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
     create_impl(&state, &ctx, Some(&ns), body)
 }
 
 pub async fn create_cluster(
     State(state): State<AppState>,
     Extension(ctx): Extension<RouteContext>,
-    Json(body): Json<serde_json::Value>,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> Response {
+    let body = match require_json(&headers, &body) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
     create_impl(&state, &ctx, None, body)
 }
 
@@ -132,8 +190,13 @@ pub async fn update_ns(
     State(state): State<AppState>,
     Extension(ctx): Extension<RouteContext>,
     Path((ns, name)): Path<(String, String)>,
-    Json(body): Json<serde_json::Value>,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> Response {
+    let body = match require_json(&headers, &body) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
     update_impl(&state, &ctx, Some(&ns), &name, body)
 }
 
@@ -141,8 +204,13 @@ pub async fn update_cluster(
     State(state): State<AppState>,
     Extension(ctx): Extension<RouteContext>,
     Path(name): Path<String>,
-    Json(body): Json<serde_json::Value>,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> Response {
+    let body = match require_json(&headers, &body) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
     update_impl(&state, &ctx, None, &name, body)
 }
 fn delete_impl(
@@ -257,6 +325,7 @@ fn list_impl(
     ctx: &RouteContext,
     namespace: Option<&str>,
     params: ListParams,
+    headers: &HeaderMap,
 ) -> Response {
     if params.is_watch() {
         return watch_impl(state, ctx, namespace);
@@ -298,13 +367,24 @@ fn list_impl(
         limit,
         params.continue_token.as_deref(),
     ) {
-        Ok(result) => response::list_response(
-            &api_version(ctx),
-            &ctx.resource_type.kind,
-            result.resource_version,
-            result.continue_token.as_deref(),
-            result.items,
-        ),
+        Ok(result) => {
+            if wants_table(headers) {
+                table::table_response(
+                    &table::columns_for(&ctx.resource_type.gvr.resource),
+                    &result.items,
+                    &ctx.resource_type.gvr.resource,
+                    Some(result.resource_version),
+                )
+            } else {
+                response::list_response(
+                    &api_version(ctx),
+                    &ctx.resource_type.kind,
+                    result.resource_version,
+                    result.continue_token.as_deref(),
+                    result.items,
+                )
+            }
+        }
         Err(err) => response::anyhow_error_response(err),
     }
 }
@@ -314,16 +394,25 @@ fn watch_impl(state: &AppState, ctx: &RouteContext, namespace: Option<&str>) -> 
     let rx = state.store.watch(&ctx.resource_type.gvr);
 
     // List existing resources to emit as initial ADDED events.
-    let items = state
+    let (items, rv) = state
         .store
         .list(&ctx.resource_type.gvr, namespace, None, None, None, None)
-        .map(|r| r.items)
+        .map(|r| (r.items, r.resource_version))
         .unwrap_or_default();
 
     let initial = items
         .into_iter()
         .map(|obj| Ok::<_, std::io::Error>(response::watch_event_line("ADDED", &obj)));
     let initial_stream = tokio_stream::iter(initial);
+
+    let bookmark = tokio_stream::iter(std::iter::once(Ok::<_, std::io::Error>(
+        response::watch_event_line(
+            "BOOKMARK",
+            &serde_json::json!({
+                "metadata": {"resourceVersion": rv.to_string()}
+            }),
+        ),
+    )));
 
     let ns_filter: Option<String> = namespace.map(|s| s.to_string());
     let live_stream = BroadcastStream::new(rx).filter_map(move |result| {
@@ -344,7 +433,7 @@ fn watch_impl(state: &AppState, ctx: &RouteContext, namespace: Option<&str>) -> 
         )))
     });
 
-    let stream = initial_stream.chain(live_stream);
+    let stream = initial_stream.chain(bookmark).chain(live_stream);
 
     Response::builder()
         .status(200)
@@ -359,22 +448,25 @@ pub async fn list_ns(
     Extension(ctx): Extension<RouteContext>,
     Query(params): Query<ListParams>,
     Path(ns): Path<String>,
+    headers: HeaderMap,
 ) -> Response {
-    list_impl(&state, &ctx, Some(&ns), params)
+    list_impl(&state, &ctx, Some(&ns), params, &headers)
 }
 
 pub async fn list_cluster(
     State(state): State<AppState>,
     Extension(ctx): Extension<RouteContext>,
     Query(params): Query<ListParams>,
+    headers: HeaderMap,
 ) -> Response {
-    list_impl(&state, &ctx, None, params)
+    list_impl(&state, &ctx, None, params, &headers)
 }
 
 pub async fn list_all_ns(
     State(state): State<AppState>,
     Extension(ctx): Extension<RouteContext>,
     Query(params): Query<ListParams>,
+    headers: HeaderMap,
 ) -> Response {
-    list_impl(&state, &ctx, None, params)
+    list_impl(&state, &ctx, None, params, &headers)
 }

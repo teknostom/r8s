@@ -6,5 +6,6 @@ pub mod params;
 pub mod patch;
 pub mod response;
 pub mod server;
+pub mod table;
 
 pub use server::ApiServer;

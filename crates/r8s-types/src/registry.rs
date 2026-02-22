@@ -88,6 +88,19 @@ impl ResourceRegistry {
             });
         }
 
+        r.register(ResourceType {
+            gvr: GroupVersionResource::new(
+                "apiextensions.k8s.io",
+                "v1",
+                "customresourcedefinitions",
+            ),
+            kind: "CustomResourceDefinition".to_string(),
+            namespaced: false,
+            singular: "customresourcedefinition".to_string(),
+            short_names: vec!["crd".to_string(), "crds".to_string()],
+            subresources: vec![],
+        });
+
         r
     }
 }

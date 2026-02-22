@@ -60,6 +60,12 @@ pub async fn get_api_groups(State(state): State<AppState>) -> Response {
         "preferredVersion": {"groupVersion": "authorization.k8s.io/v1", "version": "v1"},
     }));
 
+  groups.push(serde_json::json!({
+      "name": "apiextensions.k8s.io",
+      "versions": [{"groupVersion": "apiextensions.k8s.io/v1", "version": "v1"}],
+      "preferredVersion": {"groupVersion": "apiextensions.k8s.io/v1", "version": "v1"},
+  }));
+
     object_response(&serde_json::json!({
         "kind": "APIGroupList",
         "apiVersion": "v1",
