@@ -22,5 +22,67 @@ pub fn bootstrap_namespaces(store: &Store) -> anyhow::Result<()> {
             tracing::info!("bootstrapped namespace '{ns_name}'");
         }
     }
+    // Bootstrap the "kubernetes" service in default namespace
+    let svc_gvr = GroupVersionResource::new("", "v1", "services");
+    let svc_ref = ResourceRef {
+        gvr: &svc_gvr,
+        namespace: Some("default"),
+        name: "kubernetes",
+    };
+    if store.get(&svc_ref)?.is_none() {
+        let svc = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": {
+                "name": "kubernetes",
+                "namespace": "default",
+                "labels": {
+                    "component": "apiserver",
+                    "provider": "kubernetes",
+                },
+            },
+            "spec": {
+                "type": "ClusterIP",
+                "clusterIP": "10.96.0.1",
+                "ports": [{
+                    "name": "https",
+                    "port": 443,
+                    "targetPort": 6443,
+                    "protocol": "TCP",
+                }],
+            },
+        });
+        store.create(svc_ref, &svc)?;
+        tracing::info!("bootstrapped 'kubernetes' service");
+    }
+
+    // Bootstrap endpoints for the kubernetes service
+    let ep_gvr = GroupVersionResource::new("", "v1", "endpoints");
+    let ep_ref = ResourceRef {
+        gvr: &ep_gvr,
+        namespace: Some("default"),
+        name: "kubernetes",
+    };
+    if store.get(&ep_ref)?.is_none() {
+        let ep = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Endpoints",
+            "metadata": {
+                "name": "kubernetes",
+                "namespace": "default",
+            },
+            "subsets": [{
+                "addresses": [{"ip": "127.0.0.1"}],
+                "ports": [{
+                    "name": "https",
+                    "port": 6443,
+                    "protocol": "TCP",
+                }],
+            }],
+        });
+        store.create(ep_ref, &ep)?;
+        tracing::info!("bootstrapped 'kubernetes' endpoints");
+    }
+
     Ok(())
 }
