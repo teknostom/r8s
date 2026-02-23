@@ -1203,6 +1203,7 @@ dependencies = [
  "anyhow",
  "clap",
  "libc",
+ "r8s-store",
 ]
 
 [[package]]

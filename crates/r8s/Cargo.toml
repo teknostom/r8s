@@ -11,3 +11,4 @@ path = "src/main.rs"
 clap.workspace = true
 anyhow.workspace = true
 libc = "0.2"
+r8s-store.workspace = true

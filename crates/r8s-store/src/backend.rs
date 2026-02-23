@@ -2,7 +2,7 @@ use std::{path::Path, sync::Arc, time::Duration};
 
 use base64::prelude::*;
 use r8s_types::{GroupVersionResource, ObjectMeta};
-use redb::{Database, ReadableTable, TableDefinition};
+use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition};
 use tokio::sync::broadcast;
 
 use crate::{
@@ -370,6 +370,17 @@ impl Store {
             resource_version,
             continue_token,
         })
+    }
+
+    /// Returns (current_revision, revision_table_entries, resource_count).
+    pub fn stats(&self) -> anyhow::Result<(u64, u64, u64)> {
+        let current_rev = self.revision.current();
+        let r_transaction = self.db.begin_read()?;
+        let rev_table = r_transaction.open_table(REVISIONS)?;
+        let rev_count = rev_table.len()?;
+        let res_table = r_transaction.open_table(RESOURCES)?;
+        let res_count = res_table.len()?;
+        Ok((current_rev, rev_count, res_count))
     }
 
     pub fn watch(&self, gvr: &GroupVersionResource) -> broadcast::Receiver<WatchEvent> {

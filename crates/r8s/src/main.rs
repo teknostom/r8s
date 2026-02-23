@@ -48,6 +48,11 @@ enum Cmd {
         /// Cluster name
         name: Option<String>,
     },
+    /// Show store statistics
+    Stats {
+        /// Cluster name
+        name: Option<String>,
+    },
     /// Tail daemon logs
     Logs {
         /// Cluster name
@@ -373,6 +378,22 @@ fn main() -> anyhow::Result<()> {
                 anyhow::bail!("kubeconfig not found. Start the cluster first: sudo r8s up {name}");
             }
             println!("{}", kc.display());
+        }
+
+        Cmd::Stats { name } => {
+            let name = resolve_name(name)?;
+            let dir = cluster_dir(&name);
+            let db_path = dir.join("store.db");
+            if !db_path.exists() {
+                anyhow::bail!("store not found for cluster '{name}'");
+            }
+            let (rev, rev_entries, resources) = r8s_store::stats(&db_path)?;
+            let size = std::fs::metadata(&db_path)?.len();
+            println!("Cluster: {name}");
+            println!("Current revision:      {rev}");
+            println!("Revision table entries: {rev_entries}");
+            println!("Resource count:         {resources}");
+            println!("Store size:             {:.1} KB", size as f64 / 1024.0);
         }
 
         Cmd::Logs { name, follow } => {
