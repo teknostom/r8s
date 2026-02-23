@@ -32,7 +32,7 @@ impl MockRuntime {
 }
 
 impl ContainerRuntime for MockRuntime {
-    async fn pull_image(&self, image: &str) -> anyhow::Result<ImageId> {
+    async fn pull_image(&self, image: &str, _auth: Option<&RegistryAuth>) -> anyhow::Result<ImageId> {
         tracing::info!(image, "mock: pulling image");
         Ok(ImageId(format!("mock-{image}")))
     }

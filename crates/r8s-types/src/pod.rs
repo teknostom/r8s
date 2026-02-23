@@ -33,6 +33,13 @@ pub struct PodSpec {
     pub node_name: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub volumes: Vec<Volume>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub image_pull_secrets: Vec<LocalObjectReference>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalObjectReference {
+    pub name: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

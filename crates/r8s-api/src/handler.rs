@@ -21,6 +21,7 @@ use crate::{
     discovery::AppState,
     params::ListParams,
     patch::json_merge_patch,
+    protobuf::decode_k8s_protobuf,
     response::{self, status_error},
     table,
 };
@@ -44,12 +45,14 @@ pub(crate) fn require_json(headers: &HeaderMap, body: &Bytes) -> Result<serde_js
         .get("content-type")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    if !content_type.contains("json") {
-        return Err(Box::new(status_error(
-            StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            "UnsupportedMediaType",
-            &format!("unsupported content type: {content_type}"),
-        )));
+    if content_type.contains("protobuf") {
+        return decode_k8s_protobuf(body).ok_or_else(|| {
+            Box::new(status_error(
+                StatusCode::BAD_REQUEST,
+                "Invalid",
+                "failed to decode kubernetes protobuf body",
+            ))
+        });
     }
     serde_json::from_slice(body).map_err(|e| {
         Box::new(status_error(
@@ -271,17 +274,6 @@ pub(crate) fn patch_impl(
         namespace,
         name,
     };
-    let mut current = match state.store.get(&rref) {
-        Ok(Some(obj)) => obj,
-        Ok(None) => {
-            return response::status_error(
-                StatusCode::NOT_FOUND,
-                "NotFound",
-                &format!("{} '{}' not found", ctx.resource_type.kind, name),
-            );
-        }
-        Err(err) => return response::anyhow_error_response(err),
-    };
     let patch: serde_json::Value = match serde_json::from_slice(&bytes) {
         Ok(v) => v,
         Err(e) => {
@@ -292,9 +284,26 @@ pub(crate) fn patch_impl(
             );
         }
     };
-    json_merge_patch(&mut current, &patch);
-    match state.store.update(&rref, &current) {
-        Ok(obj) => response::object_response(&obj),
+    match state.store.get(&rref) {
+        Ok(Some(mut current)) => {
+            json_merge_patch(&mut current, &patch);
+            match state.store.update(&rref, &current) {
+                Ok(obj) => response::object_response(&obj),
+                Err(err) => response::anyhow_error_response(err),
+            }
+        }
+        Ok(None) => {
+            // Server-side apply: create if not found
+            let mut body = patch;
+            body["metadata"]["name"] = serde_json::json!(name);
+            if let Some(ns) = namespace {
+                body["metadata"]["namespace"] = serde_json::json!(ns);
+            }
+            match state.store.create(rref, &body) {
+                Ok(obj) => response::created_response(&obj),
+                Err(err) => response::anyhow_error_response(err),
+            }
+        }
         Err(err) => response::anyhow_error_response(err),
     }
 }

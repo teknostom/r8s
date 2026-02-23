@@ -383,11 +383,20 @@ fn build_oci_spec(
 }
 
 impl ContainerRuntime for ContainerdRuntime {
-    async fn pull_image(&self, image: &str) -> anyhow::Result<ImageId> {
+    async fn pull_image(&self, image: &str, auth: Option<&RegistryAuth>) -> anyhow::Result<ImageId> {
         let full_image_ref = normalize_image_ref(image);
+        let resolver = auth.map(|a| {
+            use base64::Engine;
+            let encoded = base64::engine::general_purpose::STANDARD
+                .encode(format!("{}:{}", a.username, a.password));
+            containerd_client::types::transfer::RegistryResolver {
+                headers: [("Authorization".into(), format!("Basic {encoded}"))].into(),
+                ..Default::default()
+            }
+        });
         let oci_registry = OciRegistry {
             reference: full_image_ref.clone(),
-            resolver: Default::default(),
+            resolver,
         };
         let architecture = current_oci_arch().to_string();
         let platform = Platform {

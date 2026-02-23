@@ -2,7 +2,7 @@ use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use r8s_runtime::{
     ContainerRuntime,
-    traits::{ContainerConfig, ContainerId, Mount},
+    traits::{ContainerConfig, ContainerId, Mount, RegistryAuth},
 };
 use r8s_store::{Store, backend::ResourceRef, watch::WatchEventType};
 use r8s_types::{
@@ -207,8 +207,9 @@ async fn reconcile_pod<R: ContainerRuntime>(
         let container_name = &container_spec.name;
         let image = &container_spec.image;
 
-        // Pull image
-        if let Err(e) = runtime.pull_image(image).await {
+        // Pull image (with registry auth from imagePullSecrets if available)
+        let auth = resolve_image_auth(store, pod_ns, pod_value, image);
+        if let Err(e) = runtime.pull_image(image, auth.as_ref()).await {
             tracing::error!("pod '{pod_name}': failed to pull image '{image}': {e}");
             failed = true;
             break;
@@ -527,6 +528,61 @@ fn configmaps_gvr() -> GroupVersionResource {
 
 fn secrets_gvr() -> GroupVersionResource {
     GroupVersionResource::new("", "v1", "secrets")
+}
+
+/// Extract the registry host from an image reference (e.g. "registry.io/repo/img:tag" → "registry.io").
+fn registry_host(image: &str) -> &str {
+    let host = image.split('/').next().unwrap_or(image);
+    if host.contains('.') || host.contains(':') {
+        host
+    } else {
+        "docker.io"
+    }
+}
+
+/// Resolve registry credentials for an image from imagePullSecrets.
+///
+/// Reads the pod's `imagePullSecrets`, looks up each secret in the store,
+/// parses the `.dockerconfigjson` data, and returns credentials matching
+/// the image's registry host.
+fn resolve_image_auth(
+    store: &Store,
+    namespace: Option<&str>,
+    pod_value: &serde_json::Value,
+    image: &str,
+) -> Option<RegistryAuth> {
+    let pull_secrets = pod_value["spec"]["imagePullSecrets"].as_array()?;
+    let host = registry_host(image);
+    let gvr = secrets_gvr();
+
+    for entry in pull_secrets {
+        let secret_name = entry["name"].as_str()?;
+        let rref = ResourceRef {
+            gvr: &gvr,
+            namespace,
+            name: secret_name,
+        };
+        let secret = match store.get(&rref) {
+            Ok(Some(s)) => s,
+            _ => continue,
+        };
+        let b64 = secret["data"][".dockerconfigjson"].as_str()?;
+        use base64::Engine;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .ok()?;
+        let config: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+        // Docker config format: {"auths": {"registry.host": {"username": "...", "password": "..."}}}
+        let auths = config["auths"].as_object()?;
+        if let Some(entry) = auths.get(host) {
+            let username = entry["username"].as_str().unwrap_or_default().to_string();
+            let password = entry["password"].as_str().unwrap_or_default().to_string();
+            if !username.is_empty() {
+                return Some(RegistryAuth { username, password });
+            }
+        }
+    }
+    None
 }
 
 /// Prepare host directories for each volume declared in the pod spec.

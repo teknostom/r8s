@@ -149,6 +149,26 @@ impl ResourceRegistry {
             subresources: vec![],
         });
 
+        // policy/v1
+        r.register(ResourceType {
+            gvr: GroupVersionResource::new("policy", "v1", "poddisruptionbudgets"),
+            kind: "PodDisruptionBudget".to_string(),
+            namespaced: true,
+            singular: "poddisruptionbudget".to_string(),
+            short_names: vec!["pdb".to_string()],
+            subresources: vec![],
+        });
+
+        // autoscaling/v2
+        r.register(ResourceType {
+            gvr: GroupVersionResource::new("autoscaling", "v2", "horizontalpodautoscalers"),
+            kind: "HorizontalPodAutoscaler".to_string(),
+            namespaced: true,
+            singular: "horizontalpodautoscaler".to_string(),
+            short_names: vec!["hpa".to_string()],
+            subresources: vec![],
+        });
+
         r.register(ResourceType {
             gvr: GroupVersionResource::new(
                 "apiextensions.k8s.io",

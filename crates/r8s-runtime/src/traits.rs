@@ -36,11 +36,22 @@ pub struct ContainerConfig {
     pub mounts: Vec<Mount>,
 }
 
+/// Registry credentials for authenticated image pulls.
+#[derive(Debug, Clone)]
+pub struct RegistryAuth {
+    pub username: String,
+    pub password: String,
+}
+
 /// Pluggable container runtime interface.
 ///
 /// Implementations can use youki/libcontainer, containerd CRI, or a mock for testing.
 pub trait ContainerRuntime: Send + Sync {
-    fn pull_image(&self, image: &str) -> impl Future<Output = anyhow::Result<ImageId>> + Send;
+    fn pull_image(
+        &self,
+        image: &str,
+        auth: Option<&RegistryAuth>,
+    ) -> impl Future<Output = anyhow::Result<ImageId>> + Send;
 
     fn create_container(
         &self,

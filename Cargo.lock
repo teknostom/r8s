@@ -1282,6 +1282,7 @@ name = "r8s-runtime"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "containerd-client",
  "oci-spec",
  "prost-types",
