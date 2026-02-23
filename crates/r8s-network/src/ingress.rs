@@ -83,8 +83,13 @@ fn rebuild_routes(store: &Store) -> Vec<Route> {
             Err(_) => continue,
         };
 
+        let spec = match ing.spec.as_ref() {
+            Some(s) => s,
+            None => continue,
+        };
+
         // Backoff: skip if ingressClassName is set and not "r8s"
-        if let Some(ref class) = ing.spec.ingress_class_name {
+        if let Some(ref class) = spec.ingress_class_name {
             if class != "r8s" {
                 continue;
             }
@@ -92,7 +97,9 @@ fn rebuild_routes(store: &Store) -> Vec<Route> {
 
         let ing_ns = ing.metadata.namespace.as_deref().unwrap_or("default");
 
-        for rule in &ing.spec.rules {
+        let rules = spec.rules.as_deref().unwrap_or_default();
+
+        for rule in rules {
             let host = rule.host.clone();
 
             let http = match &rule.http {
@@ -101,15 +108,22 @@ fn rebuild_routes(store: &Store) -> Vec<Route> {
             };
 
             for path_entry in &http.paths {
-                let path = path_entry.path.clone();
-                let prefix = path_entry.path_type.as_deref() != Some("Exact");
+                let path = path_entry
+                    .path
+                    .clone()
+                    .unwrap_or_else(|| "/".to_string());
+                let prefix = path_entry.path_type.as_str() != "Exact";
 
                 let svc_backend = match &path_entry.backend.service {
                     Some(s) => s,
                     None => continue,
                 };
-                let svc_port = match svc_backend.port.number {
-                    Some(p) => p,
+                let svc_port = match svc_backend
+                    .port
+                    .as_ref()
+                    .and_then(|p| p.number)
+                {
+                    Some(p) => p as u16,
                     None => continue,
                 };
 
@@ -128,14 +142,15 @@ fn rebuild_routes(store: &Store) -> Vec<Route> {
                             Err(_) => continue,
                         };
                         let mut addrs = Vec::new();
-                        for subset in &ep.subsets {
+                        for subset in ep.subsets.as_deref().unwrap_or_default() {
                             let target_port = subset
                                 .ports
-                                .first()
+                                .as_ref()
+                                .and_then(|p| p.first())
                                 .map(|p| p.port as u16)
                                 .unwrap_or(svc_port);
 
-                            for addr in &subset.addresses {
+                            for addr in subset.addresses.as_deref().unwrap_or_default() {
                                 if let Ok(ip) = addr.ip.parse() {
                                     addrs.push(Backend {
                                         addr: SocketAddr::new(ip, target_port),
@@ -221,7 +236,7 @@ async fn proxy_request(
 
     match sender.send_request(req).await {
         Ok(resp) => {
-            // Stream the response body directly — no buffering
+            // Stream the response body directly -- no buffering
             let (parts, body) = resp.into_parts();
             Ok(Response::from_parts(parts, Either::Right(body)))
         }

@@ -67,13 +67,12 @@ fn ensure_default_sa(store: &Store, sa_gvr: &GroupVersionResource, namespace: &s
         Ok(Some(_)) => {}
         Ok(None) => {
             let sa = ServiceAccount {
-                api_version: "v1".into(),
-                kind: "ServiceAccount".into(),
                 metadata: ObjectMeta {
                     name: Some("default".into()),
                     namespace: Some(namespace.into()),
                     ..Default::default()
                 },
+                ..Default::default()
             };
             let value = match serde_json::to_value(&sa) {
                 Ok(v) => v,

@@ -1,7 +1,6 @@
 use r8s_store::{Store, backend::ResourceRef, watch::WatchEventType};
 use r8s_types::{
-    GroupVersionResource, ObjectMeta, OwnerReference, Pod,
-    statefulset::StatefulSetStatus,
+    GroupVersionResource, ObjectMeta, OwnerReference, Pod, PodTemplateSpec, StatefulSetStatus,
 };
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
@@ -15,7 +14,11 @@ fn pods_gvr() -> GroupVersionResource {
 }
 
 fn is_owned_by(meta: &ObjectMeta, owner_uid: &str) -> bool {
-    meta.owner_references.iter().any(|r| r.uid == owner_uid)
+    meta.owner_references
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .any(|r| r.uid == owner_uid)
 }
 
 pub async fn run(store: Store, shutdown: CancellationToken) -> anyhow::Result<()> {
@@ -52,7 +55,7 @@ pub async fn run(store: Store, shutdown: CancellationToken) -> anyhow::Result<()
                             Ok(p) => p,
                             Err(_) => continue,
                         };
-                        if let Some(owner) = pod.metadata.owner_references.iter().find(|r| r.kind == "StatefulSet") {
+                        if let Some(owner) = pod.metadata.owner_references.as_deref().unwrap_or_default().iter().find(|r| r.kind == "StatefulSet") {
                             let resource_ref = ResourceRef {
                                 gvr: &sts_gvr(),
                                 namespace: pod.metadata.namespace.as_deref(),
@@ -110,9 +113,13 @@ fn reconcile_sts(store: &Store, sts_value: &serde_json::Value) -> anyhow::Result
     };
     let current: r8s_types::StatefulSet = serde_json::from_value(current_value)?;
     let current_uid = current.metadata.uid.as_deref().unwrap_or(sts_uid);
+    let current_spec = current
+        .spec
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("StatefulSet has no spec"))?;
 
-    let desired = current.spec.replicas;
-    let template = &current.spec.template;
+    let desired = current_spec.replicas.unwrap_or(1) as u64;
+    let template = &current_spec.template;
 
     let pod_gvr = pods_gvr();
     let pods = store.list(&pod_gvr, sts_ns, None, None, None, None)?;
@@ -170,7 +177,7 @@ fn reconcile_sts(store: &Store, sts_value: &serde_json::Value) -> anyhow::Result
         .filter_map(|v| serde_json::from_value::<Pod>(v.clone()).ok())
         .filter(|p| is_owned_by(&p.metadata, current_uid))
         .collect();
-    let total = final_owned.len() as u64;
+    let total = final_owned.len() as i32;
     let ready = final_owned
         .iter()
         .filter(|p| {
@@ -178,7 +185,7 @@ fn reconcile_sts(store: &Store, sts_value: &serde_json::Value) -> anyhow::Result
                 .as_ref()
                 .is_some_and(|s| s.phase.as_deref() == Some("Running"))
         })
-        .count() as u64;
+        .count() as i32;
     update_sts_status(store, sts_name, sts_ns, total, ready)?;
 
     Ok(())
@@ -198,31 +205,33 @@ fn create_pod(
     sts_name: &str,
     sts_uid: &str,
     namespace: Option<&str>,
-    template: &r8s_types::PodTemplateSpec,
+    template: &PodTemplateSpec,
     ordinal: u64,
 ) -> anyhow::Result<()> {
     let pod_name = format!("{sts_name}-{ordinal}");
-    let mut labels = template.metadata.labels.clone();
+    let mut labels = template
+        .metadata
+        .as_ref()
+        .and_then(|m| m.labels.clone())
+        .unwrap_or_default();
     labels.insert(
         "statefulset.kubernetes.io/pod-name".into(),
         pod_name.clone(),
     );
 
     let pod = Pod {
-        api_version: "v1".into(),
-        kind: "Pod".into(),
         metadata: ObjectMeta {
             name: Some(pod_name.clone()),
             namespace: namespace.map(String::from),
-            labels,
-            owner_references: vec![OwnerReference {
+            labels: Some(labels),
+            owner_references: Some(vec![OwnerReference {
                 api_version: "apps/v1".into(),
                 kind: "StatefulSet".into(),
                 name: sts_name.into(),
                 uid: sts_uid.into(),
                 controller: Some(true),
                 block_owner_deletion: Some(true),
-            }],
+            }]),
             ..Default::default()
         },
         spec: template.spec.clone(),
@@ -243,8 +252,8 @@ fn update_sts_status(
     store: &Store,
     sts_name: &str,
     sts_ns: Option<&str>,
-    total: u64,
-    ready: u64,
+    total: i32,
+    ready: i32,
 ) -> anyhow::Result<()> {
     let gvr = sts_gvr();
     let resource_ref = ResourceRef {
@@ -262,8 +271,9 @@ fn update_sts_status(
     let old_status = current.get("status");
     let new_status = StatefulSetStatus {
         replicas: total,
-        ready_replicas: ready,
-        available_replicas: ready,
+        ready_replicas: Some(ready),
+        available_replicas: Some(ready),
+        ..Default::default()
     };
     let new_status_val = serde_json::to_value(&new_status)?;
     if old_status == Some(&new_status_val) {

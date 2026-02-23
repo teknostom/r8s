@@ -6,11 +6,8 @@ use r8s_runtime::{
 };
 use r8s_store::{Store, backend::ResourceRef, watch::WatchEventType};
 use r8s_types::{
-    GroupVersionResource, Pod,
-    pod::{
-        ContainerState, ContainerStateRunning, ContainerStatusInfo, PodCondition, PodIP, PodStatus,
-        Volume, VolumeMount,
-    },
+    ContainerState, ContainerStateRunning, ContainerStatus, GroupVersionResource, Pod,
+    PodCondition, PodIP, PodStatus, Time, Volume, VolumeMount,
 };
 use rustc_hash::FxHashMap;
 use tokio::sync::broadcast;
@@ -149,7 +146,7 @@ async fn reconcile_pod<R: ContainerRuntime>(
     };
 
     // Only care about pods on our node
-    if pod.spec.node_name.as_deref() != Some(NODE_NAME) {
+    if pod.spec.as_ref().and_then(|s| s.node_name.as_deref()) != Some(NODE_NAME) {
         return;
     }
 
@@ -163,7 +160,7 @@ async fn reconcile_pod<R: ContainerRuntime>(
         None => return,
     };
 
-    // Already tracked — just ensure status is up to date
+    // Already tracked -- just ensure status is up to date
     if let Some(pc) = pod_containers.get(&pod_uid) {
         if pod
             .status
@@ -177,14 +174,20 @@ async fn reconcile_pod<R: ContainerRuntime>(
         return;
     }
 
-    // New pod — start containers
-    if pod.spec.containers.is_empty() {
+    let spec = match pod.spec.as_ref() {
+        Some(s) => s,
+        None => return,
+    };
+
+    // New pod -- start containers
+    if spec.containers.is_empty() {
         tracing::warn!("pod '{pod_name}' has no containers in spec");
         return;
     }
 
     // Prepare volumes before creating containers
-    let volume_paths = match prepare_volumes(store, data_dir, &pod_uid, pod_ns, &pod.spec.volumes)
+    let volumes = spec.volumes.as_deref().unwrap_or_default();
+    let volume_paths = match prepare_volumes(store, data_dir, &pod_uid, pod_ns, volumes)
     {
         Ok(paths) => paths,
         Err(e) => {
@@ -203,9 +206,9 @@ async fn reconcile_pod<R: ContainerRuntime>(
     let mut container_ids: Vec<ContainerId> = Vec::new();
     let mut failed = false;
 
-    for container_spec in &pod.spec.containers {
+    for container_spec in &spec.containers {
         let container_name = &container_spec.name;
-        let image = &container_spec.image;
+        let image = container_spec.image.as_deref().unwrap_or("unknown");
 
         // Pull image (with registry auth from imagePullSecrets if available)
         let auth = resolve_image_auth(store, pod_ns, pod_value, image);
@@ -233,7 +236,7 @@ async fn reconcile_pod<R: ContainerRuntime>(
                     .as_ref()
                     .map(|envs| {
                         envs.iter()
-                            .map(|e| (e.name.clone(), e.value.clone()))
+                            .map(|e| (e.name.clone(), e.value.clone().unwrap_or_default()))
                             .collect()
                     })
                     .unwrap_or_default();
@@ -342,27 +345,36 @@ fn update_pod_status(
         Err(_) => return,
     };
 
-    let now = chrono::Utc::now().to_rfc3339();
+    let now = Time(chrono::Utc::now());
     let pod_ip = format!("10.244.0.{pod_ip_num}");
 
-    let container_statuses: Vec<ContainerStatusInfo> = current_pod
+    let containers = current_pod
         .spec
-        .containers
+        .as_ref()
+        .map(|s| s.containers.as_slice())
+        .unwrap_or_default();
+
+    let container_statuses: Vec<ContainerStatus> = containers
         .iter()
         .zip(pc.container_ids.iter())
-        .map(|(spec, cid)| ContainerStatusInfo {
-            name: spec.name.clone(),
-            image: spec.image.clone(),
-            image_id: spec.image.clone(),
-            container_id: Some(cid.0.clone()),
-            ready: true,
-            started: true,
-            restart_count: 0,
-            state: Some(ContainerState {
-                running: Some(ContainerStateRunning {
-                    started_at: Some(now.clone()),
+        .map(|(spec, cid)| {
+            let image = spec.image.clone().unwrap_or_default();
+            ContainerStatus {
+                name: spec.name.clone(),
+                image: image.clone(),
+                image_id: image,
+                container_id: Some(cid.0.clone()),
+                ready: true,
+                started: Some(true),
+                restart_count: 0,
+                state: Some(ContainerState {
+                    running: Some(ContainerStateRunning {
+                        started_at: Some(now.clone()),
+                    }),
+                    ..Default::default()
                 }),
-            }),
+                ..Default::default()
+            }
         })
         .collect();
 
@@ -370,7 +382,7 @@ fn update_pod_status(
     let mut conditions = current_pod
         .status
         .as_ref()
-        .map(|s| s.conditions.clone())
+        .and_then(|s| s.conditions.clone())
         .unwrap_or_default();
 
     if !conditions.iter().any(|c| c.type_ == "Ready") {
@@ -378,6 +390,7 @@ fn update_pod_status(
             type_: "Ready".into(),
             status: "True".into(),
             last_transition_time: Some(now.clone()),
+            ..Default::default()
         });
     }
     if !conditions.iter().any(|c| c.type_ == "Initialized") {
@@ -385,6 +398,7 @@ fn update_pod_status(
             type_: "Initialized".into(),
             status: "True".into(),
             last_transition_time: Some(now.clone()),
+            ..Default::default()
         });
     }
     if !conditions.iter().any(|c| c.type_ == "ContainersReady") {
@@ -392,6 +406,7 @@ fn update_pod_status(
             type_: "ContainersReady".into(),
             status: "True".into(),
             last_transition_time: Some(now.clone()),
+            ..Default::default()
         });
     }
 
@@ -399,10 +414,13 @@ fn update_pod_status(
         phase: Some("Running".into()),
         host_ip: Some("127.0.0.1".into()),
         pod_ip: Some(pod_ip.clone()),
-        pod_ips: Some(vec![PodIP { ip: pod_ip.clone() }]),
+        pod_ips: Some(vec![PodIP {
+            ip: pod_ip.clone(),
+        }]),
         start_time: Some(now),
-        conditions,
-        container_statuses,
+        conditions: Some(conditions),
+        container_statuses: Some(container_statuses),
+        ..Default::default()
     };
     current["status"] = serde_json::to_value(&status).unwrap_or_default();
 
@@ -424,7 +442,7 @@ async fn handle_pod_deleted<R: ContainerRuntime>(
         Err(_) => return,
     };
 
-    if pod.spec.node_name.as_deref() != Some(NODE_NAME) {
+    if pod.spec.as_ref().and_then(|s| s.node_name.as_deref()) != Some(NODE_NAME) {
         return;
     }
 
@@ -530,7 +548,7 @@ fn secrets_gvr() -> GroupVersionResource {
     GroupVersionResource::new("", "v1", "secrets")
 }
 
-/// Extract the registry host from an image reference (e.g. "registry.io/repo/img:tag" → "registry.io").
+/// Extract the registry host from an image reference (e.g. "registry.io/repo/img:tag" -> "registry.io").
 fn registry_host(image: &str) -> &str {
     let host = image.split('/').next().unwrap_or(image);
     if host.contains('.') || host.contains(':') {
@@ -586,7 +604,7 @@ fn resolve_image_auth(
 }
 
 /// Prepare host directories for each volume declared in the pod spec.
-/// Returns a map of volume name → host path.
+/// Returns a map of volume name -> host path.
 fn prepare_volumes(
     store: &Store,
     data_dir: &PathBuf,
@@ -620,7 +638,8 @@ fn prepare_volumes(
                 .join(pod_uid)
                 .join(&vol.name);
             std::fs::create_dir_all(&dir)?;
-            project_secret(store, pod_ns, &secret_src.secret_name, &dir)?;
+            let secret_name = secret_src.secret_name.as_deref().unwrap_or_default();
+            project_secret(store, pod_ns, secret_name, &dir)?;
             dir.to_string_lossy().to_string()
         } else {
             tracing::warn!("volume '{}': unsupported volume source, skipping", vol.name);

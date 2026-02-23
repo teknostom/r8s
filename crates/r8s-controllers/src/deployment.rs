@@ -2,9 +2,8 @@ use std::hash::{Hash, Hasher};
 
 use r8s_store::{Store, backend::ResourceRef, watch::WatchEventType};
 use r8s_types::{
-    Deployment, GroupVersionResource, ObjectMeta, OwnerReference, ReplicaSet,
-    deployment::{DeploymentCondition, DeploymentStatus},
-    replicaset::ReplicaSetSpec,
+    Deployment, DeploymentCondition, DeploymentStatus, GroupVersionResource,
+    ObjectMeta, OwnerReference, ReplicaSet, ReplicaSetSpec,
 };
 use rustc_hash::FxHasher;
 use tokio::sync::broadcast;
@@ -19,7 +18,11 @@ fn rs_gvr() -> GroupVersionResource {
 }
 
 fn is_owned_by(meta: &ObjectMeta, owner_uid: &str) -> bool {
-    meta.owner_references.iter().any(|r| r.uid == owner_uid)
+    meta.owner_references
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .any(|r| r.uid == owner_uid)
 }
 
 fn template_hash(template: &serde_json::Value) -> String {
@@ -63,7 +66,7 @@ pub async fn run(store: Store, shutdown: CancellationToken) -> anyhow::Result<()
                             Ok(r) => r,
                             Err(_) => continue,
                         };
-                        if let Some(owner) = rs.metadata.owner_references.iter().find(|r| r.kind == "Deployment") {
+                        if let Some(owner) = rs.metadata.owner_references.as_deref().unwrap_or_default().iter().find(|r| r.kind == "Deployment") {
                             let d_gvr = deploy_gvr();
                             let rref = ResourceRef {
                                 gvr: &d_gvr,
@@ -122,9 +125,13 @@ fn reconcile_deployment(store: &Store, deploy_value: &serde_json::Value) -> anyh
     };
     let current: Deployment = serde_json::from_value(current_value.clone())?;
     let current_uid = current.metadata.uid.as_deref().unwrap_or(deploy_uid);
+    let current_spec = current
+        .spec
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("Deployment has no spec"))?;
 
-    let desired_replicas = current.spec.replicas;
-    let template_value = serde_json::to_value(&current.spec.template)?;
+    let desired_replicas = current_spec.replicas.unwrap_or(1);
+    let template_value = serde_json::to_value(&current_spec.template)?;
     let hash = template_hash(&template_value);
     let rs_name = format!("{deploy_name}-{hash}");
 
@@ -145,7 +152,12 @@ fn reconcile_deployment(store: &Store, deploy_value: &serde_json::Value) -> anyh
 
     if let Some(existing_rs) = matching {
         // Ensure replicas match
-        if existing_rs.spec.replicas != desired_replicas {
+        let existing_replicas = existing_rs
+            .spec
+            .as_ref()
+            .and_then(|s| s.replicas)
+            .unwrap_or(1);
+        if existing_replicas != desired_replicas {
             let rs_rref = ResourceRef {
                 gvr: &rs_gvr,
                 namespace: deploy_ns,
@@ -161,8 +173,7 @@ fn reconcile_deployment(store: &Store, deploy_value: &serde_json::Value) -> anyh
         }
     } else {
         // Create new RS
-        let mut labels = current
-            .spec
+        let mut labels = current_spec
             .selector
             .match_labels
             .clone()
@@ -170,27 +181,26 @@ fn reconcile_deployment(store: &Store, deploy_value: &serde_json::Value) -> anyh
         labels.insert("pod-template-hash".into(), hash.clone());
 
         let rs = ReplicaSet {
-            api_version: "apps/v1".into(),
-            kind: "ReplicaSet".into(),
             metadata: ObjectMeta {
                 name: Some(rs_name.clone()),
                 namespace: deploy_ns.map(String::from),
-                labels: labels.clone(),
-                owner_references: vec![OwnerReference {
+                labels: Some(labels.clone()),
+                owner_references: Some(vec![OwnerReference {
                     api_version: "apps/v1".into(),
                     kind: "Deployment".into(),
                     name: deploy_name.into(),
                     uid: current_uid.into(),
                     controller: Some(true),
                     block_owner_deletion: Some(true),
-                }],
+                }]),
                 ..Default::default()
             },
-            spec: ReplicaSetSpec {
-                replicas: desired_replicas,
-                selector: current.spec.selector.clone(),
-                template: current.spec.template.clone(),
-            },
+            spec: Some(ReplicaSetSpec {
+                replicas: Some(desired_replicas),
+                selector: current_spec.selector.clone(),
+                template: Some(current_spec.template.clone()),
+                ..Default::default()
+            }),
             status: None,
         };
 
@@ -208,7 +218,12 @@ fn reconcile_deployment(store: &Store, deploy_value: &serde_json::Value) -> anyh
     // Scale down old RSes
     for old_rs in &owned_rs {
         let name = old_rs.metadata.name.as_deref().unwrap_or("");
-        if name != rs_name && old_rs.spec.replicas > 0 {
+        let old_replicas = old_rs
+            .spec
+            .as_ref()
+            .and_then(|s| s.replicas)
+            .unwrap_or(0);
+        if name != rs_name && old_replicas > 0 {
             let rs_rref = ResourceRef {
                 gvr: &rs_gvr,
                 namespace: deploy_ns,
@@ -248,8 +263,8 @@ fn update_deploy_status(store: &Store, deploy_value: &serde_json::Value) -> anyh
 
     let rs_gvr = rs_gvr();
     let all_rs = store.list(&rs_gvr, deploy_ns, None, None, None, None)?;
-    let mut total_replicas: u64 = 0;
-    let mut ready_replicas: u64 = 0;
+    let mut total_replicas: i32 = 0;
+    let mut ready_replicas: i32 = 0;
     for rs_value in &all_rs.items {
         let rs: ReplicaSet = match serde_json::from_value(rs_value.clone()) {
             Ok(r) => r,
@@ -258,15 +273,15 @@ fn update_deploy_status(store: &Store, deploy_value: &serde_json::Value) -> anyh
         if is_owned_by(&rs.metadata, deploy_uid) {
             let status = rs.status.unwrap_or_default();
             total_replicas += status.replicas;
-            ready_replicas += status.ready_replicas;
+            ready_replicas += status.ready_replicas.unwrap_or(0);
         }
     }
 
     let status = DeploymentStatus {
-        replicas: total_replicas,
-        ready_replicas,
-        available_replicas: ready_replicas,
-        conditions: vec![DeploymentCondition {
+        replicas: Some(total_replicas),
+        ready_replicas: Some(ready_replicas),
+        available_replicas: Some(ready_replicas),
+        conditions: Some(vec![DeploymentCondition {
             type_: "Available".into(),
             status: if ready_replicas > 0 {
                 "True".into()
@@ -274,7 +289,9 @@ fn update_deploy_status(store: &Store, deploy_value: &serde_json::Value) -> anyh
                 "False".into()
             },
             reason: Some("MinimumReplicasAvailable".into()),
-        }],
+            ..Default::default()
+        }]),
+        ..Default::default()
     };
     let new_status_val = serde_json::to_value(&status)?;
     if current.get("status") == Some(&new_status_val) {

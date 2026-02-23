@@ -1,36 +1,54 @@
 pub mod registry;
 pub mod resource;
 
-// K8s resource types
-pub mod meta;
-pub mod pod;
-pub mod service;
-pub mod endpoints;
-pub mod endpointslice;
-pub mod deployment;
-pub mod replicaset;
-pub mod ingress;
-pub mod ingressclass;
-pub mod namespace;
-pub mod serviceaccount;
-pub mod node;
-pub mod crd;
-pub mod statefulset;
-
 pub use resource::{GroupVersionResource, ResourceType};
 
-// Re-export top-level resource types
-pub use deployment::Deployment;
-pub use endpoints::Endpoints;
-pub use endpointslice::EndpointSlice;
-pub use ingress::Ingress;
-pub use ingressclass::IngressClass;
-pub use meta::{LabelSelector, ObjectMeta, ObjectReference, OwnerReference, PodTemplateSpec};
-pub use namespace::Namespace;
-pub use node::Node;
-pub use pod::Pod;
-pub use replicaset::ReplicaSet;
-pub use service::Service;
-pub use serviceaccount::ServiceAccount;
-pub use crd::CustomResourceDefinition;
-pub use statefulset::StatefulSet;
+// --- Re-exports from k8s-openapi ---
+
+// Core v1 types
+pub use k8s_openapi::api::core::v1::{
+    ConfigMap, ConfigMapVolumeSource, Container, ContainerPort, ContainerState,
+    ContainerStateRunning, ContainerStateTerminated, ContainerStateWaiting, ContainerStatus,
+    EmptyDirVolumeSource, EndpointAddress, EndpointPort, EndpointSubset, Endpoints, EnvVar,
+    EnvVarSource, HostPathVolumeSource, LocalObjectReference, Namespace, NamespaceStatus, Node,
+    NodeCondition, NodeSpec, NodeStatus, NodeSystemInfo, ObjectReference, Pod, PodCondition, PodIP,
+    PodSpec, PodStatus, PodTemplateSpec, Secret, SecretVolumeSource, Service, ServiceAccount,
+    ServicePort, ServiceSpec, Volume, VolumeMount,
+};
+
+// Resource types
+pub use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
+
+// Time type
+pub use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
+
+// Apps v1 types
+pub use k8s_openapi::api::apps::v1::{
+    Deployment, DeploymentCondition, DeploymentSpec, DeploymentStatus, ReplicaSet, ReplicaSetSpec,
+    ReplicaSetStatus, StatefulSet, StatefulSetSpec, StatefulSetStatus,
+};
+
+// Networking v1 types
+pub use k8s_openapi::api::networking::v1::{
+    HTTPIngressPath, HTTPIngressRuleValue, Ingress, IngressBackend, IngressClass, IngressClassSpec,
+    IngressRule, IngressSpec, IngressServiceBackend, ServiceBackendPort,
+};
+
+// Discovery v1 types
+pub use k8s_openapi::api::discovery::v1::{
+    Endpoint as SliceEndpoint, EndpointConditions, EndpointSlice,
+};
+
+// Meta v1 types
+pub use k8s_openapi::apimachinery::pkg::apis::meta::v1::{
+    LabelSelector, ObjectMeta, OwnerReference,
+};
+
+// Utility types
+pub use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
+
+// CRD types
+pub use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::{
+    CustomResourceDefinition, CustomResourceDefinitionNames,
+    CustomResourceDefinitionSpec, CustomResourceDefinitionVersion,
+};

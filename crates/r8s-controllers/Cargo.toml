@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 r8s-types.workspace = true
 r8s-store.workspace = true
+k8s-openapi.workspace = true
 
 tokio.workspace = true
 tokio-util.workspace = true

@@ -2,11 +2,9 @@ use std::collections::BTreeMap;
 
 use r8s_store::{Store, backend::ResourceRef};
 use r8s_types::{
-    GroupVersionResource, IngressClass, Namespace, ObjectMeta, Service,
-    endpoints::{EndpointAddress, EndpointPort, EndpointSubset, Endpoints},
-    ingressclass::IngressClassSpec,
-    namespace::NamespaceStatus,
-    service::{ServicePort, ServiceSpec},
+    EndpointAddress, EndpointPort, EndpointSubset, Endpoints, GroupVersionResource, IngressClass,
+    IngressClassSpec, IntOrString, Namespace, NamespaceStatus, ObjectMeta, Service, ServicePort,
+    ServiceSpec,
 };
 
 pub fn bootstrap_namespaces(store: &Store) -> anyhow::Result<()> {
@@ -20,13 +18,13 @@ pub fn bootstrap_namespaces(store: &Store) -> anyhow::Result<()> {
         };
         if store.get(&resource_ref)?.is_none() {
             let ns = Namespace {
-                api_version: "v1".into(),
-                kind: "Namespace".into(),
                 metadata: ObjectMeta {
                     name: Some(ns_name.into()),
                     ..Default::default()
                 },
+                spec: None,
                 status: Some(NamespaceStatus {
+                    conditions: None,
                     phase: Some("Active".into()),
                 }),
             };
@@ -43,28 +41,28 @@ pub fn bootstrap_namespaces(store: &Store) -> anyhow::Result<()> {
     };
     if store.get(&svc_ref)?.is_none() {
         let svc = Service {
-            api_version: "v1".into(),
-            kind: "Service".into(),
             metadata: ObjectMeta {
                 name: Some("kubernetes".into()),
                 namespace: Some("default".into()),
-                labels: BTreeMap::from([
+                labels: Some(BTreeMap::from([
                     ("component".into(), "apiserver".into()),
                     ("provider".into(), "kubernetes".into()),
-                ]),
+                ])),
                 ..Default::default()
             },
-            spec: ServiceSpec {
+            spec: Some(ServiceSpec {
                 type_: Some("ClusterIP".into()),
                 cluster_ip: Some("10.96.0.1".into()),
-                ports: vec![ServicePort {
+                ports: Some(vec![ServicePort {
                     name: Some("https".into()),
                     port: 443,
-                    target_port: Some(6443),
-                    protocol: "TCP".into(),
-                }],
+                    target_port: Some(IntOrString::Int(6443)),
+                    protocol: Some("TCP".into()),
+                    ..Default::default()
+                }]),
                 ..Default::default()
-            },
+            }),
+            status: None,
         };
         store.create(svc_ref, &serde_json::to_value(&svc)?)?;
         tracing::info!("bootstrapped 'kubernetes' service");
@@ -79,24 +77,25 @@ pub fn bootstrap_namespaces(store: &Store) -> anyhow::Result<()> {
     };
     if store.get(&ep_ref)?.is_none() {
         let ep = Endpoints {
-            api_version: "v1".into(),
-            kind: "Endpoints".into(),
             metadata: ObjectMeta {
                 name: Some("kubernetes".into()),
                 namespace: Some("default".into()),
                 ..Default::default()
             },
-            subsets: vec![EndpointSubset {
-                addresses: vec![EndpointAddress {
+            subsets: Some(vec![EndpointSubset {
+                addresses: Some(vec![EndpointAddress {
                     ip: "10.244.0.1".into(),
                     target_ref: None,
-                }],
-                ports: vec![EndpointPort {
+                    ..Default::default()
+                }]),
+                ports: Some(vec![EndpointPort {
                     port: 6443,
-                    protocol: "TCP".into(),
+                    protocol: Some("TCP".into()),
                     name: Some("https".into()),
-                }],
-            }],
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            }]),
         };
         store.create(ep_ref, &serde_json::to_value(&ep)?)?;
         tracing::info!("bootstrapped 'kubernetes' endpoints");
@@ -114,18 +113,17 @@ pub fn bootstrap_ingress_class(store: &Store) -> anyhow::Result<()> {
     };
     if store.get(&rref)?.is_none() {
         let ic = IngressClass {
-            api_version: "networking.k8s.io/v1".into(),
-            kind: "IngressClass".into(),
             metadata: ObjectMeta {
                 name: Some("r8s".into()),
-                annotations: BTreeMap::from([(
+                annotations: Some(BTreeMap::from([(
                     "ingressclass.kubernetes.io/is-default-class".into(),
                     "true".into(),
-                )]),
+                )])),
                 ..Default::default()
             },
             spec: Some(IngressClassSpec {
                 controller: Some("r8s.dev/ingress-controller".into()),
+                ..Default::default()
             }),
         };
         store.create(rref, &serde_json::to_value(&ic)?)?;

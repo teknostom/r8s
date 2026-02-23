@@ -83,8 +83,8 @@ fn register_crd(registry: &ResourceRegistry, crd: &CustomResourceDefinition) {
             gvr,
             kind: spec.names.kind.clone(),
             namespaced,
-            singular: spec.names.singular.clone(),
-            short_names: spec.names.short_names.clone(),
+            singular: spec.names.singular.clone().unwrap_or_default(),
+            short_names: spec.names.short_names.clone().unwrap_or_default(),
             subresources: vec![],
         };
         tracing::info!(

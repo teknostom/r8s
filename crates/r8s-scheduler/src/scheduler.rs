@@ -2,9 +2,8 @@ use std::collections::BTreeMap;
 
 use r8s_store::{Store, backend::ResourceRef, watch::WatchEventType};
 use r8s_types::{
-    GroupVersionResource, Node, ObjectMeta, Pod,
-    node::{NodeCondition, NodeStatus, NodeSystemInfo},
-    pod::PodCondition,
+    GroupVersionResource, Node, NodeCondition, NodeSpec, NodeStatus, NodeSystemInfo, ObjectMeta,
+    Pod, PodCondition, Quantity, Time,
 };
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
@@ -62,44 +61,46 @@ fn register_node(store: &Store) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let now = chrono::Utc::now().to_rfc3339();
+    let now = Time(chrono::Utc::now());
     let cpu_count = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1);
     let memory_ki = read_memtotal_ki().unwrap_or(8 * 1024 * 1024); // fallback 8Gi
     let capacity = BTreeMap::from([
-        ("cpu".into(), cpu_count.to_string()),
-        ("memory".into(), format!("{memory_ki}Ki")),
-        ("pods".into(), "110".into()),
+        ("cpu".into(), Quantity(cpu_count.to_string())),
+        ("memory".into(), Quantity(format!("{memory_ki}Ki"))),
+        ("pods".into(), Quantity("110".into())),
     ]);
     let node = Node {
-        api_version: "v1".into(),
-        kind: "Node".into(),
         metadata: ObjectMeta {
             name: Some(NODE_NAME.into()),
-            labels: BTreeMap::from([
+            labels: Some(BTreeMap::from([
                 ("kubernetes.io/hostname".into(), NODE_NAME.into()),
                 ("kubernetes.io/os".into(), "linux".into()),
                 ("kubernetes.io/arch".into(), std::env::consts::ARCH.into()),
-            ]),
+            ])),
             ..Default::default()
         },
+        spec: Some(NodeSpec::default()),
         status: Some(NodeStatus {
-            conditions: vec![NodeCondition {
+            conditions: Some(vec![NodeCondition {
                 type_: "Ready".into(),
                 status: "True".into(),
                 last_heartbeat_time: Some(now.clone()),
                 last_transition_time: Some(now),
                 reason: Some("KubeletReady".into()),
                 message: Some("r8s node is ready".into()),
-            }],
+                ..Default::default()
+            }]),
             node_info: Some(NodeSystemInfo {
                 operating_system: "linux".into(),
                 architecture: std::env::consts::ARCH.into(),
                 kubelet_version: "v1.32.0-r8s".into(),
+                ..Default::default()
             }),
             capacity: Some(capacity.clone()),
             allocatable: Some(capacity),
+            ..Default::default()
         }),
     };
 
@@ -128,7 +129,12 @@ fn schedule_pod(store: &Store, pod_value: &serde_json::Value) {
     };
 
     // Already scheduled
-    if pod.spec.node_name.as_ref().is_some_and(|n| !n.is_empty()) {
+    if pod
+        .spec
+        .as_ref()
+        .and_then(|s| s.node_name.as_ref())
+        .is_some_and(|n| !n.is_empty())
+    {
         return;
     }
 
@@ -157,8 +163,8 @@ fn schedule_pod(store: &Store, pod_value: &serde_json::Value) {
     };
     if current_pod
         .spec
-        .node_name
         .as_ref()
+        .and_then(|s| s.node_name.as_ref())
         .is_some_and(|n| !n.is_empty())
     {
         return;
@@ -168,11 +174,12 @@ fn schedule_pod(store: &Store, pod_value: &serde_json::Value) {
     current["spec"]["nodeName"] = serde_json::json!(NODE_NAME);
 
     // Set scheduling condition
-    let now = chrono::Utc::now().to_rfc3339();
+    let now = Time(chrono::Utc::now());
     let conditions = vec![PodCondition {
         type_: "PodScheduled".into(),
         status: "True".into(),
         last_transition_time: Some(now),
+        ..Default::default()
     }];
     current["status"]["conditions"] = serde_json::to_value(&conditions).unwrap_or_default();
 

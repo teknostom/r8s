@@ -129,8 +129,9 @@ impl Store {
 
         let meta: ObjectMeta =
             serde_json::from_value(obj["metadata"].clone()).unwrap_or_default();
+        let empty_labels = std::collections::BTreeMap::new();
         self.index
-            .update(&resource.gvr.key_prefix(), &key, &meta.labels);
+            .update(&resource.gvr.key_prefix(), &key, meta.labels.as_ref().unwrap_or(&empty_labels));
 
         self.watches.notify(
             &resource.gvr.key_prefix(),
@@ -223,8 +224,9 @@ impl Store {
 
         let meta: ObjectMeta =
             serde_json::from_value(obj["metadata"].clone()).unwrap_or_default();
+        let empty_labels = std::collections::BTreeMap::new();
         self.index
-            .update(&resource.gvr.key_prefix(), &key, &meta.labels);
+            .update(&resource.gvr.key_prefix(), &key, meta.labels.as_ref().unwrap_or(&empty_labels));
 
         self.watches.notify(
             &resource.gvr.key_prefix(),

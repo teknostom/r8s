@@ -85,7 +85,7 @@ fn parse_query(packet: &[u8]) -> Option<String> {
         if label_len == 0 {
             break;
         }
-        // Pointer (compression) — not expected in queries but handle it
+        // Pointer (compression) -- not expected in queries but handle it
         if label_len & 0xC0 == 0xC0 {
             return None; // Don't handle compressed queries
         }
@@ -119,7 +119,10 @@ fn resolve_service(store: &Store, query: &[u8], name: &str) -> Option<Vec<u8>> {
 
     let svc_value = store.get(&resource_ref).ok()??;
     let svc: Service = serde_json::from_value(svc_value).ok()?;
-    let cluster_ip = svc.spec.cluster_ip.as_deref()?;
+    let cluster_ip = svc
+        .spec
+        .as_ref()
+        .and_then(|s| s.cluster_ip.as_deref())?;
     let ip: Ipv4Addr = cluster_ip.parse().ok()?;
 
     Some(build_a_response(query, ip))

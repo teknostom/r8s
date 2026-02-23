@@ -1,7 +1,7 @@
 use std::process::Command;
 
 use r8s_store::Store;
-use r8s_types::{Endpoints, GroupVersionResource, Service};
+use r8s_types::{Endpoints, GroupVersionResource, IntOrString, Service};
 
 fn services_gvr() -> GroupVersionResource {
     GroupVersionResource::new("", "v1", "services")
@@ -12,7 +12,7 @@ fn endpoints_gvr() -> GroupVersionResource {
 }
 
 /// Create the r8s nftables table with NAT chains.
-/// Idempotent — safe to call if the table already exists.
+/// Idempotent -- safe to call if the table already exists.
 pub fn setup_nat_table() -> anyhow::Result<()> {
     // Delete existing table first (ignore errors if it doesn't exist)
     let _ = nft(&["delete", "table", "ip", "r8s"]);
@@ -80,12 +80,18 @@ pub fn sync_service_rules(store: &Store) -> anyhow::Result<()> {
             None => continue,
         };
         let svc_ns = svc.metadata.namespace.as_deref();
-        let cluster_ip = match svc.spec.cluster_ip.as_deref() {
+        let cluster_ip = match svc.spec.as_ref().and_then(|s| s.cluster_ip.as_deref()) {
             Some(ip) if ip != "None" && !ip.is_empty() => ip,
             _ => continue,
         };
 
-        if svc.spec.ports.is_empty() {
+        let spec = match svc.spec.as_ref() {
+            Some(s) => s,
+            None => continue,
+        };
+
+        let ports = spec.ports.as_deref().unwrap_or_default();
+        if ports.is_empty() {
             continue;
         }
 
@@ -107,8 +113,10 @@ pub fn sync_service_rules(store: &Store) -> anyhow::Result<()> {
             .as_ref()
             .map(|ep| {
                 ep.subsets
+                    .as_deref()
+                    .unwrap_or_default()
                     .iter()
-                    .flat_map(|s| s.addresses.iter())
+                    .flat_map(|s| s.addresses.as_deref().unwrap_or_default().iter())
                     .map(|a| a.ip.as_str())
                     .collect()
             })
@@ -118,10 +126,17 @@ pub fn sync_service_rules(store: &Store) -> anyhow::Result<()> {
             continue;
         }
 
-        for port in &svc.spec.ports {
+        for port in ports {
             let svc_port = port.port as u64;
-            let target_port = port.target_port.map(|p| p as u64).unwrap_or(svc_port);
-            let proto = port.protocol.to_lowercase();
+            let target_port = match &port.target_port {
+                Some(IntOrString::Int(p)) => *p as u64,
+                _ => svc_port,
+            };
+            let proto = port
+                .protocol
+                .as_deref()
+                .unwrap_or("TCP")
+                .to_lowercase();
             let svc_port_str = svc_port.to_string();
 
             // Build dnat target: single IP or nftables numgen round-robin
@@ -162,7 +177,7 @@ pub fn sync_service_rules(store: &Store) -> anyhow::Result<()> {
             ]);
 
             // LoadBalancer: DNAT external traffic (non-bridge) on the service port to the pod
-            if svc.spec.type_.as_deref() == Some("LoadBalancer") {
+            if spec.type_.as_deref() == Some("LoadBalancer") {
                 let _ = nft(&[
                     "add", "rule", "ip", "r8s", "prerouting",
                     "iifname", "!=", "r8s0",

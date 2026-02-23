@@ -4,10 +4,14 @@ use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
 fn is_owned_by(meta: &ObjectMeta, owner_uid: &str) -> bool {
-    meta.owner_references.iter().any(|r| r.uid == owner_uid)
+    meta.owner_references
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .any(|r| r.uid == owner_uid)
 }
 
-/// Minimal deserializable wrapper — we only need metadata for GC.
+/// Minimal deserializable wrapper -- we only need metadata for GC.
 #[derive(serde::Deserialize)]
 struct MetadataOnly {
     metadata: ObjectMeta,
@@ -85,7 +89,7 @@ pub async fn run(store: Store, shutdown: CancellationToken) -> anyhow::Result<()
     }
 }
 
-/// Full reconciliation after lag — find children whose owners no longer exist.
+/// Full reconciliation after lag -- find children whose owners no longer exist.
 fn gc_orphans(store: &Store, owner_gvr: &GroupVersionResource, child_gvr: &GroupVersionResource) {
     let owners = match store.list(owner_gvr, None, None, None, None, None) {
         Ok(r) => r,
@@ -116,7 +120,12 @@ fn gc_orphans(store: &Store, owner_gvr: &GroupVersionResource, child_gvr: &Group
             Ok(m) => m,
             Err(_) => continue,
         };
-        for oref in &meta.metadata.owner_references {
+        for oref in meta
+            .metadata
+            .owner_references
+            .as_deref()
+            .unwrap_or_default()
+        {
             if !owner_uids.contains(&oref.uid) {
                 let name = meta.metadata.name.as_deref().unwrap_or("");
                 let ns = meta.metadata.namespace.as_deref();
