@@ -1,5 +1,8 @@
 use r8s_store::{Store, backend::ResourceRef, watch::WatchEventType};
-use r8s_types::GroupVersionResource;
+use r8s_types::{
+    GroupVersionResource, ObjectMeta, OwnerReference, Pod,
+    replicaset::ReplicaSetStatus,
+};
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
@@ -20,11 +23,8 @@ fn random_suffix() -> String {
         .collect()
 }
 
-fn is_owned_by(object: &serde_json::Value, owner_uid: &str) -> bool {
-    object["metadata"]["ownerReferences"]
-        .as_array()
-        .map(|refs| refs.iter().any(|r| r["uid"].as_str() == Some(owner_uid)))
-        .unwrap_or(false)
+fn is_owned_by(meta: &ObjectMeta, owner_uid: &str) -> bool {
+    meta.owner_references.iter().any(|r| r.uid == owner_uid)
 }
 
 pub async fn run(store: Store, shutdown: CancellationToken) -> anyhow::Result<()> {
@@ -57,11 +57,15 @@ pub async fn run(store: Store, shutdown: CancellationToken) -> anyhow::Result<()
         event = pod_rx.recv() => {
             match event {
                 Ok(event) if matches!(event.event_type, WatchEventType::Deleted) => {
-                    if let Some((rs_name, rs_ns)) = find_owner_rs(&event.object) {
+                    let pod: Pod = match serde_json::from_value(event.object) {
+                        Ok(p) => p,
+                        Err(_) => continue,
+                    };
+                    if let Some(owner) = pod.metadata.owner_references.iter().find(|r| r.kind == "ReplicaSet") {
                         let resource_ref = ResourceRef {
                             gvr: &rs_gvr(),
-                            namespace: rs_ns.as_deref(),
-                            name: &rs_name,
+                            namespace: pod.metadata.namespace.as_deref(),
+                            name: &owner.name,
                         };
                         if let Ok(Some(rs)) = store.get(&resource_ref) {
                             let _ = reconcile_rs(&store, &rs);
@@ -75,16 +79,6 @@ pub async fn run(store: Store, shutdown: CancellationToken) -> anyhow::Result<()
         }
         }
     }
-}
-
-fn find_owner_rs(pod: &serde_json::Value) -> Option<(String, Option<String>)> {
-    let refs = pod["metadata"]["ownerReferences"].as_array()?;
-    let owner = refs
-        .iter()
-        .find(|r| r["kind"].as_str() == Some("ReplicaSet"))?;
-    let name = owner["name"].as_str()?.to_string();
-    let ns = pod["metadata"]["namespace"].as_str().map(|s| s.to_string());
-    Some((name, ns))
 }
 
 fn reconcile_all(store: &Store) {
@@ -103,12 +97,15 @@ fn reconcile_all(store: &Store) {
     }
 }
 
-fn reconcile_rs(store: &Store, rs: &serde_json::Value) -> anyhow::Result<()> {
-    let rs_name = rs["metadata"]["name"]
-        .as_str()
+fn reconcile_rs(store: &Store, rs_value: &serde_json::Value) -> anyhow::Result<()> {
+    let rs: r8s_types::ReplicaSet = serde_json::from_value(rs_value.clone())?;
+    let rs_name = rs
+        .metadata
+        .name
+        .as_deref()
         .ok_or_else(|| anyhow::anyhow!("RS has no name"))?;
-    let rs_ns = rs["metadata"]["namespace"].as_str();
-    let rs_uid = rs["metadata"]["uid"].as_str().unwrap_or("");
+    let rs_ns = rs.metadata.namespace.as_deref();
+    let rs_uid = rs.metadata.uid.as_deref().unwrap_or("");
 
     let gvr = rs_gvr();
     let resource_ref = ResourceRef {
@@ -116,21 +113,23 @@ fn reconcile_rs(store: &Store, rs: &serde_json::Value) -> anyhow::Result<()> {
         namespace: rs_ns,
         name: rs_name,
     };
-    let current_rs = match store.get(&resource_ref)? {
+    let current_value = match store.get(&resource_ref)? {
         Some(rs) => rs,
         None => return Ok(()),
     };
+    let current: r8s_types::ReplicaSet = serde_json::from_value(current_value)?;
+    let current_uid = current.metadata.uid.as_deref().unwrap_or(rs_uid);
 
-    let desired: u64 = current_rs["spec"]["replicas"].as_u64().unwrap_or(1);
-    let template = &current_rs["spec"]["template"];
-    let current_uid = current_rs["metadata"]["uid"].as_str().unwrap_or(rs_uid);
+    let desired = current.spec.replicas;
+    let template = &current.spec.template;
 
     let pod_gvr = pods_gvr();
     let pods = store.list(&pod_gvr, rs_ns, None, None, None, None)?;
-    let owned: Vec<&serde_json::Value> = pods
+    let owned: Vec<Pod> = pods
         .items
         .iter()
-        .filter(|p| is_owned_by(p, current_uid))
+        .filter_map(|v| serde_json::from_value::<Pod>(v.clone()).ok())
+        .filter(|p| is_owned_by(&p.metadata, current_uid))
         .collect();
     let current_count = owned.len() as u64;
 
@@ -143,7 +142,7 @@ fn reconcile_rs(store: &Store, rs: &serde_json::Value) -> anyhow::Result<()> {
     } else if current_count > desired {
         let to_delete = current_count - desired;
         for pod in owned.iter().rev().take(to_delete as usize) {
-            if let Some(pod_name) = pod["metadata"]["name"].as_str() {
+            if let Some(pod_name) = pod.metadata.name.as_deref() {
                 let pod_ref = ResourceRef {
                     gvr: &pod_gvr,
                     namespace: rs_ns,
@@ -159,9 +158,10 @@ fn reconcile_rs(store: &Store, rs: &serde_json::Value) -> anyhow::Result<()> {
     let final_count = final_pods
         .items
         .iter()
-        .filter(|p| is_owned_by(p, current_uid))
+        .filter_map(|v| serde_json::from_value::<Pod>(v.clone()).ok())
+        .filter(|p| is_owned_by(&p.metadata, current_uid))
         .count() as u64;
-    update_rs_status(store, &current_rs, final_count)?;
+    update_rs_status(store, rs_name, rs_ns, final_count)?;
 
     Ok(())
 }
@@ -171,29 +171,30 @@ fn create_pod_from_template(
     rs_name: &str,
     rs_uid: &str,
     namespace: Option<&str>,
-    template: &serde_json::Value,
+    template: &r8s_types::PodTemplateSpec,
 ) -> anyhow::Result<()> {
     let pod_name = format!("{}-{}", rs_name, random_suffix());
-    let mut pod = serde_json::json!({
-        "apiVersion": "v1",
-        "kind": "Pod",
-        "metadata": {
-            "name": pod_name,
-            "labels": template["metadata"]["labels"],
-            "ownerReferences": [{
-                "apiVersion": "apps/v1",
-                "kind": "ReplicaSet",
-                "name": rs_name,
-                "uid": rs_uid,
-                "controller": true,
-                "blockOwnerDeletion": true,
+    let mut labels = template.metadata.labels.clone();
+    let pod = Pod {
+        api_version: "v1".into(),
+        kind: "Pod".into(),
+        metadata: ObjectMeta {
+            name: Some(pod_name.clone()),
+            namespace: namespace.map(String::from),
+            labels: std::mem::take(&mut labels),
+            owner_references: vec![OwnerReference {
+                api_version: "apps/v1".into(),
+                kind: "ReplicaSet".into(),
+                name: rs_name.into(),
+                uid: rs_uid.into(),
+                controller: Some(true),
+                block_owner_deletion: Some(true),
             }],
+            ..Default::default()
         },
-        "spec": template["spec"],
-    });
-    if let Some(ns) = namespace {
-        pod["metadata"]["namespace"] = serde_json::json!(ns);
-    }
+        spec: template.spec.clone(),
+        status: None,
+    };
 
     let gvr = pods_gvr();
     let resource_ref = ResourceRef {
@@ -201,17 +202,16 @@ fn create_pod_from_template(
         namespace,
         name: &pod_name,
     };
-    store.create(resource_ref, &pod)?;
+    store.create(resource_ref, &serde_json::to_value(&pod)?)?;
     Ok(())
 }
 
 fn update_rs_status(
     store: &Store,
-    rs: &serde_json::Value,
+    rs_name: &str,
+    rs_ns: Option<&str>,
     replica_count: u64,
 ) -> anyhow::Result<()> {
-    let rs_name = rs["metadata"]["name"].as_str().unwrap_or("");
-    let rs_ns = rs["metadata"]["namespace"].as_str();
     let gvr = rs_gvr();
     let resource_ref = ResourceRef {
         gvr: &gvr,
@@ -224,11 +224,12 @@ fn update_rs_status(
         None => return Ok(()),
     };
 
-    current["status"] = serde_json::json!({
-        "replicas": replica_count,
-        "readyReplicas": replica_count,
-        "avaliableReplicas": replica_count,
-    });
+    let status = ReplicaSetStatus {
+        replicas: replica_count,
+        ready_replicas: replica_count,
+        available_replicas: replica_count,
+    };
+    current["status"] = serde_json::to_value(&status)?;
 
     match store.update(&resource_ref, &current) {
         Ok(_) => Ok(()),

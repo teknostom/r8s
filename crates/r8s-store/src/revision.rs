@@ -5,6 +5,10 @@ use std::sync::{
 
 /// Tracks the global monotonic resource version counter.
 /// Every mutation increments this and the new value becomes the resource's resourceVersion.
+///
+/// Note: the counter is incremented before the DB transaction commits, so a failed
+/// commit leaves a gap. This matches real K8s behavior where resourceVersion gaps are
+/// normal and expected. Consumers must not assume contiguous revision sequences.
 #[derive(Clone)]
 pub struct RevisionCounter {
     revision_id: Arc<AtomicU64>,

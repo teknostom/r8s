@@ -433,23 +433,26 @@ fn watch_impl(state: &AppState, ctx: &RouteContext, namespace: Option<&str>) -> 
     )));
 
     let ns_filter: Option<String> = namespace.map(|s| s.to_string());
-    let live_stream = BroadcastStream::new(rx).filter_map(move |result| {
-        let event = result.ok()?;
-        if let Some(ref ns) = ns_filter
-            && event.object["metadata"]["namespace"].as_str() != Some(ns.as_str())
-        {
-            return None;
-        }
-        let type_str = match event.event_type {
-            WatchEventType::Added => "ADDED",
-            WatchEventType::Modified => "MODIFIED",
-            WatchEventType::Deleted => "DELETED",
-        };
-        Some(Ok::<_, std::io::Error>(response::watch_event_line(
-            type_str,
-            &event.object,
-        )))
-    });
+    // On broadcast lag, terminate the stream so the client reconnects (K8s behavior).
+    let live_stream = BroadcastStream::new(rx)
+        .take_while(|result| result.is_ok())
+        .filter_map(move |result| {
+            let event = result.ok()?;
+            if let Some(ref ns) = ns_filter
+                && event.object["metadata"]["namespace"].as_str() != Some(ns.as_str())
+            {
+                return None;
+            }
+            let type_str = match event.event_type {
+                WatchEventType::Added => "ADDED",
+                WatchEventType::Modified => "MODIFIED",
+                WatchEventType::Deleted => "DELETED",
+            };
+            Some(Ok::<_, std::io::Error>(response::watch_event_line(
+                type_str,
+                &event.object,
+            )))
+        });
 
     let stream = initial_stream.chain(bookmark).chain(live_stream);
 

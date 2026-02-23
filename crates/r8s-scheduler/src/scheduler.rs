@@ -1,5 +1,11 @@
+use std::collections::BTreeMap;
+
 use r8s_store::{Store, backend::ResourceRef, watch::WatchEventType};
-use r8s_types::GroupVersionResource;
+use r8s_types::{
+    GroupVersionResource, Node, ObjectMeta, Pod,
+    node::{NodeCondition, NodeStatus, NodeSystemInfo},
+    pod::PodCondition,
+};
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
@@ -57,37 +63,47 @@ fn register_node(store: &Store) -> anyhow::Result<()> {
     }
 
     let now = chrono::Utc::now().to_rfc3339();
-    let node = serde_json::json!({
-        "apiVersion": "v1",
-        "kind": "Node",
-        "metadata": {
-            "name": NODE_NAME,
-            "labels": {
-                "kubernetes.io/hostname": NODE_NAME,
-                "kubernetes.io/os": "linux",
-                "kubernetes.io/arch": std::env::consts::ARCH,
-            }
+    let cpu_count = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    let memory_ki = read_memtotal_ki().unwrap_or(8 * 1024 * 1024); // fallback 8Gi
+    let capacity = BTreeMap::from([
+        ("cpu".into(), cpu_count.to_string()),
+        ("memory".into(), format!("{memory_ki}Ki")),
+        ("pods".into(), "110".into()),
+    ]);
+    let node = Node {
+        api_version: "v1".into(),
+        kind: "Node".into(),
+        metadata: ObjectMeta {
+            name: Some(NODE_NAME.into()),
+            labels: BTreeMap::from([
+                ("kubernetes.io/hostname".into(), NODE_NAME.into()),
+                ("kubernetes.io/os".into(), "linux".into()),
+                ("kubernetes.io/arch".into(), std::env::consts::ARCH.into()),
+            ]),
+            ..Default::default()
         },
-        "status": {
-            "conditions": [{
-                "type": "Ready",
-                "status": "True",
-                "lastHeartbeatTime": now,
-                "lastTransitionTime": now,
-                "reason": "KubeletReady",
-                "message": "r8s node is ready",
+        status: Some(NodeStatus {
+            conditions: vec![NodeCondition {
+                type_: "Ready".into(),
+                status: "True".into(),
+                last_heartbeat_time: Some(now.clone()),
+                last_transition_time: Some(now),
+                reason: Some("KubeletReady".into()),
+                message: Some("r8s node is ready".into()),
             }],
-            "nodeInfo": {
-                "operatingSystem": "linux",
-                "architecture": std::env::consts::ARCH,
-                "kubeletVersion": "v1.32.0-r8s",
-            },
-            "capacity": {"cpu": "4", "memory": "8Gi", "pods": "110"},
-            "allocatable": {"cpu": "4", "memory": "8Gi", "pods": "110"},
-        }
-    });
+            node_info: Some(NodeSystemInfo {
+                operating_system: "linux".into(),
+                architecture: std::env::consts::ARCH.into(),
+                kubelet_version: "v1.32.0-r8s".into(),
+            }),
+            capacity: Some(capacity.clone()),
+            allocatable: Some(capacity),
+        }),
+    };
 
-    store.create(resource_ref, &node)?;
+    store.create(resource_ref, &serde_json::to_value(&node)?)?;
     tracing::info!("registered node '{NODE_NAME}'");
     Ok(())
 }
@@ -105,17 +121,22 @@ fn schedule_all(store: &Store) {
     }
 }
 
-fn schedule_pod(store: &Store, pod: &serde_json::Value) {
-    let node_name = pod["spec"]["nodeName"].as_str().unwrap_or("");
-    if !node_name.is_empty() {
+fn schedule_pod(store: &Store, pod_value: &serde_json::Value) {
+    let pod: Pod = match serde_json::from_value(pod_value.clone()) {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+
+    // Already scheduled
+    if pod.spec.node_name.as_ref().is_some_and(|n| !n.is_empty()) {
         return;
     }
 
-    let pod_name = match pod["metadata"]["name"].as_str() {
+    let pod_name = match pod.metadata.name.as_deref() {
         Some(n) => n,
         None => return,
     };
-    let pod_ns = pod["metadata"]["namespace"].as_str();
+    let pod_ns = pod.metadata.namespace.as_deref();
 
     let gvr = pods_gvr();
     let resource_ref = ResourceRef {
@@ -130,25 +151,41 @@ fn schedule_pod(store: &Store, pod: &serde_json::Value) {
     };
 
     // Double-check still unscheduled after re-read
-    let current_node = current["spec"]["nodeName"].as_str().unwrap_or("");
-    if !current_node.is_empty() {
+    let current_pod: Pod = match serde_json::from_value(current.clone()) {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+    if current_pod
+        .spec
+        .node_name
+        .as_ref()
+        .is_some_and(|n| !n.is_empty())
+    {
         return;
     }
 
+    // Set nodeName on the original Value to preserve unknown fields
     current["spec"]["nodeName"] = serde_json::json!(NODE_NAME);
 
+    // Set scheduling condition
     let now = chrono::Utc::now().to_rfc3339();
-    if current["status"].is_null() {
-        current["status"] = serde_json::json!({});
-    }
-    current["status"]["conditions"] = serde_json::json!([{
-        "type": "PodScheduled",
-        "status": "True",
-        "lastTransitionTime": now,
-    }]);
+    let conditions = vec![PodCondition {
+        type_: "PodScheduled".into(),
+        status: "True".into(),
+        last_transition_time: Some(now),
+    }];
+    current["status"]["conditions"] = serde_json::to_value(&conditions).unwrap_or_default();
 
     match store.update(&resource_ref, &current) {
         Ok(_) => tracing::info!("scheduled pod '{pod_name}' to node '{NODE_NAME}'"),
         Err(e) => tracing::debug!("scheduler update conflict for '{pod_name}': {e}"),
     }
+}
+
+/// Read MemTotal from /proc/meminfo, returning KiB.
+fn read_memtotal_ki() -> Option<u64> {
+    let contents = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let line = contents.lines().find(|l| l.starts_with("MemTotal:"))?;
+    let kb_str = line.split_whitespace().nth(1)?;
+    kb_str.parse().ok()
 }

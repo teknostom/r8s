@@ -1,5 +1,13 @@
+use std::collections::BTreeMap;
+
 use r8s_store::{Store, backend::ResourceRef};
-use r8s_types::GroupVersionResource;
+use r8s_types::{
+    GroupVersionResource, IngressClass, Namespace, ObjectMeta, Service,
+    endpoints::{EndpointAddress, EndpointPort, EndpointSubset, Endpoints},
+    ingressclass::IngressClassSpec,
+    namespace::NamespaceStatus,
+    service::{ServicePort, ServiceSpec},
+};
 
 pub fn bootstrap_namespaces(store: &Store) -> anyhow::Result<()> {
     let gvr = GroupVersionResource::new("", "v1", "namespaces");
@@ -11,14 +19,18 @@ pub fn bootstrap_namespaces(store: &Store) -> anyhow::Result<()> {
             name: ns_name,
         };
         if store.get(&resource_ref)?.is_none() {
-            let ns = serde_json::json!({
-                "apiVersion": "v1",
-                "kind": "Namespace",
-                "metadata": {"name": ns_name },
-                "spec": {},
-                "status": {"phase": "Active"},
-            });
-            store.create(resource_ref, &ns)?;
+            let ns = Namespace {
+                api_version: "v1".into(),
+                kind: "Namespace".into(),
+                metadata: ObjectMeta {
+                    name: Some(ns_name.into()),
+                    ..Default::default()
+                },
+                status: Some(NamespaceStatus {
+                    phase: Some("Active".into()),
+                }),
+            };
+            store.create(resource_ref, &serde_json::to_value(&ns)?)?;
             tracing::info!("bootstrapped namespace '{ns_name}'");
         }
     }
@@ -30,29 +42,31 @@ pub fn bootstrap_namespaces(store: &Store) -> anyhow::Result<()> {
         name: "kubernetes",
     };
     if store.get(&svc_ref)?.is_none() {
-        let svc = serde_json::json!({
-            "apiVersion": "v1",
-            "kind": "Service",
-            "metadata": {
-                "name": "kubernetes",
-                "namespace": "default",
-                "labels": {
-                    "component": "apiserver",
-                    "provider": "kubernetes",
-                },
+        let svc = Service {
+            api_version: "v1".into(),
+            kind: "Service".into(),
+            metadata: ObjectMeta {
+                name: Some("kubernetes".into()),
+                namespace: Some("default".into()),
+                labels: BTreeMap::from([
+                    ("component".into(), "apiserver".into()),
+                    ("provider".into(), "kubernetes".into()),
+                ]),
+                ..Default::default()
             },
-            "spec": {
-                "type": "ClusterIP",
-                "clusterIP": "10.96.0.1",
-                "ports": [{
-                    "name": "https",
-                    "port": 443,
-                    "targetPort": 6443,
-                    "protocol": "TCP",
+            spec: ServiceSpec {
+                type_: Some("ClusterIP".into()),
+                cluster_ip: Some("10.96.0.1".into()),
+                ports: vec![ServicePort {
+                    name: Some("https".into()),
+                    port: 443,
+                    target_port: Some(6443),
+                    protocol: "TCP".into(),
                 }],
+                ..Default::default()
             },
-        });
-        store.create(svc_ref, &svc)?;
+        };
+        store.create(svc_ref, &serde_json::to_value(&svc)?)?;
         tracing::info!("bootstrapped 'kubernetes' service");
     }
 
@@ -64,105 +78,58 @@ pub fn bootstrap_namespaces(store: &Store) -> anyhow::Result<()> {
         name: "kubernetes",
     };
     if store.get(&ep_ref)?.is_none() {
-        let ep = serde_json::json!({
-            "apiVersion": "v1",
-            "kind": "Endpoints",
-            "metadata": {
-                "name": "kubernetes",
-                "namespace": "default",
+        let ep = Endpoints {
+            api_version: "v1".into(),
+            kind: "Endpoints".into(),
+            metadata: ObjectMeta {
+                name: Some("kubernetes".into()),
+                namespace: Some("default".into()),
+                ..Default::default()
             },
-            "subsets": [{
-                "addresses": [{"ip": "10.244.0.1"}],
-                "ports": [{
-                    "name": "https",
-                    "port": 6443,
-                    "protocol": "TCP",
+            subsets: vec![EndpointSubset {
+                addresses: vec![EndpointAddress {
+                    ip: "10.244.0.1".into(),
+                    target_ref: None,
+                }],
+                ports: vec![EndpointPort {
+                    port: 6443,
+                    protocol: "TCP".into(),
+                    name: Some("https".into()),
                 }],
             }],
-        });
-        store.create(ep_ref, &ep)?;
+        };
+        store.create(ep_ref, &serde_json::to_value(&ep)?)?;
         tracing::info!("bootstrapped 'kubernetes' endpoints");
     }
 
     Ok(())
 }
 
-pub fn bootstrap_traefik(store: &Store, data_dir: &std::path::Path) -> anyhow::Result<()> {
-    let sa_dir = data_dir.join("serviceaccount");
-    std::fs::create_dir_all(&sa_dir)?;
-    std::fs::write(sa_dir.join("token"), "dummy")?;
-    std::fs::write(sa_dir.join("ca.crt"), "")?;
-    std::fs::write(sa_dir.join("namespace"), "default")?;
-
-    let deploy_gvr = GroupVersionResource::new("apps", "v1", "deployments");
-    let deploy_ref = ResourceRef {
-        gvr: &deploy_gvr,
-        namespace: Some("kube-system"),
-        name: "traefik",
+pub fn bootstrap_ingress_class(store: &Store) -> anyhow::Result<()> {
+    let gvr = GroupVersionResource::new("networking.k8s.io", "v1", "ingressclasses");
+    let rref = ResourceRef {
+        gvr: &gvr,
+        namespace: None,
+        name: "r8s",
     };
-    if store.get(&deploy_ref)?.is_none() {
-        let deploy = serde_json::json!({
-            "apiVersion": "apps/v1",
-            "kind": "Deployment",
-            "metadata": {
-                "name": "traefik",
-                "namespace": "kube-system",
-                "labels": {"app": "traefik"},
+    if store.get(&rref)?.is_none() {
+        let ic = IngressClass {
+            api_version: "networking.k8s.io/v1".into(),
+            kind: "IngressClass".into(),
+            metadata: ObjectMeta {
+                name: Some("r8s".into()),
+                annotations: BTreeMap::from([(
+                    "ingressclass.kubernetes.io/is-default-class".into(),
+                    "true".into(),
+                )]),
+                ..Default::default()
             },
-            "spec": {
-                "replicas": 1,
-                "selector": {"matchLabels": {"app": "traefik"}},
-                "template": {
-                    "metadata": {"labels": {"app": "traefik"}},
-                    "spec": {
-                        "containers": [{
-                            "name": "traefik",
-                            "image": "traefik:v2.11",
-                            "args": [
-                                "--entrypoints.web.address=:80",
-                                "--providers.kubernetesingress",
-                                "--providers.kubernetesingress.endpoint=http://10.244.0.1:6443",
-                                "--log.level=INFO",
-                            ],
-                        }],
-                    },
-                },
-            },
-        });
-        store.create(deploy_ref, &deploy)?;
-        tracing::info!("bootstrapped traefik deployment");
+            spec: Some(IngressClassSpec {
+                controller: Some("r8s.dev/ingress-controller".into()),
+            }),
+        };
+        store.create(rref, &serde_json::to_value(&ic)?)?;
+        tracing::info!("bootstrapped 'r8s' IngressClass");
     }
-
-    let svc_gvr = GroupVersionResource::new("", "v1", "services");
-    let svc_ref = ResourceRef {
-        gvr: &svc_gvr,
-        namespace: Some("kube-system"),
-        name: "traefik",
-    };
-    if store.get(&svc_ref)?.is_none() {
-        let svc = serde_json::json!({
-            "apiVersion": "v1",
-            "kind": "Service",
-            "metadata": {
-                "name": "traefik",
-                "namespace": "kube-system",
-                "labels": {"app": "traefik"},
-            },
-            "spec": {
-                "type": "LoadBalancer",
-                "selector": {"app": "traefik"},
-                "clusterIP": "10.96.0.80",
-                "ports": [{
-                    "name": "web",
-                    "port": 80,
-                    "targetPort": 80,
-                    "protocol": "TCP",
-                }],
-            },
-        });
-        store.create(svc_ref, &svc)?;
-        tracing::info!("bootstrapped traefik service");
-    }
-
     Ok(())
 }

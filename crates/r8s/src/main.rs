@@ -62,6 +62,19 @@ fn base_dir() -> PathBuf {
     PathBuf::from("/var/lib/r8s/clusters")
 }
 
+fn validate_name(name: &str) -> anyhow::Result<()> {
+    if name.is_empty() {
+        anyhow::bail!("cluster name cannot be empty");
+    }
+    if name.contains('/') || name.contains('\\') || name == "." || name == ".." {
+        anyhow::bail!("invalid cluster name '{name}'");
+    }
+    if !name.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_') {
+        anyhow::bail!("cluster name must be alphanumeric (with - or _)");
+    }
+    Ok(())
+}
+
 fn cluster_dir(name: &str) -> PathBuf {
     base_dir().join(name)
 }
@@ -69,6 +82,7 @@ fn cluster_dir(name: &str) -> PathBuf {
 /// Resolve cluster name: use provided name, or if omitted, pick the only existing cluster.
 fn resolve_name(name: Option<String>) -> anyhow::Result<String> {
     if let Some(n) = name {
+        validate_name(&n)?;
         return Ok(n);
     }
     let base = base_dir();
@@ -149,6 +163,7 @@ fn main() -> anyhow::Result<()> {
     match cli.command {
         Cmd::Create { name } => {
             let name = name.unwrap_or_else(|| "default".to_string());
+            validate_name(&name)?;
             let dir = cluster_dir(&name);
             if dir.exists() {
                 anyhow::bail!("cluster '{name}' already exists");
@@ -188,7 +203,7 @@ fn main() -> anyhow::Result<()> {
             } else {
                 let log_file = std::fs::File::create(dir.join("r8sd.log"))?;
                 let stderr_file = log_file.try_clone()?;
-                let child = Command::new(r8sd_binary())
+                let mut child = Command::new(r8sd_binary())
                     .arg("--data-dir")
                     .arg(&dir)
                     .stdout(log_file)
@@ -197,8 +212,46 @@ fn main() -> anyhow::Result<()> {
 
                 std::fs::write(pid_file(&dir), child.id().to_string())?;
 
+                // Wait for boot: check process alive + API ready (up to 2s)
+                let deadline = std::time::Instant::now()
+                    + std::time::Duration::from_secs(10);
+                let api_addr: std::net::SocketAddr = "127.0.0.1:6443".parse().unwrap();
+                let mut ready = false;
+
+                while std::time::Instant::now() < deadline {
+                    match child.try_wait()? {
+                        Some(status) => {
+                            let _ = std::fs::remove_file(pid_file(&dir));
+                            let log = std::fs::read_to_string(dir.join("r8sd.log"))
+                                .unwrap_or_default();
+                            let tail: Vec<&str> = log.lines().rev().take(10).collect();
+                            let tail: String = tail.into_iter().rev()
+                                .collect::<Vec<_>>().join("\n");
+                            anyhow::bail!(
+                                "r8sd exited immediately ({status}):\n{tail}"
+                            );
+                        }
+                        None => {}
+                    }
+                    if std::net::TcpStream::connect_timeout(
+                        &api_addr,
+                        std::time::Duration::from_millis(100),
+                    ).is_ok() {
+                        ready = true;
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+
                 let kc = dir.join("kubeconfig");
-                println!("Cluster '{name}' started (pid {}).", child.id());
+                if ready {
+                    println!("Cluster '{name}' started (pid {}).", child.id());
+                } else {
+                    println!(
+                        "Cluster '{name}' started (pid {}), waiting for API server...",
+                        child.id()
+                    );
+                }
                 println!("export KUBECONFIG={}", kc.display());
             }
         }
@@ -217,8 +270,9 @@ fn main() -> anyhow::Result<()> {
             };
 
             // Send SIGTERM
-            unsafe {
-                libc::kill(pid as i32, libc::SIGTERM);
+            let ret = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+            if ret != 0 {
+                anyhow::bail!("failed to send SIGTERM to pid {pid}");
             }
 
             // Wait for exit (up to 10 seconds)
@@ -231,9 +285,7 @@ fn main() -> anyhow::Result<()> {
 
             if is_running(pid) {
                 eprintln!("warning: r8sd (pid {pid}) did not exit, sending SIGKILL");
-                unsafe {
-                    libc::kill(pid as i32, libc::SIGKILL);
-                }
+                let _ = unsafe { libc::kill(pid as i32, libc::SIGKILL) };
             }
 
             let _ = std::fs::remove_file(pid_file(&dir));
@@ -241,6 +293,7 @@ fn main() -> anyhow::Result<()> {
         }
 
         Cmd::Delete { name } => {
+            validate_name(&name)?;
             let dir = cluster_dir(&name);
             if !dir.exists() {
                 anyhow::bail!("cluster '{name}' does not exist");

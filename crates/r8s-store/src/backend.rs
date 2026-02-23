@@ -1,7 +1,7 @@
 use std::{path::Path, sync::Arc, time::Duration};
 
 use base64::prelude::*;
-use r8s_types::GroupVersionResource;
+use r8s_types::{GroupVersionResource, ObjectMeta};
 use redb::{Database, ReadableTable, TableDefinition};
 use tokio::sync::broadcast;
 
@@ -127,8 +127,10 @@ impl Store {
 
         w_transaction.commit()?;
 
-        let labels = obj["metadata"]["labels"].as_object();
-        self.index.update(&resource.gvr.key_prefix(), &key, labels);
+        let meta: ObjectMeta =
+            serde_json::from_value(obj["metadata"].clone()).unwrap_or_default();
+        self.index
+            .update(&resource.gvr.key_prefix(), &key, &meta.labels);
 
         self.watches.notify(
             &resource.gvr.key_prefix(),
@@ -173,20 +175,21 @@ impl Store {
             }
         };
 
-        if let Some(incoming_rv) = object["metadata"]["resourceVersion"].as_str() {
-            let stored_rv = existing["metadata"]["resourceVersion"]
-                .as_str()
-                .unwrap_or("");
-            if incoming_rv != stored_rv {
-                return Err(StoreError::Conflict {
-                    gvr: resource.gvr.key_prefix(),
-                    name: resource.name.to_string(),
-                    message: format!(
-                        "resourceVersion mismatch: stored={stored_rv}, incoming={incoming_rv}"
-                    ),
-                }
-                .into());
+        let incoming_meta: ObjectMeta =
+            serde_json::from_value(object["metadata"].clone()).unwrap_or_default();
+        let stored_meta: ObjectMeta =
+            serde_json::from_value(existing["metadata"].clone()).unwrap_or_default();
+        let incoming_rv = incoming_meta.resource_version.as_deref().unwrap_or("");
+        let stored_rv = stored_meta.resource_version.as_deref().unwrap_or("");
+        if incoming_rv != stored_rv {
+            return Err(StoreError::Conflict {
+                gvr: resource.gvr.key_prefix(),
+                name: resource.name.to_string(),
+                message: format!(
+                    "resourceVersion mismatch: stored={stored_rv}, incoming={incoming_rv}"
+                ),
             }
+            .into());
         }
 
         let rev = self.revision.next();
@@ -218,8 +221,10 @@ impl Store {
 
         w_transaction.commit()?;
 
-        let labels = obj["metadata"]["labels"].as_object();
-        self.index.update(&resource.gvr.key_prefix(), &key, labels);
+        let meta: ObjectMeta =
+            serde_json::from_value(obj["metadata"].clone()).unwrap_or_default();
+        self.index
+            .update(&resource.gvr.key_prefix(), &key, &meta.labels);
 
         self.watches.notify(
             &resource.gvr.key_prefix(),

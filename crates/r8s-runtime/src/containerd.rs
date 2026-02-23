@@ -337,6 +337,20 @@ fn build_oci_spec(
                     .options(vec!["rbind".into(), "ro".into()])
                     .build()?,
             );
+            for m in &config.mounts {
+                mounts.push(
+                    MountBuilder::default()
+                        .destination(&m.container_path)
+                        .source(&m.host_path)
+                        .typ("bind")
+                        .options(if m.readonly {
+                            vec!["rbind".into(), "ro".into()]
+                        } else {
+                            vec!["rbind".into(), "rw".into()]
+                        })
+                        .build()?,
+                );
+            }
             mounts
         })
         .linux(

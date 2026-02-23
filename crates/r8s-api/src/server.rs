@@ -1,8 +1,9 @@
 use std::{net::SocketAddr, sync::Arc};
+use tokio_util::sync::CancellationToken;
 
 use axum::{
     Extension, Router,
-    extract::Request,
+    extract::{DefaultBodyLimit, Request},
     routing::{get, post},
 };
 use hyper::StatusCode;
@@ -54,7 +55,7 @@ impl ApiServer {
         }
     }
 
-    pub async fn serve(self, addr: SocketAddr) -> anyhow::Result<()> {
+    pub async fn serve(self, addr: SocketAddr, shutdown: CancellationToken) -> anyhow::Result<()> {
         let mut router = Router::new()
             .route("/version", get(get_version))
             .route("/api", get(get_api_versions))
@@ -71,7 +72,7 @@ impl ApiServer {
             );
         for rt in self.state.registry.iter() {
             let ctx = RouteContext {
-                resource_type: Arc::new(rt.clone()),
+                resource_type: Arc::clone(rt),
             };
             let base = if rt.gvr.group.is_empty() {
                 format!("/api/{}", rt.gvr.version)
@@ -126,10 +127,13 @@ impl ApiServer {
         let router = router
             .with_state(self.state)
             .fallback(fallback)
+            .layer(DefaultBodyLimit::max(1024 * 1024)) // 1MB
             .layer(axum::middleware::from_fn(log_requests));
         let listener = tokio::net::TcpListener::bind(addr).await?;
         tracing::info!("API server listening on {addr}");
-        axum::serve(listener, router).await?;
+        axum::serve(listener, router)
+            .with_graceful_shutdown(shutdown.cancelled_owned())
+            .await?;
         Ok(())
     }
 }

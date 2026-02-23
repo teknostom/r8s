@@ -1,5 +1,5 @@
 use r8s_store::{Store, backend::ResourceRef, watch::WatchEventType};
-use r8s_types::GroupVersionResource;
+use r8s_types::{GroupVersionResource, ObjectMeta, ServiceAccount};
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
@@ -20,8 +20,11 @@ pub async fn run(store: Store, shutdown: CancellationToken) -> anyhow::Result<()
             event = rx.recv() => {
                 match event {
                     Ok(event) if matches!(event.event_type, WatchEventType::Added) => {
-                        if let Some(name) = event.object["metadata"]["name"].as_str() {
-                            ensure_default_sa(&store, &sa_gvr, name);
+                        let ns: Result<r8s_types::Namespace, _> = serde_json::from_value(event.object);
+                        if let Ok(ns) = ns {
+                            if let Some(name) = ns.metadata.name.as_deref() {
+                                ensure_default_sa(&store, &sa_gvr, name);
+                            }
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -44,9 +47,12 @@ fn reconcile_all(store: &Store, ns_gvr: &GroupVersionResource, sa_gvr: &GroupVer
             return;
         }
     };
-    for ns in &result.items {
-        if let Some(name) = ns["metadata"]["name"].as_str() {
-            ensure_default_sa(store, sa_gvr, name);
+    for item in &result.items {
+        let ns: Result<r8s_types::Namespace, _> = serde_json::from_value(item.clone());
+        if let Ok(ns) = ns {
+            if let Some(name) = ns.metadata.name.as_deref() {
+                ensure_default_sa(store, sa_gvr, name);
+            }
         }
     }
 }
@@ -60,12 +66,23 @@ fn ensure_default_sa(store: &Store, sa_gvr: &GroupVersionResource, namespace: &s
     match store.get(&resource_ref) {
         Ok(Some(_)) => {}
         Ok(None) => {
-            let sa = serde_json::json!({
-                "apiVersion": "v1",
-                "kind": "ServiceAccount",
-                "metadata": {"name": "default", "namespace": namespace},
-            });
-            match store.create(resource_ref, &sa) {
+            let sa = ServiceAccount {
+                api_version: "v1".into(),
+                kind: "ServiceAccount".into(),
+                metadata: ObjectMeta {
+                    name: Some("default".into()),
+                    namespace: Some(namespace.into()),
+                    ..Default::default()
+                },
+            };
+            let value = match serde_json::to_value(&sa) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!("failed to serialize SA: {e}");
+                    return;
+                }
+            };
+            match store.create(resource_ref, &value) {
                 Ok(_) => tracing::info!("created default ServiceAccount in '{namespace}'"),
                 Err(e) => tracing::warn!("failed to create default SA in '{namespace}': {e}"),
             }

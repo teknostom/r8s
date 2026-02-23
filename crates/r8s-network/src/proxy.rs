@@ -1,7 +1,7 @@
 use std::process::Command;
 
 use r8s_store::Store;
-use r8s_types::GroupVersionResource;
+use r8s_types::{Endpoints, GroupVersionResource, Service};
 
 fn services_gvr() -> GroupVersionResource {
     GroupVersionResource::new("", "v1", "services")
@@ -70,21 +70,24 @@ pub fn sync_service_rules(store: &Store) -> anyhow::Result<()> {
         .map(|r| r.items)
         .unwrap_or_default();
 
-    for svc in &services {
-        let svc_name = match svc["metadata"]["name"].as_str() {
+    for svc_value in &services {
+        let svc: Service = match serde_json::from_value(svc_value.clone()) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let svc_name = match svc.metadata.name.as_deref() {
             Some(n) => n,
             None => continue,
         };
-        let svc_ns = svc["metadata"]["namespace"].as_str();
-        let cluster_ip = match svc["spec"]["clusterIP"].as_str() {
+        let svc_ns = svc.metadata.namespace.as_deref();
+        let cluster_ip = match svc.spec.cluster_ip.as_deref() {
             Some(ip) if ip != "None" && !ip.is_empty() => ip,
             _ => continue,
         };
 
-        let ports = match svc["spec"]["ports"].as_array() {
-            Some(p) => p,
-            None => continue,
-        };
+        if svc.spec.ports.is_empty() {
+            continue;
+        }
 
         // Find endpoints for this service
         let ep_gvr = endpoints_gvr();
@@ -93,86 +96,78 @@ pub fn sync_service_rules(store: &Store) -> anyhow::Result<()> {
             namespace: svc_ns,
             name: svc_name,
         };
-        let endpoints = store.get(&ep_ref).ok().flatten();
+        let endpoints: Option<Endpoints> = store
+            .get(&ep_ref)
+            .ok()
+            .flatten()
+            .and_then(|v| serde_json::from_value(v).ok());
 
-        // Get first ready address from endpoints
-        let pod_ip = endpoints.as_ref().and_then(|ep| {
-            ep["subsets"]
-                .as_array()?
-                .iter()
-                .flat_map(|s| s["addresses"].as_array().into_iter().flatten())
-                .find_map(|a| a["ip"].as_str())
-        });
+        // Get all ready addresses from endpoints
+        let pod_ips: Vec<&str> = endpoints
+            .as_ref()
+            .map(|ep| {
+                ep.subsets
+                    .iter()
+                    .flat_map(|s| s.addresses.iter())
+                    .map(|a| a.ip.as_str())
+                    .collect()
+            })
+            .unwrap_or_default();
 
-        let pod_ip = match pod_ip {
-            Some(ip) => ip,
-            None => continue, // No ready endpoints
-        };
+        if pod_ips.is_empty() {
+            continue;
+        }
 
-        for port in ports {
-            let svc_port = match port["port"].as_u64() {
-                Some(p) => p,
-                None => continue,
-            };
-            let target_port = port["targetPort"].as_u64().unwrap_or(svc_port);
-            let proto = port["protocol"].as_str().unwrap_or("TCP").to_lowercase();
-
-            let dnat_target = format!("{pod_ip}:{target_port}");
+        for port in &svc.spec.ports {
+            let svc_port = port.port as u64;
+            let target_port = port.target_port.map(|p| p as u64).unwrap_or(svc_port);
+            let proto = port.protocol.to_lowercase();
             let svc_port_str = svc_port.to_string();
+
+            // Build dnat target: single IP or nftables numgen round-robin
+            let dnat_target = if pod_ips.len() == 1 {
+                format!("{}:{target_port}", pod_ips[0])
+            } else {
+                // numgen round-robin across all endpoints
+                let addrs: Vec<String> = pod_ips
+                    .iter()
+                    .map(|ip| format!("{ip}:{target_port}"))
+                    .collect();
+                format!(
+                    "numgen inc mod {} map {{ {} }}",
+                    pod_ips.len(),
+                    addrs
+                        .iter()
+                        .enumerate()
+                        .map(|(i, a)| format!("{i} : {a}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            };
 
             // DNAT in prerouting (for traffic from other pods)
             let _ = nft(&[
-                "add",
-                "rule",
-                "ip",
-                "r8s",
-                "prerouting",
-                "ip",
-                "daddr",
-                cluster_ip,
-                &proto,
-                "dport",
-                &svc_port_str,
-                "dnat",
-                "to",
-                &dnat_target,
+                "add", "rule", "ip", "r8s", "prerouting",
+                "ip", "daddr", cluster_ip,
+                &proto, "dport", &svc_port_str,
+                "dnat", "to", &dnat_target,
             ]);
 
             // DNAT in output (for traffic from the host itself)
             let _ = nft(&[
-                "add",
-                "rule",
-                "ip",
-                "r8s",
-                "output",
-                "ip",
-                "daddr",
-                cluster_ip,
-                &proto,
-                "dport",
-                &svc_port_str,
-                "dnat",
-                "to",
-                &dnat_target,
+                "add", "rule", "ip", "r8s", "output",
+                "ip", "daddr", cluster_ip,
+                &proto, "dport", &svc_port_str,
+                "dnat", "to", &dnat_target,
             ]);
+
             // LoadBalancer: DNAT external traffic (non-bridge) on the service port to the pod
-            let svc_type = svc["spec"]["type"].as_str().unwrap_or("ClusterIP");
-            if svc_type == "LoadBalancer" {
+            if svc.spec.type_.as_deref() == Some("LoadBalancer") {
                 let _ = nft(&[
-                    "add",
-                    "rule",
-                    "ip",
-                    "r8s",
-                    "prerouting",
-                    "iifname",
-                    "!=",
-                    "r8s0",
-                    &proto,
-                    "dport",
-                    &svc_port_str,
-                    "dnat",
-                    "to",
-                    &dnat_target,
+                    "add", "rule", "ip", "r8s", "prerouting",
+                    "iifname", "!=", "r8s0",
+                    &proto, "dport", &svc_port_str,
+                    "dnat", "to", &dnat_target,
                 ]);
             }
         }

@@ -1,7 +1,7 @@
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use rustc_hash::{FxHashMap, FxHashSet};
-use serde_json::Value;
 
 type LabelMap = FxHashMap<String, FxHashMap<String, FxHashSet<String>>>;
 
@@ -110,7 +110,7 @@ impl FieldSelector {
 fn extract_field(obj: &serde_json::Value, path: &str) -> Option<String> {
     let mut current = obj;
     for part in path.split('.') {
-        current = &current[part];
+        current = current.get(part)?;
     }
     current.as_str().map(|s| s.to_string())
 }
@@ -126,7 +126,7 @@ impl LabelIndex {
         &self,
         gvr_prefix: &str,
         resource_key: &str,
-        labels: Option<&serde_json::Map<String, Value>>,
+        labels: &BTreeMap<String, String>,
     ) {
         let mut map = self.index.lock().expect("Failed to lock index. FATAL");
         let inner = map.entry(gvr_prefix.to_string()).or_default();
@@ -135,21 +135,17 @@ impl LabelIndex {
             key_set.remove(resource_key);
         }
 
-        if let Some(labels) = labels {
-            for (key, value) in labels {
-                if let Some(v_str) = value.as_str() {
-                    let label_string = format!("{key}={v_str}");
-                    inner
-                        .entry(label_string)
-                        .or_default()
-                        .insert(resource_key.to_string());
-                }
-            }
+        for (key, value) in labels {
+            let label_string = format!("{key}={value}");
+            inner
+                .entry(label_string)
+                .or_default()
+                .insert(resource_key.to_string());
         }
     }
 
     pub fn remove(&self, gvr_prefix: &str, resource_key: &str) {
-        self.update(gvr_prefix, resource_key, None);
+        self.update(gvr_prefix, resource_key, &BTreeMap::new());
     }
 
     pub fn matches(&self, gvr_prefix: &str, selector: &LabelSelector) -> Option<FxHashSet<String>> {

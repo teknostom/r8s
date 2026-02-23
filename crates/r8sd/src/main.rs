@@ -3,7 +3,7 @@ use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 use clap::Parser;
 use r8s_api::{
     ApiServer,
-    bootstrap::{bootstrap_namespaces, bootstrap_traefik},
+    bootstrap::{bootstrap_ingress_class, bootstrap_namespaces},
 };
 use r8s_controllers::ControllerManager;
 use r8s_runtime::{ContainerRuntime, MockRuntime, containerd::ContainerdRuntime};
@@ -34,7 +34,7 @@ async fn main() -> anyhow::Result<()> {
     let store = Store::open(&data_dir.join("store.db"))?;
 
     bootstrap_namespaces(&store)?;
-    bootstrap_traefik(&store, &data_dir)?;
+    bootstrap_ingress_class(&store)?;
 
     let shutdown = CancellationToken::new();
 
@@ -65,6 +65,16 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
+    let ingress_store = store.clone();
+    let ingress_shutdown = shutdown.clone();
+    let ingress_handle = tokio::spawn(async move {
+        if let Err(e) =
+            r8s_network::ingress::run_ingress_proxy(ingress_store, ingress_shutdown).await
+        {
+            tracing::error!("ingress proxy error: {e}");
+        }
+    });
+
     let proxy_store = store.clone();
     let proxy_shutdown = shutdown.clone();
     let proxy_handle = tokio::spawn(async move {
@@ -85,23 +95,24 @@ async fn main() -> anyhow::Result<()> {
         "mock" => {
             tracing::info!("using mock container runtime");
             let runtime = Arc::new(MockRuntime::new());
-            spawn_kubelet(store.clone(), runtime, shutdown.clone())
+            spawn_kubelet(store.clone(), runtime, shutdown.clone(), data_dir.clone())
         }
         _ => {
             let socket = std::env::var("CONTAINERD_SOCKET")
                 .unwrap_or_else(|_| "/run/containerd/containerd.sock".to_string());
             tracing::info!(socket, "using containerd runtime");
             let runtime = Arc::new(ContainerdRuntime::new(&socket, data_dir.clone()).await?);
-            spawn_kubelet(store.clone(), runtime, shutdown.clone())
+            spawn_kubelet(store.clone(), runtime, shutdown.clone(), data_dir.clone())
         }
     };
 
     let registry = ResourceRegistry::default_mvp();
     let server = ApiServer::new(store, registry, data_dir);
     let addr: SocketAddr = "0.0.0.0:6443".parse()?;
+    let server_shutdown = shutdown.clone();
 
     let server_handle = tokio::spawn(async move {
-        if let Err(e) = server.serve(addr).await {
+        if let Err(e) = server.serve(addr, server_shutdown).await {
             tracing::error!("API server error: {e}");
         }
     });
@@ -114,12 +125,13 @@ async fn main() -> anyhow::Result<()> {
     shutdown.cancel();
     r8s_network::bridge::cleanup();
     r8s_network::proxy::cleanup();
-    server_handle.abort();
     controller_manager.shutdown().await;
     let _ = scheduler_handle.await;
     let _ = kubelet_handle.await;
     let _ = dns_handle.await;
+    let _ = ingress_handle.await;
     let _ = proxy_handle.await;
+    let _ = server_handle.await;
 
     Ok(())
 }
@@ -128,9 +140,10 @@ fn spawn_kubelet<R: ContainerRuntime + 'static>(
     store: Store,
     runtime: Arc<R>,
     shutdown: CancellationToken,
+    data_dir: PathBuf,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        if let Err(e) = r8s_kubelet::run(store, runtime, shutdown).await {
+        if let Err(e) = r8s_kubelet::run(store, runtime, shutdown, data_dir).await {
             tracing::error!("kubelet error: {e}");
         }
     })

@@ -1,11 +1,13 @@
+use std::sync::Arc;
+
 use rustc_hash::FxHashMap;
 
 use crate::{GroupVersionResource, ResourceType};
 
 #[derive(Default)]
 pub struct ResourceRegistry {
-    by_gvr: FxHashMap<String, ResourceType>,
-    by_resource: FxHashMap<String, ResourceType>,
+    by_gvr: FxHashMap<String, Arc<ResourceType>>,
+    by_resource: FxHashMap<String, Arc<ResourceType>>,
 }
 
 impl ResourceRegistry {
@@ -17,23 +19,28 @@ impl ResourceRegistry {
     }
 
     pub fn register(&mut self, rt: ResourceType) {
-        self.by_gvr.insert(rt.gvr.key_prefix(), rt.clone());
+        let rt = Arc::new(rt);
+        self.by_gvr.insert(rt.gvr.key_prefix(), Arc::clone(&rt));
         self.by_resource.insert(rt.gvr.resource.clone(), rt);
     }
 
-    pub fn get_by_gvr(&self, gvr: &GroupVersionResource) -> Option<&ResourceType> {
+    pub fn get_by_gvr(&self, gvr: &GroupVersionResource) -> Option<&Arc<ResourceType>> {
         self.by_gvr.get(&gvr.key_prefix())
     }
 
-    pub fn get_by_resource(&self, resource: &str) -> Option<&ResourceType> {
+    pub fn get_by_resource(&self, resource: &str) -> Option<&Arc<ResourceType>> {
         self.by_resource.get(resource)
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = &ResourceType> {
+    pub fn iter(&self) -> impl Iterator<Item = &Arc<ResourceType>> {
         self.by_gvr.values()
     }
 
-    pub fn resources_for_group_version(&self, group: &str, version: &str) -> Vec<&ResourceType> {
+    pub fn resources_for_group_version(
+        &self,
+        group: &str,
+        version: &str,
+    ) -> Vec<&Arc<ResourceType>> {
         self.by_gvr
             .values()
             .filter(|rt| rt.gvr.group == group && rt.gvr.version == version)

@@ -3,20 +3,23 @@ use axum::{body::Body, response::Response};
 use r8s_store::error::StoreError;
 use serde_json::Value;
 
-pub fn object_response(object: &Value) -> Response {
+pub fn json_response(status: u16, object: &Value) -> Response {
+    let body = serde_json::to_vec(object).unwrap_or_else(|e| {
+        format!(r#"{{"kind":"Status","status":"Failure","message":"serialization error: {e}","code":500}}"#).into_bytes()
+    });
     Response::builder()
-        .status(200)
+        .status(status)
         .header("content-type", "application/json")
-        .body(Body::from(serde_json::to_vec(object).unwrap()))
-        .unwrap()
+        .body(Body::from(body))
+        .expect("valid response")
+}
+
+pub fn object_response(object: &Value) -> Response {
+    json_response(200, object)
 }
 
 pub fn created_response(object: &Value) -> Response {
-    Response::builder()
-        .status(201)
-        .header("content-type", "application/json")
-        .body(Body::from(serde_json::to_vec(object).unwrap()))
-        .unwrap()
+    json_response(201, object)
 }
 
 pub fn list_response(
@@ -53,11 +56,7 @@ pub fn status_error(status: StatusCode, reason: &str, message: &str) -> Response
         "code": status.as_u16(),
     });
 
-    Response::builder()
-        .status(status)
-        .header("content-type", "application/json")
-        .body(Body::from(serde_json::to_vec(&body).unwrap()))
-        .unwrap()
+    json_response(status.as_u16(), &body)
 }
 
 pub fn store_error_response(err: &StoreError) -> Response {
@@ -90,7 +89,7 @@ pub fn watch_event_line(event_type: &str, object: &Value) -> Vec<u8> {
         "type": event_type,
         "object": object,
     });
-    let mut bytes = serde_json::to_vec(&frame).unwrap();
+    let mut bytes = serde_json::to_vec(&frame).unwrap_or_default();
     bytes.push(b'\n');
     bytes
 }

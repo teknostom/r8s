@@ -1,7 +1,7 @@
 use std::net::Ipv4Addr;
 
 use r8s_store::Store;
-use r8s_types::GroupVersionResource;
+use r8s_types::{GroupVersionResource, Service};
 use tokio::net::UdpSocket;
 use tokio_util::sync::CancellationToken;
 
@@ -23,6 +23,7 @@ pub async fn run_dns_server(
     let upstream = upstream.trim().to_string();
 
     let socket = UdpSocket::bind("10.244.0.1:53").await?;
+    let fwd_socket = UdpSocket::bind("0.0.0.0:0").await?;
     tracing::info!(upstream, "DNS server listening on 10.244.0.1:53");
 
     let mut buf = [0u8; 512];
@@ -47,7 +48,7 @@ pub async fn run_dns_server(
                     Some(r) => r,
                     None => {
                         // Forward to upstream
-                        match forward_query(query, &upstream).await {
+                        match forward_query(query, &upstream, &fwd_socket).await {
                             Ok(r) => r,
                             Err(e) => {
                                 tracing::debug!("DNS forward error: {e}");
@@ -116,8 +117,9 @@ fn resolve_service(store: &Store, query: &[u8], name: &str) -> Option<Vec<u8>> {
         name: svc_name,
     };
 
-    let service = store.get(&resource_ref).ok()??;
-    let cluster_ip = service["spec"]["clusterIP"].as_str()?;
+    let svc_value = store.get(&resource_ref).ok()??;
+    let svc: Service = serde_json::from_value(svc_value).ok()?;
+    let cluster_ip = svc.spec.cluster_ip.as_deref()?;
     let ip: Ipv4Addr = cluster_ip.parse().ok()?;
 
     Some(build_a_response(query, ip))
@@ -157,8 +159,7 @@ fn build_nxdomain(query: &[u8]) -> Vec<u8> {
 }
 
 /// Forward a DNS query to the upstream resolver and return the response.
-async fn forward_query(query: &[u8], upstream: &str) -> anyhow::Result<Vec<u8>> {
-    let sock = UdpSocket::bind("0.0.0.0:0").await?;
+async fn forward_query(query: &[u8], upstream: &str, sock: &UdpSocket) -> anyhow::Result<Vec<u8>> {
     sock.send_to(query, format!("{upstream}:53")).await?;
 
     let mut buf = [0u8; 512];

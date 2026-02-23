@@ -16,6 +16,14 @@ pub struct ContainerStatus {
     pub exit_code: Option<i32>,
 }
 
+/// A bind mount to add to a container.
+#[derive(Debug, Clone)]
+pub struct Mount {
+    pub host_path: String,
+    pub container_path: String,
+    pub readonly: bool,
+}
+
 /// Configuration for creating a container.
 #[derive(Debug, Clone)]
 pub struct ContainerConfig {
@@ -25,6 +33,7 @@ pub struct ContainerConfig {
     pub args: Vec<String>,
     pub env: Vec<(String, String)>,
     pub working_dir: Option<String>,
+    pub mounts: Vec<Mount>,
 }
 
 /// Pluggable container runtime interface.
