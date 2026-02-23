@@ -39,7 +39,7 @@ pub struct LogParams {
     pub tail_lines: Option<u64>,
 }
 
-fn require_json(headers: &HeaderMap, body: &Bytes) -> Result<serde_json::Value, Box<Response>> {
+pub(crate) fn require_json(headers: &HeaderMap, body: &Bytes) -> Result<serde_json::Value, Box<Response>> {
     let content_type = headers
         .get("content-type")
         .and_then(|v| v.to_str().ok())
@@ -67,7 +67,7 @@ fn wants_table(headers: &HeaderMap) -> bool {
         .is_some_and(|accept| accept.contains("as=Table") && accept.contains("g=meta.k8s.io"))
 }
 
-fn get_impl(
+pub(crate) fn get_impl(
     state: &AppState,
     ctx: &RouteContext,
     namespace: Option<&str>,
@@ -118,7 +118,7 @@ pub async fn get_cluster(
     get_impl(&state, &ctx, None, &name, &headers)
 }
 
-fn create_impl(
+pub(crate) fn create_impl(
     state: &AppState,
     ctx: &RouteContext,
     namespace: Option<&str>,
@@ -176,7 +176,7 @@ pub async fn create_cluster(
     create_impl(&state, &ctx, None, body)
 }
 
-fn update_impl(
+pub(crate) fn update_impl(
     state: &AppState,
     ctx: &RouteContext,
     namespace: Option<&str>,
@@ -221,7 +221,7 @@ pub async fn update_cluster(
     };
     update_impl(&state, &ctx, None, &name, body)
 }
-fn delete_impl(
+pub(crate) fn delete_impl(
     state: &AppState,
     ctx: &RouteContext,
     namespace: Option<&str>,
@@ -259,7 +259,7 @@ pub async fn delete_cluster(
     delete_impl(&state, &ctx, None, &name)
 }
 
-fn patch_impl(
+pub(crate) fn patch_impl(
     state: &AppState,
     ctx: &RouteContext,
     namespace: Option<&str>,
@@ -328,7 +328,7 @@ fn api_version(ctx: &RouteContext) -> String {
     }
 }
 
-fn list_impl(
+pub(crate) fn list_impl(
     state: &AppState,
     ctx: &RouteContext,
     namespace: Option<&str>,

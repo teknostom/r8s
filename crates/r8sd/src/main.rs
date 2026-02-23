@@ -37,10 +37,12 @@ async fn main() -> anyhow::Result<()> {
     bootstrap_ingress_class(&store)?;
 
     let shutdown = CancellationToken::new();
+    let registry = ResourceRegistry::default_mvp();
 
     // Start controllers before API server so watches are subscribed
     // before any API-driven mutations
-    let mut controller_manager = ControllerManager::new(store.clone(), shutdown.clone());
+    let mut controller_manager =
+        ControllerManager::new(store.clone(), shutdown.clone(), registry.clone());
     controller_manager.start();
 
     let scheduler_store = store.clone();
@@ -106,7 +108,6 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    let registry = ResourceRegistry::default_mvp();
     let server = ApiServer::new(store, registry, data_dir);
     let addr: SocketAddr = "0.0.0.0:6443".parse()?;
     let server_shutdown = shutdown.clone();

@@ -14,6 +14,7 @@ pub mod ingressclass;
 pub mod namespace;
 pub mod serviceaccount;
 pub mod node;
+pub mod crd;
 
 pub use resource::{GroupVersionResource, ResourceType};
 
@@ -30,3 +31,4 @@ pub use pod::Pod;
 pub use replicaset::ReplicaSet;
 pub use service::Service;
 pub use serviceaccount::ServiceAccount;
+pub use crd::CustomResourceDefinition;

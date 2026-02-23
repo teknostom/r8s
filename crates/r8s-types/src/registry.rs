@@ -1,54 +1,83 @@
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use rustc_hash::FxHashMap;
 
 use crate::{GroupVersionResource, ResourceType};
 
-#[derive(Default)]
-pub struct ResourceRegistry {
+struct RegistryInner {
     by_gvr: FxHashMap<String, Arc<ResourceType>>,
     by_resource: FxHashMap<String, Arc<ResourceType>>,
+}
+
+/// Thread-safe registry of known resource types.
+///
+/// Uses interior mutability so the CRD controller can register new types
+/// at runtime while the API server reads concurrently.
+#[derive(Clone)]
+pub struct ResourceRegistry {
+    inner: Arc<RwLock<RegistryInner>>,
+}
+
+impl Default for ResourceRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ResourceRegistry {
     pub fn new() -> Self {
         Self {
-            by_gvr: FxHashMap::default(),
-            by_resource: FxHashMap::default(),
+            inner: Arc::new(RwLock::new(RegistryInner {
+                by_gvr: FxHashMap::default(),
+                by_resource: FxHashMap::default(),
+            })),
         }
     }
 
-    pub fn register(&mut self, rt: ResourceType) {
+    pub fn register(&self, rt: ResourceType) {
         let rt = Arc::new(rt);
-        self.by_gvr.insert(rt.gvr.key_prefix(), Arc::clone(&rt));
-        self.by_resource.insert(rt.gvr.resource.clone(), rt);
+        let mut inner = self.inner.write().unwrap();
+        inner.by_gvr.insert(rt.gvr.key_prefix(), Arc::clone(&rt));
+        inner.by_resource.insert(rt.gvr.resource.clone(), rt);
     }
 
-    pub fn get_by_gvr(&self, gvr: &GroupVersionResource) -> Option<&Arc<ResourceType>> {
-        self.by_gvr.get(&gvr.key_prefix())
+    pub fn unregister(&self, gvr: &GroupVersionResource) {
+        let mut inner = self.inner.write().unwrap();
+        inner.by_gvr.remove(&gvr.key_prefix());
+        inner.by_resource.remove(&gvr.resource);
     }
 
-    pub fn get_by_resource(&self, resource: &str) -> Option<&Arc<ResourceType>> {
-        self.by_resource.get(resource)
+    pub fn get_by_gvr(&self, gvr: &GroupVersionResource) -> Option<Arc<ResourceType>> {
+        let inner = self.inner.read().unwrap();
+        inner.by_gvr.get(&gvr.key_prefix()).cloned()
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = &Arc<ResourceType>> {
-        self.by_gvr.values()
+    pub fn get_by_resource(&self, resource: &str) -> Option<Arc<ResourceType>> {
+        let inner = self.inner.read().unwrap();
+        inner.by_resource.get(resource).cloned()
+    }
+
+    pub fn iter(&self) -> Vec<Arc<ResourceType>> {
+        let inner = self.inner.read().unwrap();
+        inner.by_gvr.values().cloned().collect()
     }
 
     pub fn resources_for_group_version(
         &self,
         group: &str,
         version: &str,
-    ) -> Vec<&Arc<ResourceType>> {
-        self.by_gvr
+    ) -> Vec<Arc<ResourceType>> {
+        let inner = self.inner.read().unwrap();
+        inner
+            .by_gvr
             .values()
             .filter(|rt| rt.gvr.group == group && rt.gvr.version == version)
+            .cloned()
             .collect()
     }
 
     pub fn default_mvp() -> Self {
-        let mut r = Self::new();
+        let r = Self::new();
 
         // Core/v1
         for (resource, kind, namespaced, singular, short) in [
