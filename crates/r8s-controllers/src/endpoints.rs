@@ -202,7 +202,6 @@ fn reconcile_service(store: &Store, service_value: &serde_json::Value) -> anyhow
         }]),
     };
 
-    let ep_value = serde_json::to_value(&ep)?;
     let gvr = GroupVersionResource::endpoints();
     let rref = ResourceRef {
         gvr: &gvr,
@@ -211,10 +210,16 @@ fn reconcile_service(store: &Store, service_value: &serde_json::Value) -> anyhow
     };
 
     match store.get(&rref)? {
-        Some(_) => {
+        Some(existing) => {
+            // Preserve resourceVersion for update
+            let mut ep_value = serde_json::to_value(&ep)?;
+            if let Some(rv) = existing["metadata"]["resourceVersion"].as_str() {
+                ep_value["metadata"]["resourceVersion"] = serde_json::json!(rv);
+            }
             let _ = store.update(&rref, &ep_value);
         }
         None => {
+            let ep_value = serde_json::to_value(&ep)?;
             let _ = store.create(rref, &ep_value);
         }
     }
@@ -276,12 +281,16 @@ fn reconcile_service(store: &Store, service_value: &serde_json::Value) -> anyhow
             .collect(),
         ports: Some(discovery_ports),
     };
-    let es_value = serde_json::to_value(&es)?;
     match store.get(&es_ref)? {
-        Some(_) => {
+        Some(existing) => {
+            let mut es_value = serde_json::to_value(&es)?;
+            if let Some(rv) = existing["metadata"]["resourceVersion"].as_str() {
+                es_value["metadata"]["resourceVersion"] = serde_json::json!(rv);
+            }
             let _ = store.update(&es_ref, &es_value);
         }
         None => {
+            let es_value = serde_json::to_value(&es)?;
             let _ = store.create(es_ref, &es_value);
         }
     }

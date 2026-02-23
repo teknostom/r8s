@@ -12,6 +12,7 @@ use tokio_util::sync::CancellationToken;
 pub struct TestCluster {
     pub store: Store,
     pub runtime: Arc<MockRuntime>,
+    pub registry: ResourceRegistry,
     shutdown: CancellationToken,
     _controller_manager: ControllerManager,
     _handles: Vec<JoinHandle<()>>,
@@ -33,7 +34,7 @@ impl TestCluster {
 
         // Start controllers BEFORE other subsystems (so watches are subscribed)
         let mut controller_manager =
-            ControllerManager::new(store.clone(), shutdown.clone(), registry);
+            ControllerManager::new(store.clone(), shutdown.clone(), registry.clone());
         controller_manager.start();
 
         // Start scheduler
@@ -75,6 +76,7 @@ impl TestCluster {
         Self {
             store,
             runtime,
+            registry,
             shutdown,
             _controller_manager: controller_manager,
             _handles: vec![scheduler_handle, kubelet_handle],
@@ -138,6 +140,66 @@ where
         if let Ok(result) = store.list(gvr, ns, None, None, None, None) {
             let matched = result.items.iter().filter(|v| filter(v)).count();
             if matched >= count {
+                return true;
+            }
+        }
+        if tokio::time::Instant::now() > deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Wait until exactly `count` resources match a filter (stabilized).
+/// Waits for the count to reach exactly `count` and stay there for 2 consecutive polls.
+pub async fn wait_for_exact_count<F>(
+    store: &Store,
+    gvr: &GroupVersionResource,
+    ns: Option<&str>,
+    filter: F,
+    count: usize,
+    timeout: Duration,
+) -> bool
+where
+    F: Fn(&serde_json::Value) -> bool,
+{
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut consecutive = 0u32;
+    loop {
+        if let Ok(result) = store.list(gvr, ns, None, None, None, None) {
+            let matched = result.items.iter().filter(|v| filter(v)).count();
+            if matched == count {
+                consecutive += 1;
+                if consecutive >= 2 {
+                    return true;
+                }
+            } else {
+                consecutive = 0;
+            }
+        }
+        if tokio::time::Instant::now() > deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Wait until zero resources match a filter.
+pub async fn wait_for_zero<F>(
+    store: &Store,
+    gvr: &GroupVersionResource,
+    ns: Option<&str>,
+    filter: F,
+    timeout: Duration,
+) -> bool
+where
+    F: Fn(&serde_json::Value) -> bool,
+{
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if let Ok(result) = store.list(gvr, ns, None, None, None, None) {
+            let matched = result.items.iter().filter(|v| filter(v)).count();
+            if matched == 0 {
                 return true;
             }
         }

@@ -34,11 +34,17 @@ impl MockRuntime {
     /// Stop all containers whose config name contains the given substring.
     /// Simulates process exit for testing (e.g. Job pod completion).
     pub fn stop_matching(&self, name_contains: &str) {
+        self.stop_matching_with_code(name_contains, 0);
+    }
+
+    /// Stop matching containers with a specific exit code.
+    /// Use exit_code=0 for success, non-zero for failure.
+    pub fn stop_matching_with_code(&self, name_contains: &str, code: i32) {
         let mut containers = self.containers.lock().unwrap();
         for c in containers.values_mut() {
             if c.config.name.contains(name_contains) && c.running {
                 c.running = false;
-                c.exit_code = Some(0);
+                c.exit_code = Some(code);
             }
         }
     }
