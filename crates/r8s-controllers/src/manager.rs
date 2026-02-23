@@ -39,6 +39,7 @@ impl ControllerManager {
         spawn_controller!("deployment", super::deployment::run);
         spawn_controller!("gc", super::gc::run);
         spawn_controller!("endpoints", super::endpoints::run);
+        spawn_controller!("statefulset", super::statefulset::run);
 
         // CRD controller needs the registry
         {

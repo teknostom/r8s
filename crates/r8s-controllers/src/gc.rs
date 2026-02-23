@@ -17,10 +17,12 @@ pub async fn run(store: Store, shutdown: CancellationToken) -> anyhow::Result<()
     tracing::info!("gc controller started");
     let deploy_gvr = GroupVersionResource::new("apps", "v1", "deployments");
     let rs_gvr = GroupVersionResource::new("apps", "v1", "replicasets");
+    let sts_gvr = GroupVersionResource::new("apps", "v1", "statefulsets");
     let pods_gvr = GroupVersionResource::new("", "v1", "pods");
 
     let mut deploy_rx = store.watch(&deploy_gvr);
     let mut rs_rx = store.watch(&rs_gvr);
+    let mut sts_rx = store.watch(&sts_gvr);
 
     loop {
         tokio::select! {
@@ -57,6 +59,23 @@ pub async fn run(store: Store, shutdown: CancellationToken) -> anyhow::Result<()
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => {
                         gc_orphans(&store, &rs_gvr, &pods_gvr);
+                    }
+                    Err(broadcast::error::RecvError::Closed) => return Ok(()),
+                    _ => {}
+                }
+            }
+            event = sts_rx.recv() => {
+                match event {
+                    Ok(event) if matches!(event.event_type, WatchEventType::Deleted) => {
+                        let meta: MetadataOnly = match serde_json::from_value(event.object) {
+                            Ok(m) => m,
+                            Err(_) => continue,
+                        };
+                        let uid = meta.metadata.uid.as_deref().unwrap_or("");
+                        delete_owned(&store, &pods_gvr, uid);
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        gc_orphans(&store, &sts_gvr, &pods_gvr);
                     }
                     Err(broadcast::error::RecvError::Closed) => return Ok(()),
                     _ => {}

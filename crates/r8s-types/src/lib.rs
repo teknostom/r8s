@@ -15,6 +15,7 @@ pub mod namespace;
 pub mod serviceaccount;
 pub mod node;
 pub mod crd;
+pub mod statefulset;
 
 pub use resource::{GroupVersionResource, ResourceType};
 
@@ -32,3 +33,4 @@ pub use replicaset::ReplicaSet;
 pub use service::Service;
 pub use serviceaccount::ServiceAccount;
 pub use crd::CustomResourceDefinition;
+pub use statefulset::StatefulSet;

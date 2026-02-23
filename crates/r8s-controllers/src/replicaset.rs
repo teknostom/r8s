@@ -219,7 +219,7 @@ fn update_rs_status(
         name: rs_name,
     };
 
-    let mut current = match store.get(&resource_ref)? {
+    let current = match store.get(&resource_ref)? {
         Some(rs) => rs,
         None => return Ok(()),
     };
@@ -229,9 +229,15 @@ fn update_rs_status(
         ready_replicas: replica_count,
         available_replicas: replica_count,
     };
-    current["status"] = serde_json::to_value(&status)?;
+    let new_status_val = serde_json::to_value(&status)?;
+    if current.get("status") == Some(&new_status_val) {
+        return Ok(());
+    }
 
-    match store.update(&resource_ref, &current) {
+    let mut updated = current;
+    updated["status"] = new_status_val;
+
+    match store.update(&resource_ref, &updated) {
         Ok(_) => Ok(()),
         Err(e) => {
             tracing::debug!("rs status update conflict for '{rs_name}', will retry: {e}");

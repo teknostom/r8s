@@ -276,7 +276,12 @@ fn update_deploy_status(store: &Store, deploy_value: &serde_json::Value) -> anyh
             reason: Some("MinimumReplicasAvailable".into()),
         }],
     };
-    current["status"] = serde_json::to_value(&status)?;
+    let new_status_val = serde_json::to_value(&status)?;
+    if current.get("status") == Some(&new_status_val) {
+        return Ok(());
+    }
+
+    current["status"] = new_status_val;
 
     match store.update(&resource_ref, &current) {
         Ok(_) => Ok(()),
