@@ -59,6 +59,16 @@ pub async fn run<R: ContainerRuntime>(
     shutdown: CancellationToken,
     data_dir: PathBuf,
 ) -> anyhow::Result<()> {
+    run_with_config(store, runtime, shutdown, data_dir, Duration::from_secs(10)).await
+}
+
+pub async fn run_with_config<R: ContainerRuntime>(
+    store: Store,
+    runtime: Arc<R>,
+    shutdown: CancellationToken,
+    data_dir: PathBuf,
+    health_interval_duration: Duration,
+) -> anyhow::Result<()> {
     tracing::info!("kubelet started for node '{NODE_NAME}'");
 
     let mut pod_containers: FxHashMap<String, PodContainers> = FxHashMap::default();
@@ -68,7 +78,7 @@ pub async fn run<R: ContainerRuntime>(
     reconcile_all(&store, rt, &mut pod_containers, &mut ip_pool, &data_dir).await;
 
     let mut rx = store.watch(&GroupVersionResource::pods());
-    let mut health_interval = tokio::time::interval(Duration::from_secs(10));
+    let mut health_interval = tokio::time::interval(health_interval_duration);
     health_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
@@ -144,6 +154,12 @@ async fn reconcile_pod<R: ContainerRuntime>(
     // Only care about pods on our node
     if pod.spec.as_ref().and_then(|s| s.node_name.as_deref()) != Some(NODE_NAME) {
         return;
+    }
+
+    // Skip pods in terminal phase (Succeeded/Failed) — don't restart them
+    match pod.status.as_ref().and_then(|s| s.phase.as_deref()) {
+        Some("Succeeded") | Some("Failed") => return,
+        _ => {}
     }
 
     let pod_name = match pod.metadata.name.as_deref() {
@@ -471,7 +487,7 @@ async fn check_health<R: ContainerRuntime>(
     ip_pool: &mut IpPool,
     data_dir: &PathBuf,
 ) {
-    let mut crashed: Vec<String> = Vec::new();
+    let mut crashed: Vec<(String, Option<i32>)> = Vec::new();
 
     for (pod_uid, pc) in pod_containers.iter() {
         for cid in &pc.container_ids {
@@ -483,7 +499,7 @@ async fn check_health<R: ContainerRuntime>(
                         cid.0,
                         status.exit_code
                     );
-                    crashed.push(pod_uid.clone());
+                    crashed.push((pod_uid.clone(), status.exit_code));
                     break;
                 }
                 Err(e) => {
@@ -492,7 +508,7 @@ async fn check_health<R: ContainerRuntime>(
                         pc.pod_name,
                         cid.0
                     );
-                    crashed.push(pod_uid.clone());
+                    crashed.push((pod_uid.clone(), None));
                     break;
                 }
                 _ => {}
@@ -500,7 +516,7 @@ async fn check_health<R: ContainerRuntime>(
         }
     }
 
-    for pod_uid in crashed {
+    for (pod_uid, exit_code) in crashed {
         let pc = match pod_containers.remove(&pod_uid) {
             Some(pc) => pc,
             None => continue,
@@ -515,24 +531,63 @@ async fn check_health<R: ContainerRuntime>(
         r8s_network::bridge::teardown_pod_network(&pc.pod_name);
         cleanup_pod_volumes(data_dir, &pod_uid);
 
-        // Update pod status to Failed, then delete so RS controller creates a replacement
         let gvr = GroupVersionResource::pods();
         let resource_ref = ResourceRef {
             gvr: &gvr,
             namespace: pc.pod_ns.as_deref(),
             name: &pc.pod_name,
         };
-        if let Ok(Some(mut pod)) = store.get(&resource_ref) {
-            pod["status"]["phase"] = serde_json::json!("Failed");
-            let _ = store.update(&resource_ref, &pod);
-        }
-        let _ = store.delete(&resource_ref);
 
-        tracing::info!(
-            "pod '{}': crashed, cleaned up and deleted (ip=10.244.0.{})",
-            pc.pod_name,
-            pc.pod_ip_num
-        );
+        // Read the pod's restartPolicy to decide what to do
+        let restart_policy = store
+            .get(&resource_ref)
+            .ok()
+            .flatten()
+            .and_then(|p| p["spec"]["restartPolicy"].as_str().map(String::from))
+            .unwrap_or_else(|| "Always".to_string());
+
+        let succeeded = exit_code == Some(0);
+
+        match restart_policy.as_str() {
+            "Never" => {
+                // Mark final phase, keep pod in store for Job controller to count
+                let phase = if succeeded { "Succeeded" } else { "Failed" };
+                if let Ok(Some(mut pod)) = store.get(&resource_ref) {
+                    pod["status"]["phase"] = serde_json::json!(phase);
+                    let _ = store.update(&resource_ref, &pod);
+                }
+                tracing::info!(
+                    "pod '{}': exited (code={:?}), phase={phase}, kept in store (restartPolicy=Never)",
+                    pc.pod_name,
+                    exit_code,
+                );
+            }
+            "OnFailure" if succeeded => {
+                // Succeeded — keep in store like Never
+                if let Ok(Some(mut pod)) = store.get(&resource_ref) {
+                    pod["status"]["phase"] = serde_json::json!("Succeeded");
+                    let _ = store.update(&resource_ref, &pod);
+                }
+                tracing::info!(
+                    "pod '{}': succeeded, kept in store (restartPolicy=OnFailure)",
+                    pc.pod_name,
+                );
+            }
+            _ => {
+                // "Always" or "OnFailure" with failure — delete so controller recreates
+                if let Ok(Some(mut pod)) = store.get(&resource_ref) {
+                    pod["status"]["phase"] = serde_json::json!("Failed");
+                    let _ = store.update(&resource_ref, &pod);
+                }
+                let _ = store.delete(&resource_ref);
+                tracing::info!(
+                    "pod '{}': crashed (code={:?}), cleaned up and deleted (ip=10.244.0.{})",
+                    pc.pod_name,
+                    exit_code,
+                    pc.pod_ip_num
+                );
+            }
+        }
     }
 }
 

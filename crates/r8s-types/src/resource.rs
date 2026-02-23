@@ -37,6 +37,7 @@ impl GroupVersionResource {
     pub fn deployments() -> Self { Self::new("apps", "v1", "deployments") }
     pub fn replica_sets() -> Self { Self::new("apps", "v1", "replicasets") }
     pub fn stateful_sets() -> Self { Self::new("apps", "v1", "statefulsets") }
+    pub fn daemon_sets() -> Self { Self::new("apps", "v1", "daemonsets") }
 
     // Networking v1
     pub fn ingresses() -> Self { Self::new("networking.k8s.io", "v1", "ingresses") }
@@ -44,6 +45,10 @@ impl GroupVersionResource {
 
     // Discovery v1
     pub fn endpoint_slices() -> Self { Self::new("discovery.k8s.io", "v1", "endpointslices") }
+
+    // Batch v1
+    pub fn jobs() -> Self { Self::new("batch", "v1", "jobs") }
+    pub fn cron_jobs() -> Self { Self::new("batch", "v1", "cronjobs") }
 
     // Apiextensions v1
     pub fn crds() -> Self { Self::new("apiextensions.k8s.io", "v1", "customresourcedefinitions") }

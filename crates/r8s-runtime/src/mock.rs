@@ -12,8 +12,9 @@ pub struct MockRuntime {
 }
 
 struct MockContainer {
-    _config: ContainerConfig,
+    config: ContainerConfig,
     running: bool,
+    exit_code: Option<i32>,
 }
 
 impl Default for MockRuntime {
@@ -28,6 +29,18 @@ impl Default for MockRuntime {
 impl MockRuntime {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Stop all containers whose config name contains the given substring.
+    /// Simulates process exit for testing (e.g. Job pod completion).
+    pub fn stop_matching(&self, name_contains: &str) {
+        let mut containers = self.containers.lock().unwrap();
+        for c in containers.values_mut() {
+            if c.config.name.contains(name_contains) && c.running {
+                c.running = false;
+                c.exit_code = Some(0);
+            }
+        }
     }
 }
 
@@ -46,8 +59,9 @@ impl ContainerRuntime for MockRuntime {
         containers.insert(
             id.clone(),
             MockContainer {
-                _config: config.clone(),
+                config: config.clone(),
                 running: false,
+                exit_code: None,
             },
         );
         tracing::info!(id, name = config.name, "mock: created container");
@@ -58,6 +72,7 @@ impl ContainerRuntime for MockRuntime {
         let mut containers = self.containers.lock().unwrap();
         if let Some(c) = containers.get_mut(&id.0) {
             c.running = true;
+            c.exit_code = None;
             tracing::info!(id = id.0, "mock: started container");
         }
         Ok(())
@@ -67,6 +82,9 @@ impl ContainerRuntime for MockRuntime {
         let mut containers = self.containers.lock().unwrap();
         if let Some(c) = containers.get_mut(&id.0) {
             c.running = false;
+            if c.exit_code.is_none() {
+                c.exit_code = Some(0);
+            }
             tracing::info!(id = id.0, "mock: stopped container");
         }
         Ok(())
@@ -85,7 +103,7 @@ impl ContainerRuntime for MockRuntime {
             Some(c) => Ok(ContainerStatus {
                 id: id.clone(),
                 running: c.running,
-                exit_code: if c.running { None } else { Some(0) },
+                exit_code: if c.running { None } else { c.exit_code },
             }),
             None => anyhow::bail!("container not found: {}", id.0),
         }

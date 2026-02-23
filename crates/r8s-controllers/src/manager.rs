@@ -40,6 +40,9 @@ impl ControllerManager {
         spawn_controller!("gc", super::gc::run);
         spawn_controller!("endpoints", super::endpoints::run);
         spawn_controller!("statefulset", super::statefulset::run);
+        spawn_controller!("daemonset", super::daemonset::run);
+        spawn_controller!("job", super::job::run);
+        spawn_controller!("cronjob", super::cronjob::run);
 
         // CRD controller needs the registry
         {

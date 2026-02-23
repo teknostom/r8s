@@ -16,11 +16,17 @@ pub async fn run(store: Store, shutdown: CancellationToken) -> anyhow::Result<()
     let deploy_gvr = GroupVersionResource::deployments();
     let rs_gvr = GroupVersionResource::replica_sets();
     let sts_gvr = GroupVersionResource::stateful_sets();
+    let ds_gvr = GroupVersionResource::daemon_sets();
+    let job_gvr = GroupVersionResource::jobs();
+    let cj_gvr = GroupVersionResource::cron_jobs();
     let pods_gvr = GroupVersionResource::pods();
 
     let mut deploy_rx = store.watch(&deploy_gvr);
     let mut rs_rx = store.watch(&rs_gvr);
     let mut sts_rx = store.watch(&sts_gvr);
+    let mut ds_rx = store.watch(&ds_gvr);
+    let mut job_rx = store.watch(&job_gvr);
+    let mut cj_rx = store.watch(&cj_gvr);
 
     loop {
         tokio::select! {
@@ -74,6 +80,57 @@ pub async fn run(store: Store, shutdown: CancellationToken) -> anyhow::Result<()
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => {
                         gc_orphans(&store, &sts_gvr, &pods_gvr);
+                    }
+                    Err(broadcast::error::RecvError::Closed) => return Ok(()),
+                    _ => {}
+                }
+            }
+            event = ds_rx.recv() => {
+                match event {
+                    Ok(event) if matches!(event.event_type, WatchEventType::Deleted) => {
+                        let meta: MetadataOnly = match serde_json::from_value(event.object) {
+                            Ok(m) => m,
+                            Err(_) => continue,
+                        };
+                        let uid = meta.metadata.uid.as_deref().unwrap_or("");
+                        delete_owned(&store, &pods_gvr, uid);
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        gc_orphans(&store, &ds_gvr, &pods_gvr);
+                    }
+                    Err(broadcast::error::RecvError::Closed) => return Ok(()),
+                    _ => {}
+                }
+            }
+            event = cj_rx.recv() => {
+                match event {
+                    Ok(event) if matches!(event.event_type, WatchEventType::Deleted) => {
+                        let meta: MetadataOnly = match serde_json::from_value(event.object) {
+                            Ok(m) => m,
+                            Err(_) => continue,
+                        };
+                        let uid = meta.metadata.uid.as_deref().unwrap_or("");
+                        delete_owned(&store, &job_gvr, uid);
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        gc_orphans(&store, &cj_gvr, &job_gvr);
+                    }
+                    Err(broadcast::error::RecvError::Closed) => return Ok(()),
+                    _ => {}
+                }
+            }
+            event = job_rx.recv() => {
+                match event {
+                    Ok(event) if matches!(event.event_type, WatchEventType::Deleted) => {
+                        let meta: MetadataOnly = match serde_json::from_value(event.object) {
+                            Ok(m) => m,
+                            Err(_) => continue,
+                        };
+                        let uid = meta.metadata.uid.as_deref().unwrap_or("");
+                        delete_owned(&store, &pods_gvr, uid);
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        gc_orphans(&store, &job_gvr, &pods_gvr);
                     }
                     Err(broadcast::error::RecvError::Closed) => return Ok(()),
                     _ => {}

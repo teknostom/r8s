@@ -24,8 +24,14 @@ pub use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
 
 // Apps v1 types
 pub use k8s_openapi::api::apps::v1::{
-    Deployment, DeploymentCondition, DeploymentSpec, DeploymentStatus, ReplicaSet, ReplicaSetSpec,
-    ReplicaSetStatus, StatefulSet, StatefulSetSpec, StatefulSetStatus,
+    DaemonSet, DaemonSetSpec, DaemonSetStatus, Deployment, DeploymentCondition, DeploymentSpec,
+    DeploymentStatus, ReplicaSet, ReplicaSetSpec, ReplicaSetStatus, StatefulSet, StatefulSetSpec,
+    StatefulSetStatus,
+};
+
+// Batch v1 types
+pub use k8s_openapi::api::batch::v1::{
+    CronJob, CronJobSpec, CronJobStatus, Job, JobCondition, JobSpec, JobStatus, JobTemplateSpec,
 };
 
 // Networking v1 types

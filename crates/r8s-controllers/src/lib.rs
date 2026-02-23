@@ -1,7 +1,10 @@
 pub mod crd;
+pub mod cronjob;
+pub mod daemonset;
 pub mod deployment;
 pub mod endpoints;
 pub mod gc;
+pub mod job;
 pub mod manager;
 pub mod namespace;
 pub mod replicaset;

@@ -11,6 +11,7 @@ members = [
     "crates/r8s-kubelet",
     "crates/r8s-runtime",
     "crates/r8s-network",
+    "crates/r8s-tests",
 ]
 
 [workspace.package]
@@ -72,6 +73,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
 rand = "0.9"
+tempfile = "3"
 
 # Internal crates
 r8s-types = { path = "crates/r8s-types" }

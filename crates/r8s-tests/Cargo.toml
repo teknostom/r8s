@@ -1,19 +1,20 @@
 [package]
-name = "r8s-controllers"
+name = "r8s-tests"
 version.workspace = true
 edition.workspace = true
 
 [dependencies]
 r8s-types.workspace = true
 r8s-store.workspace = true
-k8s-openapi.workspace = true
+r8s-api.workspace = true
+r8s-controllers.workspace = true
+r8s-scheduler.workspace = true
+r8s-kubelet.workspace = true
+r8s-runtime.workspace = true
 
 tokio.workspace = true
 tokio-util.workspace = true
 anyhow.workspace = true
-tracing.workspace = true
-serde.workspace = true
 serde_json.workspace = true
-rustc-hash.workspace = true
-rand.workspace = true
-chrono.workspace = true
+tempfile.workspace = true
+tracing.workspace = true

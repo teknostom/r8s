@@ -1252,6 +1252,7 @@ name = "r8s-controllers"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "k8s-openapi",
  "r8s-store",
  "r8s-types",
@@ -1347,6 +1348,25 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "r8s-tests"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "r8s-api",
+ "r8s-controllers",
+ "r8s-kubelet",
+ "r8s-runtime",
+ "r8s-scheduler",
+ "r8s-store",
+ "r8s-types",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tracing",
 ]
 
 [[package]]

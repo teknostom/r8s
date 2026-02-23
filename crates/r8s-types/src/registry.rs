@@ -159,6 +159,21 @@ impl ResourceRegistry {
             subresources: vec![],
         });
 
+        // Batch/v1
+        for (resource, kind, singular, short) in [
+            ("jobs", "Job", "job", vec![]),
+            ("cronjobs", "CronJob", "cronjob", vec!["cj"]),
+        ] {
+            r.register(ResourceType {
+                gvr: GroupVersionResource::new("batch", "v1", resource),
+                kind: kind.to_string(),
+                namespaced: true,
+                singular: singular.to_string(),
+                short_names: short.into_iter().map(String::from).collect(),
+                subresources: vec![],
+            });
+        }
+
         // autoscaling/v2
         r.register(ResourceType {
             gvr: GroupVersionResource::new("autoscaling", "v2", "horizontalpodautoscalers"),
