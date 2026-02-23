@@ -8,7 +8,7 @@ use r8s_types::{
 };
 
 pub fn bootstrap_namespaces(store: &Store) -> anyhow::Result<()> {
-    let gvr = GroupVersionResource::new("", "v1", "namespaces");
+    let gvr = GroupVersionResource::namespaces();
 
     for ns_name in ["default", "kube-system", "kube-public", "kube-node-lease"] {
         let resource_ref = ResourceRef {
@@ -33,7 +33,7 @@ pub fn bootstrap_namespaces(store: &Store) -> anyhow::Result<()> {
         }
     }
     // Bootstrap the "kubernetes" service in default namespace
-    let svc_gvr = GroupVersionResource::new("", "v1", "services");
+    let svc_gvr = GroupVersionResource::services();
     let svc_ref = ResourceRef {
         gvr: &svc_gvr,
         namespace: Some("default"),
@@ -69,7 +69,7 @@ pub fn bootstrap_namespaces(store: &Store) -> anyhow::Result<()> {
     }
 
     // Bootstrap endpoints for the kubernetes service
-    let ep_gvr = GroupVersionResource::new("", "v1", "endpoints");
+    let ep_gvr = GroupVersionResource::endpoints();
     let ep_ref = ResourceRef {
         gvr: &ep_gvr,
         namespace: Some("default"),
@@ -105,7 +105,7 @@ pub fn bootstrap_namespaces(store: &Store) -> anyhow::Result<()> {
 }
 
 pub fn bootstrap_ingress_class(store: &Store) -> anyhow::Result<()> {
-    let gvr = GroupVersionResource::new("networking.k8s.io", "v1", "ingressclasses");
+    let gvr = GroupVersionResource::ingress_classes();
     let rref = ResourceRef {
         gvr: &gvr,
         namespace: None,

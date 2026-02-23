@@ -3,14 +3,6 @@ use std::process::Command;
 use r8s_store::Store;
 use r8s_types::{Endpoints, GroupVersionResource, IntOrString, Service};
 
-fn services_gvr() -> GroupVersionResource {
-    GroupVersionResource::new("", "v1", "services")
-}
-
-fn endpoints_gvr() -> GroupVersionResource {
-    GroupVersionResource::new("", "v1", "endpoints")
-}
-
 /// Create the r8s nftables table with NAT chains.
 /// Idempotent -- safe to call if the table already exists.
 pub fn setup_nat_table() -> anyhow::Result<()> {
@@ -65,16 +57,11 @@ pub fn sync_service_rules(store: &Store) -> anyhow::Result<()> {
     let _ = nft(&["flush", "chain", "ip", "r8s", "prerouting"]);
     let _ = nft(&["flush", "chain", "ip", "r8s", "output"]);
 
-    let services = store
-        .list(&services_gvr(), None, None, None, None, None)
-        .map(|r| r.items)
+    let services: Vec<Service> = store
+        .list_as::<Service>(&GroupVersionResource::services(), None)
         .unwrap_or_default();
 
-    for svc_value in &services {
-        let svc: Service = match serde_json::from_value(svc_value.clone()) {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
+    for svc in &services {
         let svc_name = match svc.metadata.name.as_deref() {
             Some(n) => n,
             None => continue,
@@ -96,17 +83,13 @@ pub fn sync_service_rules(store: &Store) -> anyhow::Result<()> {
         }
 
         // Find endpoints for this service
-        let ep_gvr = endpoints_gvr();
+        let ep_gvr = GroupVersionResource::endpoints();
         let ep_ref = r8s_store::backend::ResourceRef {
             gvr: &ep_gvr,
             namespace: svc_ns,
             name: svc_name,
         };
-        let endpoints: Option<Endpoints> = store
-            .get(&ep_ref)
-            .ok()
-            .flatten()
-            .and_then(|v| serde_json::from_value(v).ok());
+        let endpoints: Option<Endpoints> = store.get_as::<Endpoints>(&ep_ref).ok().flatten();
 
         // Get all ready addresses from endpoints
         let pod_ips: Vec<&str> = endpoints

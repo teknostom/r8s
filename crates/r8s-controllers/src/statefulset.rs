@@ -5,30 +5,16 @@ use r8s_types::{
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
-fn sts_gvr() -> GroupVersionResource {
-    GroupVersionResource::new("apps", "v1", "statefulsets")
-}
-
-fn pods_gvr() -> GroupVersionResource {
-    GroupVersionResource::new("", "v1", "pods")
-}
-
-fn is_owned_by(meta: &ObjectMeta, owner_uid: &str) -> bool {
-    meta.owner_references
-        .as_deref()
-        .unwrap_or_default()
-        .iter()
-        .any(|r| r.uid == owner_uid)
-}
+use crate::is_owned_by;
 
 pub async fn run(store: Store, shutdown: CancellationToken) -> anyhow::Result<()> {
     tracing::info!("statefulset controller started");
-    let gvr = sts_gvr();
+    let gvr = GroupVersionResource::stateful_sets();
 
     reconcile_all(&store);
 
     let mut sts_rx = store.watch(&gvr);
-    let mut pod_rx = store.watch(&pods_gvr());
+    let mut pod_rx = store.watch(&GroupVersionResource::pods());
 
     loop {
         tokio::select! {
@@ -57,7 +43,7 @@ pub async fn run(store: Store, shutdown: CancellationToken) -> anyhow::Result<()
                         };
                         if let Some(owner) = pod.metadata.owner_references.as_deref().unwrap_or_default().iter().find(|r| r.kind == "StatefulSet") {
                             let resource_ref = ResourceRef {
-                                gvr: &sts_gvr(),
+                                gvr: &GroupVersionResource::stateful_sets(),
                                 namespace: pod.metadata.namespace.as_deref(),
                                 name: &owner.name,
                             };
@@ -76,7 +62,7 @@ pub async fn run(store: Store, shutdown: CancellationToken) -> anyhow::Result<()
 }
 
 fn reconcile_all(store: &Store) {
-    let gvr = sts_gvr();
+    let gvr = GroupVersionResource::stateful_sets();
     let result = match store.list(&gvr, None, None, None, None, None) {
         Ok(r) => r,
         Err(e) => {
@@ -101,17 +87,16 @@ fn reconcile_sts(store: &Store, sts_value: &serde_json::Value) -> anyhow::Result
     let sts_ns = sts.metadata.namespace.as_deref();
     let sts_uid = sts.metadata.uid.as_deref().unwrap_or("");
 
-    let gvr = sts_gvr();
+    let gvr = GroupVersionResource::stateful_sets();
     let resource_ref = ResourceRef {
         gvr: &gvr,
         namespace: sts_ns,
         name: sts_name,
     };
-    let current_value = match store.get(&resource_ref)? {
+    let current: r8s_types::StatefulSet = match store.get_as(&resource_ref)? {
         Some(v) => v,
         None => return Ok(()),
     };
-    let current: r8s_types::StatefulSet = serde_json::from_value(current_value)?;
     let current_uid = current.metadata.uid.as_deref().unwrap_or(sts_uid);
     let current_spec = current
         .spec
@@ -121,12 +106,10 @@ fn reconcile_sts(store: &Store, sts_value: &serde_json::Value) -> anyhow::Result
     let desired = current_spec.replicas.unwrap_or(1) as u64;
     let template = &current_spec.template;
 
-    let pod_gvr = pods_gvr();
-    let pods = store.list(&pod_gvr, sts_ns, None, None, None, None)?;
-    let mut owned: Vec<Pod> = pods
-        .items
-        .iter()
-        .filter_map(|v| serde_json::from_value::<Pod>(v.clone()).ok())
+    let pod_gvr = GroupVersionResource::pods();
+    let mut owned: Vec<Pod> = store
+        .list_as::<Pod>(&pod_gvr, sts_ns)?
+        .into_iter()
         .filter(|p| is_owned_by(&p.metadata, current_uid))
         .collect();
 
@@ -170,11 +153,9 @@ fn reconcile_sts(store: &Store, sts_value: &serde_json::Value) -> anyhow::Result
     }
 
     // Update status
-    let final_pods = store.list(&pod_gvr, sts_ns, None, None, None, None)?;
-    let final_owned: Vec<Pod> = final_pods
-        .items
-        .iter()
-        .filter_map(|v| serde_json::from_value::<Pod>(v.clone()).ok())
+    let final_owned: Vec<Pod> = store
+        .list_as::<Pod>(&pod_gvr, sts_ns)?
+        .into_iter()
         .filter(|p| is_owned_by(&p.metadata, current_uid))
         .collect();
     let total = final_owned.len() as i32;
@@ -238,7 +219,7 @@ fn create_pod(
         status: None,
     };
 
-    let gvr = pods_gvr();
+    let gvr = GroupVersionResource::pods();
     let resource_ref = ResourceRef {
         gvr: &gvr,
         namespace,
@@ -255,7 +236,7 @@ fn update_sts_status(
     total: i32,
     ready: i32,
 ) -> anyhow::Result<()> {
-    let gvr = sts_gvr();
+    let gvr = GroupVersionResource::stateful_sets();
     let resource_ref = ResourceRef {
         gvr: &gvr,
         namespace: sts_ns,

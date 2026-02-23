@@ -385,6 +385,31 @@ impl Store {
         Ok((current_rev, rev_count, res_count))
     }
 
+    /// Get and deserialize a resource.
+    pub fn get_as<T: serde::de::DeserializeOwned>(
+        &self,
+        resource: &ResourceRef,
+    ) -> anyhow::Result<Option<T>> {
+        match self.get(resource)? {
+            Some(v) => Ok(Some(serde_json::from_value(v)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// List and deserialize resources, skipping any that fail to deserialize.
+    pub fn list_as<T: serde::de::DeserializeOwned>(
+        &self,
+        gvr: &GroupVersionResource,
+        namespace: Option<&str>,
+    ) -> anyhow::Result<Vec<T>> {
+        let result = self.list(gvr, namespace, None, None, None, None)?;
+        Ok(result
+            .items
+            .into_iter()
+            .filter_map(|v| serde_json::from_value(v).ok())
+            .collect())
+    }
+
     pub fn watch(&self, gvr: &GroupVersionResource) -> broadcast::Receiver<WatchEvent> {
         self.watches.subscribe(&gvr.key_prefix())
     }

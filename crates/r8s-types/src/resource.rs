@@ -22,6 +22,31 @@ impl GroupVersionResource {
     pub fn key_prefix(&self) -> String {
         format!("{}/{}/{}", self.group, self.version, self.resource)
     }
+
+    // Core v1
+    pub fn pods() -> Self { Self::new("", "v1", "pods") }
+    pub fn nodes() -> Self { Self::new("", "v1", "nodes") }
+    pub fn namespaces() -> Self { Self::new("", "v1", "namespaces") }
+    pub fn services() -> Self { Self::new("", "v1", "services") }
+    pub fn endpoints() -> Self { Self::new("", "v1", "endpoints") }
+    pub fn secrets() -> Self { Self::new("", "v1", "secrets") }
+    pub fn configmaps() -> Self { Self::new("", "v1", "configmaps") }
+    pub fn service_accounts() -> Self { Self::new("", "v1", "serviceaccounts") }
+
+    // Apps v1
+    pub fn deployments() -> Self { Self::new("apps", "v1", "deployments") }
+    pub fn replica_sets() -> Self { Self::new("apps", "v1", "replicasets") }
+    pub fn stateful_sets() -> Self { Self::new("apps", "v1", "statefulsets") }
+
+    // Networking v1
+    pub fn ingresses() -> Self { Self::new("networking.k8s.io", "v1", "ingresses") }
+    pub fn ingress_classes() -> Self { Self::new("networking.k8s.io", "v1", "ingressclasses") }
+
+    // Discovery v1
+    pub fn endpoint_slices() -> Self { Self::new("discovery.k8s.io", "v1", "endpointslices") }
+
+    // Apiextensions v1
+    pub fn crds() -> Self { Self::new("apiextensions.k8s.io", "v1", "customresourcedefinitions") }
 }
 
 /// Metadata about a registered resource type.

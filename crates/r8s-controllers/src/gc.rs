@@ -3,13 +3,7 @@ use r8s_types::{GroupVersionResource, ObjectMeta};
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
-fn is_owned_by(meta: &ObjectMeta, owner_uid: &str) -> bool {
-    meta.owner_references
-        .as_deref()
-        .unwrap_or_default()
-        .iter()
-        .any(|r| r.uid == owner_uid)
-}
+use crate::is_owned_by;
 
 /// Minimal deserializable wrapper -- we only need metadata for GC.
 #[derive(serde::Deserialize)]
@@ -19,10 +13,10 @@ struct MetadataOnly {
 
 pub async fn run(store: Store, shutdown: CancellationToken) -> anyhow::Result<()> {
     tracing::info!("gc controller started");
-    let deploy_gvr = GroupVersionResource::new("apps", "v1", "deployments");
-    let rs_gvr = GroupVersionResource::new("apps", "v1", "replicasets");
-    let sts_gvr = GroupVersionResource::new("apps", "v1", "statefulsets");
-    let pods_gvr = GroupVersionResource::new("", "v1", "pods");
+    let deploy_gvr = GroupVersionResource::deployments();
+    let rs_gvr = GroupVersionResource::replica_sets();
+    let sts_gvr = GroupVersionResource::stateful_sets();
+    let pods_gvr = GroupVersionResource::pods();
 
     let mut deploy_rx = store.watch(&deploy_gvr);
     let mut rs_rx = store.watch(&rs_gvr);
@@ -91,7 +85,7 @@ pub async fn run(store: Store, shutdown: CancellationToken) -> anyhow::Result<()
 
 /// Full reconciliation after lag -- find children whose owners no longer exist.
 fn gc_orphans(store: &Store, owner_gvr: &GroupVersionResource, child_gvr: &GroupVersionResource) {
-    let owners = match store.list(owner_gvr, None, None, None, None, None) {
+    let owners = match store.list_as::<MetadataOnly>(owner_gvr, None) {
         Ok(r) => r,
         Err(e) => {
             tracing::warn!("gc orphan scan: failed to list owners: {e}");
@@ -99,15 +93,11 @@ fn gc_orphans(store: &Store, owner_gvr: &GroupVersionResource, child_gvr: &Group
         }
     };
     let owner_uids: std::collections::HashSet<String> = owners
-        .items
-        .iter()
-        .filter_map(|o| {
-            let m: MetadataOnly = serde_json::from_value(o.clone()).ok()?;
-            m.metadata.uid
-        })
+        .into_iter()
+        .filter_map(|m| m.metadata.uid)
         .collect();
 
-    let children = match store.list(child_gvr, None, None, None, None, None) {
+    let children = match store.list_as::<MetadataOnly>(child_gvr, None) {
         Ok(r) => r,
         Err(e) => {
             tracing::warn!("gc orphan scan: failed to list children: {e}");
@@ -115,11 +105,7 @@ fn gc_orphans(store: &Store, owner_gvr: &GroupVersionResource, child_gvr: &Group
         }
     };
 
-    for child in &children.items {
-        let meta: MetadataOnly = match serde_json::from_value(child.clone()) {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
+    for meta in &children {
         for oref in meta
             .metadata
             .owner_references
@@ -147,18 +133,14 @@ fn gc_orphans(store: &Store, owner_gvr: &GroupVersionResource, child_gvr: &Group
 }
 
 fn delete_owned(store: &Store, child_gvr: &GroupVersionResource, owner_uid: &str) {
-    let result = match store.list(child_gvr, None, None, None, None, None) {
+    let children = match store.list_as::<MetadataOnly>(child_gvr, None) {
         Ok(r) => r,
         Err(e) => {
             tracing::warn!("gc list error: {e}");
             return;
         }
     };
-    for item in &result.items {
-        let meta: MetadataOnly = match serde_json::from_value(item.clone()) {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
+    for meta in &children {
         if is_owned_by(&meta.metadata, owner_uid) {
             let name = meta.metadata.name.as_deref().unwrap_or("");
             let namespace = meta.metadata.namespace.as_deref();

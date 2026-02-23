@@ -12,7 +12,7 @@ pub async fn run(
     registry: ResourceRegistry,
 ) -> anyhow::Result<()> {
     tracing::info!("crd controller started");
-    let crd_gvr = GroupVersionResource::new("apiextensions.k8s.io", "v1", "customresourcedefinitions");
+    let crd_gvr = GroupVersionResource::crds();
 
     // Bootstrap: register any CRDs already in the store.
     reconcile_all(&store, &crd_gvr, &registry);
@@ -55,18 +55,15 @@ fn reconcile_all(
     crd_gvr: &GroupVersionResource,
     registry: &ResourceRegistry,
 ) {
-    let result = match store.list(crd_gvr, None, None, None, None, None) {
+    let crds = match store.list_as::<CustomResourceDefinition>(crd_gvr, None) {
         Ok(r) => r,
         Err(e) => {
             tracing::warn!("crd controller list error: {e}");
             return;
         }
     };
-    for item in &result.items {
-        let crd: Result<CustomResourceDefinition, _> = serde_json::from_value(item.clone());
-        if let Ok(crd) = crd {
-            register_crd(registry, &crd);
-        }
+    for crd in &crds {
+        register_crd(registry, crd);
     }
 }
 

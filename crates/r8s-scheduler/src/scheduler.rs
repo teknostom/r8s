@@ -10,21 +10,13 @@ use tokio_util::sync::CancellationToken;
 
 const NODE_NAME: &str = "r8s-node";
 
-fn pods_gvr() -> GroupVersionResource {
-    GroupVersionResource::new("", "v1", "pods")
-}
-
-fn nodes_gvr() -> GroupVersionResource {
-    GroupVersionResource::new("", "v1", "nodes")
-}
-
 pub async fn run(store: Store, shutdown: CancellationToken) -> anyhow::Result<()> {
     tracing::info!("scheduler started");
 
     register_node(&store)?;
     schedule_all(&store);
 
-    let mut rx = store.watch(&pods_gvr());
+    let mut rx = store.watch(&GroupVersionResource::pods());
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => {
@@ -49,7 +41,7 @@ pub async fn run(store: Store, shutdown: CancellationToken) -> anyhow::Result<()
 }
 
 fn register_node(store: &Store) -> anyhow::Result<()> {
-    let gvr = nodes_gvr();
+    let gvr = GroupVersionResource::nodes();
     let resource_ref = ResourceRef {
         gvr: &gvr,
         namespace: None,
@@ -110,7 +102,7 @@ fn register_node(store: &Store) -> anyhow::Result<()> {
 }
 
 fn schedule_all(store: &Store) {
-    let result = match store.list(&pods_gvr(), None, None, None, None, None) {
+    let result = match store.list(&GroupVersionResource::pods(), None, None, None, None, None) {
         Ok(r) => r,
         Err(e) => {
             tracing::warn!("scheduler list error: {e}");
@@ -144,7 +136,7 @@ fn schedule_pod(store: &Store, pod_value: &serde_json::Value) {
     };
     let pod_ns = pod.metadata.namespace.as_deref();
 
-    let gvr = pods_gvr();
+    let gvr = GroupVersionResource::pods();
     let resource_ref = ResourceRef {
         gvr: &gvr,
         namespace: pod_ns,

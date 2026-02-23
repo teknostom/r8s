@@ -5,8 +5,8 @@ use tokio_util::sync::CancellationToken;
 
 pub async fn run(store: Store, shutdown: CancellationToken) -> anyhow::Result<()> {
     tracing::info!("namespace controller started");
-    let ns_gvr = GroupVersionResource::new("", "v1", "namespaces");
-    let sa_gvr = GroupVersionResource::new("", "v1", "serviceaccounts");
+    let ns_gvr = GroupVersionResource::namespaces();
+    let sa_gvr = GroupVersionResource::service_accounts();
 
     reconcile_all(&store, &ns_gvr, &sa_gvr);
 
@@ -40,19 +40,16 @@ pub async fn run(store: Store, shutdown: CancellationToken) -> anyhow::Result<()
 }
 
 fn reconcile_all(store: &Store, ns_gvr: &GroupVersionResource, sa_gvr: &GroupVersionResource) {
-    let result = match store.list(ns_gvr, None, None, None, None, None) {
+    let namespaces = match store.list_as::<r8s_types::Namespace>(ns_gvr, None) {
         Ok(r) => r,
         Err(e) => {
             tracing::warn!("namespace controller list error: {e}");
             return;
         }
     };
-    for item in &result.items {
-        let ns: Result<r8s_types::Namespace, _> = serde_json::from_value(item.clone());
-        if let Ok(ns) = ns {
-            if let Some(name) = ns.metadata.name.as_deref() {
-                ensure_default_sa(store, sa_gvr, name);
-            }
+    for ns in &namespaces {
+        if let Some(name) = ns.metadata.name.as_deref() {
+            ensure_default_sa(store, sa_gvr, name);
         }
     }
 }

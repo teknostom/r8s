@@ -20,14 +20,6 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
-fn ingresses_gvr() -> GroupVersionResource {
-    GroupVersionResource::new("networking.k8s.io", "v1", "ingresses")
-}
-
-fn endpoints_gvr() -> GroupVersionResource {
-    GroupVersionResource::new("", "v1", "endpoints")
-}
-
 struct Backend {
     addr: SocketAddr,
 }
@@ -67,8 +59,8 @@ impl Route {
 type RouteTable = Vec<Route>;
 
 fn rebuild_routes(store: &Store) -> Vec<Route> {
-    let ingress_items = match store.list(&ingresses_gvr(), None, None, None, None, None) {
-        Ok(r) => r.items,
+    let ingresses = match store.list_as::<Ingress>(&GroupVersionResource::ingresses(), None) {
+        Ok(r) => r,
         Err(e) => {
             tracing::warn!("ingress: failed to list ingresses: {e}");
             return Vec::new();
@@ -77,11 +69,7 @@ fn rebuild_routes(store: &Store) -> Vec<Route> {
 
     let mut routes = Vec::new();
 
-    for ing_value in &ingress_items {
-        let ing: Ingress = match serde_json::from_value(ing_value.clone()) {
-            Ok(i) => i,
-            Err(_) => continue,
-        };
+    for ing in &ingresses {
 
         let spec = match ing.spec.as_ref() {
             Some(s) => s,
@@ -128,19 +116,15 @@ fn rebuild_routes(store: &Store) -> Vec<Route> {
                 };
 
                 // Resolve backends from Endpoints
-                let ep_gvr = endpoints_gvr();
+                let ep_gvr = GroupVersionResource::endpoints();
                 let ep_ref = r8s_store::backend::ResourceRef {
                     gvr: &ep_gvr,
                     namespace: Some(ing_ns),
                     name: &svc_backend.name,
                 };
 
-                let backends = match store.get(&ep_ref) {
-                    Ok(Some(ep_value)) => {
-                        let ep: Endpoints = match serde_json::from_value(ep_value) {
-                            Ok(e) => e,
-                            Err(_) => continue,
-                        };
+                let backends = match store.get_as::<Endpoints>(&ep_ref) {
+                    Ok(Some(ep)) => {
                         let mut addrs = Vec::new();
                         for subset in ep.subsets.as_deref().unwrap_or_default() {
                             let target_port = subset
@@ -258,8 +242,8 @@ pub async fn run_ingress_proxy(store: Store, shutdown: CancellationToken) -> any
     let watcher_store = store.clone();
     let watcher_shutdown = shutdown.clone();
     tokio::spawn(async move {
-        let mut ing_rx = watcher_store.watch(&ingresses_gvr());
-        let mut ep_rx = watcher_store.watch(&endpoints_gvr());
+        let mut ing_rx = watcher_store.watch(&GroupVersionResource::ingresses());
+        let mut ep_rx = watcher_store.watch(&GroupVersionResource::endpoints());
 
         loop {
             tokio::select! {

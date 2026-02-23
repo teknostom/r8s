@@ -9,21 +9,7 @@ use rustc_hash::FxHasher;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
-fn deploy_gvr() -> GroupVersionResource {
-    GroupVersionResource::new("apps", "v1", "deployments")
-}
-
-fn rs_gvr() -> GroupVersionResource {
-    GroupVersionResource::new("apps", "v1", "replicasets")
-}
-
-fn is_owned_by(meta: &ObjectMeta, owner_uid: &str) -> bool {
-    meta.owner_references
-        .as_deref()
-        .unwrap_or_default()
-        .iter()
-        .any(|r| r.uid == owner_uid)
-}
+use crate::is_owned_by;
 
 fn template_hash(template: &serde_json::Value) -> String {
     let canonical = serde_json::to_string(template).unwrap_or_default();
@@ -34,12 +20,12 @@ fn template_hash(template: &serde_json::Value) -> String {
 
 pub async fn run(store: Store, shutdown: CancellationToken) -> anyhow::Result<()> {
     tracing::info!("deployment controller started");
-    let gvr = deploy_gvr();
+    let gvr = GroupVersionResource::deployments();
 
     reconcile_all(&store);
 
     let mut deploy_rx = store.watch(&gvr);
-    let mut rs_rx = store.watch(&rs_gvr());
+    let mut rs_rx = store.watch(&GroupVersionResource::replica_sets());
 
     loop {
         tokio::select! {
@@ -67,7 +53,7 @@ pub async fn run(store: Store, shutdown: CancellationToken) -> anyhow::Result<()
                             Err(_) => continue,
                         };
                         if let Some(owner) = rs.metadata.owner_references.as_deref().unwrap_or_default().iter().find(|r| r.kind == "Deployment") {
-                            let d_gvr = deploy_gvr();
+                            let d_gvr = GroupVersionResource::deployments();
                             let rref = ResourceRef {
                                 gvr: &d_gvr,
                                 namespace: rs.metadata.namespace.as_deref(),
@@ -88,7 +74,7 @@ pub async fn run(store: Store, shutdown: CancellationToken) -> anyhow::Result<()
 }
 
 fn reconcile_all(store: &Store) {
-    let gvr = deploy_gvr();
+    let gvr = GroupVersionResource::deployments();
     let result = match store.list(&gvr, None, None, None, None, None) {
         Ok(r) => r,
         Err(e) => {
@@ -113,7 +99,7 @@ fn reconcile_deployment(store: &Store, deploy_value: &serde_json::Value) -> anyh
     let deploy_ns = deploy.metadata.namespace.as_deref();
     let deploy_uid = deploy.metadata.uid.as_deref().unwrap_or("");
 
-    let gvr = deploy_gvr();
+    let gvr = GroupVersionResource::deployments();
     let resource_ref = ResourceRef {
         gvr: &gvr,
         namespace: deploy_ns,
@@ -136,12 +122,10 @@ fn reconcile_deployment(store: &Store, deploy_value: &serde_json::Value) -> anyh
     let rs_name = format!("{deploy_name}-{hash}");
 
     // List RSes owned by this deployment
-    let rs_gvr = rs_gvr();
-    let all_rs = store.list(&rs_gvr, deploy_ns, None, None, None, None)?;
-    let owned_rs: Vec<ReplicaSet> = all_rs
-        .items
-        .iter()
-        .filter_map(|v| serde_json::from_value::<ReplicaSet>(v.clone()).ok())
+    let rs_gvr = GroupVersionResource::replica_sets();
+    let owned_rs: Vec<ReplicaSet> = store
+        .list_as::<ReplicaSet>(&rs_gvr, deploy_ns)?
+        .into_iter()
         .filter(|rs| is_owned_by(&rs.metadata, current_uid))
         .collect();
 
@@ -249,7 +233,7 @@ fn update_deploy_status(store: &Store, deploy_value: &serde_json::Value) -> anyh
     let deploy_ns = deploy.metadata.namespace.as_deref();
     let deploy_uid = deploy.metadata.uid.as_deref().unwrap_or("");
 
-    let gvr = deploy_gvr();
+    let gvr = GroupVersionResource::deployments();
     let resource_ref = ResourceRef {
         gvr: &gvr,
         namespace: deploy_ns,
@@ -261,20 +245,18 @@ fn update_deploy_status(store: &Store, deploy_value: &serde_json::Value) -> anyh
         None => return Ok(()),
     };
 
-    let rs_gvr = rs_gvr();
-    let all_rs = store.list(&rs_gvr, deploy_ns, None, None, None, None)?;
+    let rs_gvr = GroupVersionResource::replica_sets();
+    let owned_rs: Vec<ReplicaSet> = store
+        .list_as::<ReplicaSet>(&rs_gvr, deploy_ns)?
+        .into_iter()
+        .filter(|rs| is_owned_by(&rs.metadata, deploy_uid))
+        .collect();
     let mut total_replicas: i32 = 0;
     let mut ready_replicas: i32 = 0;
-    for rs_value in &all_rs.items {
-        let rs: ReplicaSet = match serde_json::from_value(rs_value.clone()) {
-            Ok(r) => r,
-            Err(_) => continue,
-        };
-        if is_owned_by(&rs.metadata, deploy_uid) {
-            let status = rs.status.unwrap_or_default();
-            total_replicas += status.replicas;
-            ready_replicas += status.ready_replicas.unwrap_or(0);
-        }
+    for rs in &owned_rs {
+        let status = rs.status.clone().unwrap_or_default();
+        total_replicas += status.replicas;
+        ready_replicas += status.ready_replicas.unwrap_or(0);
     }
 
     let status = DeploymentStatus {

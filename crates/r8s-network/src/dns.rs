@@ -5,10 +5,6 @@ use r8s_types::{GroupVersionResource, Service};
 use tokio::net::UdpSocket;
 use tokio_util::sync::CancellationToken;
 
-fn services_gvr() -> GroupVersionResource {
-    GroupVersionResource::new("", "v1", "services")
-}
-
 /// Run a minimal DNS server on the bridge IP (10.244.0.1:53).
 ///
 /// Resolves `<service>.<namespace>.svc.cluster.local` by looking up Service
@@ -110,15 +106,14 @@ fn resolve_service(store: &Store, query: &[u8], name: &str) -> Option<Vec<u8>> {
     let svc_name = parts[0];
     let namespace = parts[1];
 
-    let gvr = services_gvr();
+    let gvr = GroupVersionResource::services();
     let resource_ref = r8s_store::backend::ResourceRef {
         gvr: &gvr,
         namespace: Some(namespace),
         name: svc_name,
     };
 
-    let svc_value = store.get(&resource_ref).ok()??;
-    let svc: Service = serde_json::from_value(svc_value).ok()?;
+    let svc: Service = store.get_as::<Service>(&resource_ref).ok()??;
     let cluster_ip = svc
         .spec
         .as_ref()

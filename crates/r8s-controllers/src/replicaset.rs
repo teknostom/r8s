@@ -5,14 +5,6 @@ use r8s_types::{
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
-fn rs_gvr() -> GroupVersionResource {
-    GroupVersionResource::new("apps", "v1", "replicasets")
-}
-
-fn pods_gvr() -> GroupVersionResource {
-    GroupVersionResource::new("", "v1", "pods")
-}
-
 fn random_suffix() -> String {
     use rand::Rng;
     const CHARSET: &[u8] = b"abcdefghijklmnopqrstuvxyz0123456789";
@@ -22,22 +14,16 @@ fn random_suffix() -> String {
         .collect()
 }
 
-fn is_owned_by(meta: &ObjectMeta, owner_uid: &str) -> bool {
-    meta.owner_references
-        .as_deref()
-        .unwrap_or_default()
-        .iter()
-        .any(|r| r.uid == owner_uid)
-}
+use crate::is_owned_by;
 
 pub async fn run(store: Store, shutdown: CancellationToken) -> anyhow::Result<()> {
     tracing::info!("replicaset controller started");
-    let gvr = rs_gvr();
+    let gvr = GroupVersionResource::replica_sets();
 
     reconcile_all(&store);
 
     let mut rs_rx = store.watch(&gvr);
-    let mut pod_rx = store.watch(&pods_gvr());
+    let mut pod_rx = store.watch(&GroupVersionResource::pods());
 
     loop {
         tokio::select! {
@@ -66,7 +52,7 @@ pub async fn run(store: Store, shutdown: CancellationToken) -> anyhow::Result<()
                     };
                     if let Some(owner) = pod.metadata.owner_references.as_deref().unwrap_or_default().iter().find(|r| r.kind == "ReplicaSet") {
                         let resource_ref = ResourceRef {
-                            gvr: &rs_gvr(),
+                            gvr: &GroupVersionResource::replica_sets(),
                             namespace: pod.metadata.namespace.as_deref(),
                             name: &owner.name,
                         };
@@ -85,7 +71,7 @@ pub async fn run(store: Store, shutdown: CancellationToken) -> anyhow::Result<()
 }
 
 fn reconcile_all(store: &Store) {
-    let gvr = rs_gvr();
+    let gvr = GroupVersionResource::replica_sets();
     let result = match store.list(&gvr, None, None, None, None, None) {
         Ok(r) => r,
         Err(e) => {
@@ -110,17 +96,16 @@ fn reconcile_rs(store: &Store, rs_value: &serde_json::Value) -> anyhow::Result<(
     let rs_ns = rs.metadata.namespace.as_deref();
     let rs_uid = rs.metadata.uid.as_deref().unwrap_or("");
 
-    let gvr = rs_gvr();
+    let gvr = GroupVersionResource::replica_sets();
     let resource_ref = ResourceRef {
         gvr: &gvr,
         namespace: rs_ns,
         name: rs_name,
     };
-    let current_value = match store.get(&resource_ref)? {
+    let current: r8s_types::ReplicaSet = match store.get_as(&resource_ref)? {
         Some(rs) => rs,
         None => return Ok(()),
     };
-    let current: r8s_types::ReplicaSet = serde_json::from_value(current_value)?;
     let current_uid = current.metadata.uid.as_deref().unwrap_or(rs_uid);
     let current_spec = current
         .spec
@@ -133,12 +118,10 @@ fn reconcile_rs(store: &Store, rs_value: &serde_json::Value) -> anyhow::Result<(
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("RS has no template"))?;
 
-    let pod_gvr = pods_gvr();
-    let pods = store.list(&pod_gvr, rs_ns, None, None, None, None)?;
-    let owned: Vec<Pod> = pods
-        .items
-        .iter()
-        .filter_map(|v| serde_json::from_value::<Pod>(v.clone()).ok())
+    let pod_gvr = GroupVersionResource::pods();
+    let owned: Vec<Pod> = store
+        .list_as::<Pod>(&pod_gvr, rs_ns)?
+        .into_iter()
         .filter(|p| is_owned_by(&p.metadata, current_uid))
         .collect();
     let current_count = owned.len() as u64;
@@ -164,11 +147,9 @@ fn reconcile_rs(store: &Store, rs_value: &serde_json::Value) -> anyhow::Result<(
         tracing::info!("rs '{rs_name}': deleted {to_delete} pods ({current_count} -> {desired})");
     }
 
-    let final_pods = store.list(&pod_gvr, rs_ns, None, None, None, None)?;
-    let final_count = final_pods
-        .items
-        .iter()
-        .filter_map(|v| serde_json::from_value::<Pod>(v.clone()).ok())
+    let final_count = store
+        .list_as::<Pod>(&pod_gvr, rs_ns)?
+        .into_iter()
         .filter(|p| is_owned_by(&p.metadata, current_uid))
         .count() as i32;
     update_rs_status(store, rs_name, rs_ns, final_count)?;
@@ -207,7 +188,7 @@ fn create_pod_from_template(
         status: None,
     };
 
-    let gvr = pods_gvr();
+    let gvr = GroupVersionResource::pods();
     let resource_ref = ResourceRef {
         gvr: &gvr,
         namespace,
@@ -223,7 +204,7 @@ fn update_rs_status(
     rs_ns: Option<&str>,
     replica_count: i32,
 ) -> anyhow::Result<()> {
-    let gvr = rs_gvr();
+    let gvr = GroupVersionResource::replica_sets();
     let resource_ref = ResourceRef {
         gvr: &gvr,
         namespace: rs_ns,

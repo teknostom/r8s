@@ -15,10 +15,6 @@ use tokio_util::sync::CancellationToken;
 
 const NODE_NAME: &str = "r8s-node";
 
-fn pods_gvr() -> GroupVersionResource {
-    GroupVersionResource::new("", "v1", "pods")
-}
-
 struct PodContainers {
     container_ids: Vec<ContainerId>,
     pod_ip_num: u32,
@@ -71,7 +67,7 @@ pub async fn run<R: ContainerRuntime>(
 
     reconcile_all(&store, rt, &mut pod_containers, &mut ip_pool, &data_dir).await;
 
-    let mut rx = store.watch(&pods_gvr());
+    let mut rx = store.watch(&GroupVersionResource::pods());
     let mut health_interval = tokio::time::interval(Duration::from_secs(10));
     health_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -120,7 +116,7 @@ async fn reconcile_all<R: ContainerRuntime>(
     ip_pool: &mut IpPool,
     data_dir: &PathBuf,
 ) {
-    let result = match store.list(&pods_gvr(), None, None, None, None, None) {
+    let result = match store.list(&GroupVersionResource::pods(), None, None, None, None, None) {
         Ok(r) => r,
         Err(e) => {
             tracing::warn!("kubelet list error: {e}");
@@ -322,7 +318,7 @@ fn update_pod_status(
     pod_ns: Option<&str>,
     pod_ip_num: u32,
 ) {
-    let gvr = pods_gvr();
+    let gvr = GroupVersionResource::pods();
     let resource_ref = ResourceRef {
         gvr: &gvr,
         namespace: pod_ns,
@@ -520,7 +516,7 @@ async fn check_health<R: ContainerRuntime>(
         cleanup_pod_volumes(data_dir, &pod_uid);
 
         // Update pod status to Failed, then delete so RS controller creates a replacement
-        let gvr = pods_gvr();
+        let gvr = GroupVersionResource::pods();
         let resource_ref = ResourceRef {
             gvr: &gvr,
             namespace: pc.pod_ns.as_deref(),
@@ -538,14 +534,6 @@ async fn check_health<R: ContainerRuntime>(
             pc.pod_ip_num
         );
     }
-}
-
-fn configmaps_gvr() -> GroupVersionResource {
-    GroupVersionResource::new("", "v1", "configmaps")
-}
-
-fn secrets_gvr() -> GroupVersionResource {
-    GroupVersionResource::new("", "v1", "secrets")
 }
 
 /// Extract the registry host from an image reference (e.g. "registry.io/repo/img:tag" -> "registry.io").
@@ -571,7 +559,7 @@ fn resolve_image_auth(
 ) -> Option<RegistryAuth> {
     let pull_secrets = pod_value["spec"]["imagePullSecrets"].as_array()?;
     let host = registry_host(image);
-    let gvr = secrets_gvr();
+    let gvr = GroupVersionResource::secrets();
 
     for entry in pull_secrets {
         let secret_name = entry["name"].as_str()?;
@@ -659,7 +647,7 @@ fn project_configmap(
     name: &str,
     dir: &std::path::Path,
 ) -> anyhow::Result<()> {
-    let gvr = configmaps_gvr();
+    let gvr = GroupVersionResource::configmaps();
     let resource_ref = ResourceRef {
         gvr: &gvr,
         namespace,
@@ -685,7 +673,7 @@ fn project_secret(
     name: &str,
     dir: &std::path::Path,
 ) -> anyhow::Result<()> {
-    let gvr = secrets_gvr();
+    let gvr = GroupVersionResource::secrets();
     let resource_ref = ResourceRef {
         gvr: &gvr,
         namespace,

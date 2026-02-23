@@ -10,29 +10,13 @@ use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
-fn svc_gvr() -> GroupVersionResource {
-    GroupVersionResource::new("", "v1", "services")
-}
-
-fn ep_gvr() -> GroupVersionResource {
-    GroupVersionResource::new("", "v1", "endpoints")
-}
-
-fn es_gvr() -> GroupVersionResource {
-    GroupVersionResource::new("discovery.k8s.io", "v1", "endpointslices")
-}
-
-fn pods_gvr() -> GroupVersionResource {
-    GroupVersionResource::new("", "v1", "pods")
-}
-
 pub async fn run(store: Store, shutdown: CancellationToken) -> anyhow::Result<()> {
     tracing::info!("endpoints controller started");
 
     reconcile_all(&store);
 
-    let mut svc_rx = store.watch(&svc_gvr());
-    let mut pod_rx = store.watch(&pods_gvr());
+    let mut svc_rx = store.watch(&GroupVersionResource::services());
+    let mut pod_rx = store.watch(&GroupVersionResource::pods());
 
     loop {
         tokio::select! {
@@ -68,7 +52,7 @@ pub async fn run(store: Store, shutdown: CancellationToken) -> anyhow::Result<()
 }
 
 fn reconcile_all(store: &Store) {
-    let result = match store.list(&svc_gvr(), None, None, None, None, None) {
+    let result = match store.list(&GroupVersionResource::services(), None, None, None, None, None) {
         Ok(r) => r,
         Err(e) => {
             tracing::warn!("endpoints controller list error: {e}");
@@ -84,7 +68,7 @@ fn reconcile_all(store: &Store) {
 fn reconcile_services_for_pod(store: &Store, pod: &Pod) {
     let pod_ns = pod.metadata.namespace.as_deref();
     let pod_labels = pod.metadata.labels.as_ref();
-    let svcs = match store.list(&svc_gvr(), pod_ns, None, None, None, None) {
+    let svcs = match store.list(&GroupVersionResource::services(), pod_ns, None, None, None, None) {
         Ok(r) => r,
         Err(e) => {
             tracing::warn!("endpoints controller list error: {e}");
@@ -131,11 +115,10 @@ fn reconcile_service(store: &Store, service_value: &serde_json::Value) -> anyhow
     };
 
     // Find matching pods
-    let pods = store.list(&pods_gvr(), svc_ns, None, None, None, None)?;
-    let matching: Vec<Pod> = pods
-        .items
-        .iter()
-        .filter_map(|v| serde_json::from_value::<Pod>(v.clone()).ok())
+    let pod_gvr = GroupVersionResource::pods();
+    let matching: Vec<Pod> = store
+        .list_as::<Pod>(&pod_gvr, svc_ns)?
+        .into_iter()
         .filter(|pod| {
             match pod.metadata.labels.as_ref() {
                 Some(labels) => selector.iter().all(|(k, v)| labels.get(k) == Some(v)),
@@ -220,7 +203,7 @@ fn reconcile_service(store: &Store, service_value: &serde_json::Value) -> anyhow
     };
 
     let ep_value = serde_json::to_value(&ep)?;
-    let gvr = ep_gvr();
+    let gvr = GroupVersionResource::endpoints();
     let rref = ResourceRef {
         gvr: &gvr,
         namespace: svc_ns,
@@ -237,7 +220,7 @@ fn reconcile_service(store: &Store, service_value: &serde_json::Value) -> anyhow
     }
 
     // Also create/update EndpointSlice (used by Traefik v3 and newer controllers)
-    let es_gvr = es_gvr();
+    let es_gvr = GroupVersionResource::endpoint_slices();
     let es_ref = ResourceRef {
         gvr: &es_gvr,
         namespace: svc_ns,
