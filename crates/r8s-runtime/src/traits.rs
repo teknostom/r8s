@@ -28,6 +28,7 @@ pub struct Mount {
 #[derive(Debug, Clone)]
 pub struct ContainerConfig {
     pub name: String,
+    pub namespace: String,
     pub image: String,
     pub command: Vec<String>,
     pub args: Vec<String>,

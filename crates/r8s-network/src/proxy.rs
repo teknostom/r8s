@@ -44,6 +44,27 @@ pub fn setup_nat_table() -> anyhow::Result<()> {
         "ip",
         "saddr",
         "10.244.0.0/24",
+        "oifname",
+        "!=",
+        "r8s0",
+        "masquerade",
+    ])?;
+    // Hairpin masquerade: when pod→ClusterIP is DNAT'd to another pod on the
+    // same bridge, masquerade so the return path goes through the host's conntrack.
+    nft(&[
+        "add",
+        "rule",
+        "ip",
+        "r8s",
+        "postrouting",
+        "ip",
+        "saddr",
+        "10.244.0.0/24",
+        "ip",
+        "daddr",
+        "10.244.0.0/24",
+        "oifname",
+        "r8s0",
         "masquerade",
     ])?;
 
@@ -159,11 +180,18 @@ pub fn sync_service_rules(store: &Store) -> anyhow::Result<()> {
                 "dnat", "to", &dnat_target,
             ]);
 
-            // LoadBalancer: DNAT external traffic (non-bridge) on the service port to the pod
+            // LoadBalancer: DNAT external traffic on the service port to the pod
             if spec.type_.as_deref() == Some("LoadBalancer") {
+                // Prerouting: traffic from outside
                 let _ = nft(&[
                     "add", "rule", "ip", "r8s", "prerouting",
                     "iifname", "!=", "r8s0",
+                    &proto, "dport", &svc_port_str,
+                    "dnat", "to", &dnat_target,
+                ]);
+                // Output: traffic from localhost
+                let _ = nft(&[
+                    "add", "rule", "ip", "r8s", "output",
                     &proto, "dport", &svc_port_str,
                     "dnat", "to", &dnat_target,
                 ]);

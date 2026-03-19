@@ -141,6 +141,20 @@ pub(crate) fn create_impl(
     if let Some(ns) = namespace {
         body["metadata"]["namespace"] = serde_json::json!(ns);
     }
+
+    // Allocate ClusterIP for services that need one
+    if ctx.resource_type.gvr.resource == "services" {
+        let svc_type = body["spec"]["type"].as_str().unwrap_or("ClusterIP");
+        let has_cluster_ip = body["spec"]["clusterIP"]
+            .as_str()
+            .is_some_and(|ip| !ip.is_empty() && ip != "None");
+        if (svc_type == "ClusterIP" || svc_type == "LoadBalancer" || svc_type == "NodePort") && !has_cluster_ip {
+            let ip = state.allocate_cluster_ip();
+            body["spec"]["clusterIP"] = serde_json::json!(ip);
+            body["spec"]["clusterIPs"] = serde_json::json!([ip]);
+        }
+    }
+
     let resource_ref = ResourceRef {
         gvr: &ctx.resource_type.gvr,
         namespace,

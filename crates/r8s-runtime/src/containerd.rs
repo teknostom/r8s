@@ -8,7 +8,7 @@ use containerd_client::{
         images_client::ImagesClient,
         snapshots::{
             MountsRequest, PrepareSnapshotRequest, RemoveSnapshotRequest,
-            snapshots_client::SnapshotsClient,
+            StatSnapshotRequest, snapshots_client::SnapshotsClient,
         },
         tasks_client::TasksClient,
         transfer_client::TransferClient,
@@ -321,10 +321,23 @@ fn build_oci_spec(
         )
         .mounts({
             let mut mounts = get_default_mounts();
+
+            // Generate per-container resolv.conf with the pod's namespace in the search path
+            let resolv_dir = data_dir.join("resolv");
+            std::fs::create_dir_all(&resolv_dir)?;
+            let resolv_path = resolv_dir.join(format!("{}.conf", config.name));
+            std::fs::write(
+                &resolv_path,
+                format!(
+                    "nameserver 10.244.0.1\nsearch {ns}.svc.cluster.local svc.cluster.local cluster.local\noptions ndots:5\n",
+                    ns = config.namespace,
+                ),
+            )?;
+
             mounts.push(
                 MountBuilder::default()
                     .destination("/etc/resolv.conf")
-                    .source(data_dir.join("resolv.conf"))
+                    .source(resolv_path)
                     .typ("bind")
                     .options(vec!["rbind".into(), "ro".into()])
                     .build()?,
@@ -435,15 +448,36 @@ impl ContainerRuntime for ContainerdRuntime {
         // Clean up any stale state from a previous run (task → container → snapshot)
         self.cleanup_stale(&config.name).await;
 
-        // Prepare a writable snapshot for this container
+        // Wait for image snapshot to be ready (unpack may still be in progress)
         let snapshot_key = config.name.clone();
+        let mut snapshots = SnapshotsClient::new(self.channel.clone());
+        for i in 0..50 {
+            let req = StatSnapshotRequest {
+                snapshotter: SNAPSHOTTER.to_string(),
+                key: image_info.chain_id.clone(),
+            };
+            match snapshots.stat(with_namespace!(req, NAMESPACE)).await {
+                Ok(_) => break,
+                Err(_) if i < 49 => {
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                }
+                Err(e) => {
+                    anyhow::bail!(
+                        "image snapshot '{}' not ready after 10s: {e}",
+                        image_info.chain_id
+                    );
+                }
+            }
+        }
+
+        // Prepare a writable snapshot for this container
         let req = PrepareSnapshotRequest {
             snapshotter: SNAPSHOTTER.to_string(),
             key: snapshot_key.clone(),
             parent: image_info.chain_id.clone(),
             labels: Default::default(),
         };
-        SnapshotsClient::new(self.channel.clone())
+        snapshots
             .prepare(with_namespace!(req, NAMESPACE))
             .await?;
 

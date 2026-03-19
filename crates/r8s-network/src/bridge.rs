@@ -27,8 +27,21 @@ pub fn setup_bridge(data_dir: &std::path::Path) -> anyhow::Result<()> {
     run_ignore_exists("ip", &["addr", "add", BRIDGE_CIDR, "dev", BRIDGE_NAME])?;
     run("ip", &["link", "set", BRIDGE_NAME, "up"])?;
 
-    // Enable IP forwarding
+    // Enable IP forwarding and disable bridge-nf-call-iptables so bridge
+    // traffic between pods doesn't get filtered by iptables/nftables
     run("sysctl", &["-w", "net.ipv4.ip_forward=1"])?;
+    let _ = run("sysctl", &["-w", "net.bridge.bridge-nf-call-iptables=0"]);
+    let _ = run("sysctl", &["-w", "net.bridge.bridge-nf-call-ip6tables=0"]);
+
+    // Dummy interface to sink ClusterIP traffic so the kernel accepts it
+    // and runs it through prerouting DNAT before routing
+    let _ = run("ip", &["link", "add", "r8s-svc", "type", "dummy"]);
+    let _ = run("ip", &["link", "set", "r8s-svc", "up"]);
+    let _ = run("ip", &["addr", "add", "10.96.0.0/16", "dev", "r8s-svc"]);
+
+    // Allow forwarding for r8s bridge traffic (Docker sets FORWARD policy to DROP)
+    let _ = run("iptables", &["-I", "FORWARD", "1", "-i", BRIDGE_NAME, "-j", "ACCEPT"]);
+    let _ = run("iptables", &["-I", "FORWARD", "1", "-o", BRIDGE_NAME, "-j", "ACCEPT"]);
 
     tracing::info!("bridge {BRIDGE_NAME} ready");
     Ok(())
@@ -37,18 +50,20 @@ pub fn setup_bridge(data_dir: &std::path::Path) -> anyhow::Result<()> {
 /// Create a veth pair, attach to bridge, configure IP in the container's netns.
 pub fn setup_pod_network(pid: u32, pod_ip: &str, pod_name: &str) -> anyhow::Result<()> {
     let veth_host = veth_name(pod_name);
+    let veth_peer = format!("{veth_host}p");
     let pid_str = pid.to_string();
 
-    // Create veth pair
+    // Create veth pair with unique names on both ends
     run(
         "ip",
         &[
-            "link", "add", &veth_host, "type", "veth", "peer", "name", "eth0",
+            "link", "add", &veth_host, "type", "veth", "peer", "name", &veth_peer,
         ],
     )?;
 
-    // Move eth0 into container netns
-    run("ip", &["link", "set", "eth0", "netns", &pid_str])?;
+    // Move peer into container netns and rename to eth0
+    run("ip", &["link", "set", &veth_peer, "netns", &pid_str])?;
+    nsenter(pid, &["ip", "link", "set", &veth_peer, "name", "eth0"])?;
 
     // Attach host side to bridge and bring up
     run("ip", &["link", "set", &veth_host, "master", BRIDGE_NAME])?;
@@ -75,18 +90,21 @@ pub fn teardown_pod_network(pod_name: &str) {
 
 /// Clean up bridge and nftables on shutdown.
 pub fn cleanup() {
+    let _ = run("iptables", &["-D", "FORWARD", "-i", BRIDGE_NAME, "-j", "ACCEPT"]);
+    let _ = run("iptables", &["-D", "FORWARD", "-o", BRIDGE_NAME, "-j", "ACCEPT"]);
     let _ = run("ip", &["link", "delete", BRIDGE_NAME]);
+    let _ = run("ip", &["link", "delete", "r8s-svc"]);
     tracing::info!("bridge {BRIDGE_NAME} removed");
 }
 
-/// Sanitized veth name — max 15 chars for Linux interface names.
+/// Unique veth name — max 15 chars for Linux interface names.
+/// Uses a hash of the pod name to avoid collisions.
 fn veth_name(pod_name: &str) -> String {
-    let sanitized: String = pod_name
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
-        .take(10)
-        .collect();
-    format!("veth{sanitized}")
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    pod_name.hash(&mut hasher);
+    let hash = hasher.finish();
+    format!("veth{hash:010x}", hash = hash & 0xff_ffff_ffff)
 }
 
 fn run(cmd: &str, args: &[&str]) -> anyhow::Result<()> {

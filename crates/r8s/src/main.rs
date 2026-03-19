@@ -1,3 +1,6 @@
+mod config;
+mod helm;
+
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -60,6 +63,29 @@ enum Cmd {
         /// Follow log output
         #[arg(short, long)]
         follow: bool,
+    },
+    /// Manage environment from r8s.toml
+    Env {
+        #[command(subcommand)]
+        action: EnvCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum EnvCmd {
+    /// Start environment: deploy deps and app from r8s.toml if not already running
+    Up {
+        /// Path to r8s.toml
+        #[arg(short, long, default_value = "r8s.toml")]
+        config: PathBuf,
+    },
+    /// Stop the cluster (state is preserved)
+    Down,
+    /// Uninstall all helm releases from r8s.toml
+    Nuke {
+        /// Path to r8s.toml
+        #[arg(short, long, default_value = "r8s.toml")]
+        config: PathBuf,
     },
 }
 
@@ -394,6 +420,188 @@ fn main() -> anyhow::Result<()> {
             println!("Revision table entries: {rev_entries}");
             println!("Resource count:         {resources}");
             println!("Store size:             {:.1} KB", size as f64 / 1024.0);
+        }
+
+        Cmd::Env { action } => {
+            match action {
+                EnvCmd::Up { config } => {
+                    check_root()?;
+                    let config_path = std::fs::canonicalize(&config)
+                        .map_err(|e| anyhow::anyhow!("cannot find {}: {e}", config.display()))?;
+                    let base_dir = config_path.parent().unwrap();
+                    let cfg = config::load(&config_path)?;
+
+                    let name = cfg
+                        .cluster
+                        .as_ref()
+                        .and_then(|c| c.name.clone())
+                        .unwrap_or_else(|| "default".to_string());
+                    validate_name(&name)?;
+                    let dir = cluster_dir(&name);
+
+                    // Create cluster if it doesn't exist
+                    if !dir.exists() {
+                        std::fs::create_dir_all(dir.join("logs"))?;
+                        std::fs::create_dir_all(dir.join("serviceaccount"))?;
+                        println!("Cluster '{name}' created.");
+                    }
+
+                    // Start daemon if not running
+                    let already_running = read_pid(&dir)
+                        .is_some_and(|pid| is_running(pid));
+
+                    if !already_running {
+                        write_kubeconfig(&dir, &name)?;
+
+                        let log_file = std::fs::File::create(dir.join("r8sd.log"))?;
+                        let stderr_file = log_file.try_clone()?;
+                        let mut child = Command::new(r8sd_binary())
+                            .arg("--data-dir")
+                            .arg(&dir)
+                            .stdout(log_file)
+                            .stderr(stderr_file)
+                            .spawn()?;
+
+                        std::fs::write(pid_file(&dir), child.id().to_string())?;
+
+                        let deadline =
+                            std::time::Instant::now() + std::time::Duration::from_secs(10);
+                        let api_addr: std::net::SocketAddr = "127.0.0.1:6443".parse().unwrap();
+                        let mut ready = false;
+
+                        while std::time::Instant::now() < deadline {
+                            if let Some(status) = child.try_wait()? {
+                                let _ = std::fs::remove_file(pid_file(&dir));
+                                let log = std::fs::read_to_string(dir.join("r8sd.log"))
+                                    .unwrap_or_default();
+                                let tail: Vec<&str> = log.lines().rev().take(10).collect();
+                                let tail: String =
+                                    tail.into_iter().rev().collect::<Vec<_>>().join("\n");
+                                anyhow::bail!("r8sd exited immediately ({status}):\n{tail}");
+                            }
+                            if std::net::TcpStream::connect_timeout(
+                                &api_addr,
+                                std::time::Duration::from_millis(100),
+                            )
+                            .is_ok()
+                            {
+                                ready = true;
+                                break;
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(100));
+                        }
+
+                        if ready {
+                            println!("Cluster '{name}' started (pid {}).", child.id());
+                        } else {
+                            println!(
+                                "Cluster '{name}' started (pid {}), waiting for API server...",
+                                child.id()
+                            );
+                        }
+                    } else {
+                        println!("Cluster '{name}' already running.");
+                    }
+
+                    let kubeconfig = dir.join("kubeconfig");
+
+                    // Deploy from r8s.toml
+                    helm::check_helm()?;
+                    let default_ns = cfg
+                        .cluster
+                        .as_ref()
+                        .and_then(|c| c.namespace.as_deref())
+                        .unwrap_or("default");
+
+                    for dep in &cfg.dependencies {
+                        println!("Applying dependency '{}'...", dep.name);
+                        helm::install_release(dep, &kubeconfig, base_dir, default_ns)?;
+                    }
+
+                    if let Some(app) = &cfg.app {
+                        println!("Applying app '{}'...", app.name);
+                        helm::install_release(app, &kubeconfig, base_dir, default_ns)?;
+                    }
+
+                    println!("Environment ready.");
+                    println!("export KUBECONFIG={}", kubeconfig.display());
+                }
+
+                EnvCmd::Down => {
+                    check_root()?;
+                    let name = resolve_name(None)?;
+                    let dir = cluster_dir(&name);
+
+                    let pid = match read_pid(&dir) {
+                        Some(pid) if is_running(pid) => pid,
+                        _ => {
+                            println!("Environment '{name}' is not running.");
+                            return Ok(());
+                        }
+                    };
+
+                    let ret = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+                    if ret != 0 {
+                        anyhow::bail!("failed to send SIGTERM to pid {pid}");
+                    }
+
+                    for _ in 0..100 {
+                        if !is_running(pid) {
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+
+                    if is_running(pid) {
+                        eprintln!("warning: r8sd (pid {pid}) did not exit, sending SIGKILL");
+                        let _ = unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+                    }
+
+                    let _ = std::fs::remove_file(pid_file(&dir));
+                    println!("Environment '{name}' stopped. State preserved.");
+                }
+
+                EnvCmd::Nuke { config } => {
+                    check_root()?;
+                    let config_path = std::fs::canonicalize(&config)
+                        .map_err(|e| anyhow::anyhow!("cannot find {}: {e}", config.display()))?;
+                    let cfg = config::load(&config_path)?;
+
+                    let name = cfg
+                        .cluster
+                        .as_ref()
+                        .and_then(|c| c.name.clone())
+                        .unwrap_or_else(|| "default".to_string());
+                    validate_name(&name)?;
+                    let dir = cluster_dir(&name);
+
+                    if !dir.exists() {
+                        println!("Environment '{name}' does not exist.");
+                        return Ok(());
+                    }
+
+                    // Stop if running
+                    if let Some(pid) = read_pid(&dir) {
+                        if is_running(pid) {
+                            unsafe {
+                                libc::kill(pid as i32, libc::SIGTERM);
+                            }
+                            for _ in 0..50 {
+                                if !is_running(pid) {
+                                    break;
+                                }
+                                std::thread::sleep(std::time::Duration::from_millis(100));
+                            }
+                            if is_running(pid) {
+                                let _ = unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+                            }
+                        }
+                    }
+
+                    std::fs::remove_dir_all(&dir)?;
+                    println!("Environment '{name}' nuked.");
+                }
+            }
         }
 
         Cmd::Logs { name, follow } => {

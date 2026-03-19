@@ -163,6 +163,7 @@ impl ApiServer {
                 store,
                 registry,
                 data_dir,
+                next_cluster_ip: std::sync::atomic::AtomicU32::new(2),
             }),
         }
     }

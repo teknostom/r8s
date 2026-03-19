@@ -239,6 +239,7 @@ async fn reconcile_pod<R: ContainerRuntime>(
         // Build config
         let config = ContainerConfig {
             name: format!("{pod_name}_{container_name}"),
+            namespace: pod_ns.unwrap_or("default").to_string(),
             image: image.to_string(),
             command: container_spec.command.clone().unwrap_or_default(),
             args: container_spec.args.clone().unwrap_or_default(),
