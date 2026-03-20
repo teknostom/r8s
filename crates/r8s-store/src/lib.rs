@@ -4,10 +4,8 @@ pub mod index;
 pub mod revision;
 pub mod watch;
 
-// Re-export the main store interface
 pub use backend::Store;
 
-/// Read-only stats query — no tokio runtime needed.
 pub fn stats(path: &std::path::Path) -> anyhow::Result<(u64, u64, u64)> {
     use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition};
     const RESOURCES: TableDefinition<&str, &[u8]> = TableDefinition::new("resources");

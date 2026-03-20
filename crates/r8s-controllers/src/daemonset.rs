@@ -7,15 +7,6 @@ use tokio_util::sync::CancellationToken;
 
 use crate::is_owned_by;
 
-fn random_suffix() -> String {
-    use rand::Rng;
-    const CHARSET: &[u8] = b"abcdefghijklmnopqrstuvxyz0123456789";
-    let mut rng = rand::rng();
-    (0..5)
-        .map(|_| CHARSET[rng.random_range(0..CHARSET.len())] as char)
-        .collect()
-}
-
 pub async fn run(store: Store, shutdown: CancellationToken) -> anyhow::Result<()> {
     tracing::info!("daemonset controller started");
     let gvr = GroupVersionResource::daemon_sets();
@@ -50,7 +41,7 @@ pub async fn run(store: Store, shutdown: CancellationToken) -> anyhow::Result<()
                             Ok(p) => p,
                             Err(_) => continue,
                         };
-                        if let Some(owner) = pod.metadata.owner_references.as_deref().unwrap_or_default().iter().find(|r| r.kind == "DaemonSet") {
+                        if let Some(owner) = crate::find_owner(&pod.metadata, "DaemonSet") {
                             let resource_ref = ResourceRef {
                                 gvr: &GroupVersionResource::daemon_sets(),
                                 namespace: pod.metadata.namespace.as_deref(),
@@ -120,14 +111,13 @@ fn reconcile_ds(store: &Store, ds_value: &serde_json::Value) -> anyhow::Result<(
         .filter(|p| is_owned_by(&p.metadata, current_uid))
         .collect();
 
-    // Single node = desired is always 1
+    // Single node — desired is always 1
     let current_count = owned.len();
 
     if current_count == 0 {
         create_pod(store, ds_name, current_uid, ds_ns, template)?;
         tracing::info!("ds '{ds_name}': created pod (0 -> 1)");
     } else if current_count > 1 {
-        // Delete extras, keep the first one
         for pod in owned.iter().skip(1) {
             if let Some(pod_name) = pod.metadata.name.as_deref() {
                 let pod_ref = ResourceRef {
@@ -141,7 +131,6 @@ fn reconcile_ds(store: &Store, ds_value: &serde_json::Value) -> anyhow::Result<(
         tracing::info!("ds '{ds_name}': deleted {} extra pods", current_count - 1);
     }
 
-    // Update status
     let final_owned: Vec<Pod> = store
         .list_as::<Pod>(&pod_gvr, ds_ns)?
         .into_iter()
@@ -168,11 +157,8 @@ fn create_pod(
     namespace: Option<&str>,
     template: &PodTemplateSpec,
 ) -> anyhow::Result<()> {
-    let pod_name = format!("{ds_name}-{}", random_suffix());
-    let labels = template
-        .metadata
-        .as_ref()
-        .and_then(|m| m.labels.clone());
+    let pod_name = format!("{ds_name}-{}", crate::random_suffix());
+    let labels = template.metadata.as_ref().and_then(|m| m.labels.clone());
     let pod = Pod {
         metadata: ObjectMeta {
             name: Some(pod_name.clone()),
@@ -240,7 +226,7 @@ fn update_ds_status(
     match store.update(&resource_ref, &updated) {
         Ok(_) => Ok(()),
         Err(e) => {
-            tracing::debug!("ds status update conflict for '{ds_name}', will retry: {e}");
+            tracing::debug!("ds status update conflict for '{ds_name}': {e}");
             Ok(())
         }
     }

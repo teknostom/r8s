@@ -1,26 +1,14 @@
-//! Minimal decoder for the Kubernetes protobuf wire format.
+//! Decoder for the Kubernetes protobuf wire format used by client-go.
 //!
-//! The Go client-go library sends requests with `Content-Type: application/vnd.kubernetes.protobuf`.
-//! The wire format is: 4-byte magic `k8s\0` followed by a protobuf-encoded `Unknown` envelope:
+//! Wire format: 4-byte magic `k8s\0`, then a protobuf `Unknown` envelope where
+//! field 1 = TypeMeta (apiVersion + kind) and field 2 = raw resource bytes.
+//! By K8s convention, field 1 of the raw resource is always ObjectMeta.
 //!
-//! ```proto
-//! message Unknown {
-//!     optional TypeMeta typeMeta = 1;   // apiVersion + kind
-//!     optional bytes raw = 2;           // protobuf-encoded resource
-//!     optional string contentEncoding = 3;
-//!     optional string contentType = 4;
-//! }
-//! ```
-//!
-//! The `raw` field contains the protobuf-encoded resource, where by Kubernetes convention:
-//! - Field 1 is always ObjectMeta for top-level resources
-//!
-//! We decode just enough to extract metadata (name, namespace, labels, annotations)
-//! and construct a JSON object that the store can persist.
+//! We only extract metadata (name, namespace, labels, annotations) — enough to
+//! construct a JSON object the store can persist.
 
 const K8S_MAGIC: &[u8] = b"k8s\0";
 
-/// Decode a protobuf varint. Returns (value, bytes_consumed).
 fn decode_varint(data: &[u8]) -> Option<(u64, usize)> {
     let mut result: u64 = 0;
     let mut shift = 0;
@@ -37,7 +25,6 @@ fn decode_varint(data: &[u8]) -> Option<(u64, usize)> {
     None
 }
 
-/// Skip a protobuf field value based on its wire type. Returns bytes consumed.
 fn skip_field(data: &[u8], wire_type: u8) -> Option<usize> {
     match wire_type {
         0 => decode_varint(data).map(|(_, n)| n),
@@ -51,8 +38,7 @@ fn skip_field(data: &[u8], wire_type: u8) -> Option<usize> {
     }
 }
 
-/// Extract all occurrences of a length-delimited field (wire type 2) by field number.
-fn extract_fields<'a>(data: &'a [u8], target: u32) -> Vec<&'a [u8]> {
+fn extract_fields(data: &[u8], target: u32) -> Vec<&[u8]> {
     let mut results = Vec::new();
     let mut pos = 0;
     while pos < data.len() {
@@ -88,20 +74,17 @@ fn extract_fields<'a>(data: &'a [u8], target: u32) -> Vec<&'a [u8]> {
     results
 }
 
-/// Extract the first occurrence of a length-delimited field.
-fn extract_field<'a>(data: &'a [u8], target: u32) -> Option<&'a [u8]> {
+fn extract_field(data: &[u8], target: u32) -> Option<&[u8]> {
     extract_fields(data, target).into_iter().next()
 }
 
-/// Extract a string field.
 fn extract_string(data: &[u8], field_number: u32) -> Option<String> {
     extract_field(data, field_number)
         .and_then(|b| std::str::from_utf8(b).ok())
         .map(String::from)
 }
 
-/// Extract a `map<string, string>` protobuf field.
-/// Protobuf encodes maps as repeated messages with key=1, value=2.
+// Protobuf encodes maps as repeated messages with key=1, value=2.
 fn extract_string_map(
     data: &[u8],
     field_number: u32,
@@ -115,11 +98,6 @@ fn extract_string_map(
     map
 }
 
-/// Try to decode a Kubernetes protobuf request body into a JSON value.
-///
-/// Extracts apiVersion, kind, and ObjectMeta (name, namespace, labels, annotations).
-/// The spec/status are not decoded since we don't have the per-type proto definitions,
-/// but this is sufficient for store-only resources (PDB, HPA, etc.).
 pub fn decode_k8s_protobuf(body: &[u8]) -> Option<serde_json::Value> {
     if !body.starts_with(K8S_MAGIC) {
         return None;
@@ -154,10 +132,7 @@ pub fn decode_k8s_protobuf(body: &[u8]) -> Option<serde_json::Value> {
     }
 
     let mut obj = serde_json::Map::new();
-    obj.insert(
-        "apiVersion".into(),
-        serde_json::Value::String(api_version),
-    );
+    obj.insert("apiVersion".into(), serde_json::Value::String(api_version));
     obj.insert("kind".into(), serde_json::Value::String(kind));
     obj.insert("metadata".into(), serde_json::Value::Object(metadata));
 

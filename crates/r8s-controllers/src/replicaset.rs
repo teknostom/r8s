@@ -5,15 +5,6 @@ use r8s_types::{
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
-fn random_suffix() -> String {
-    use rand::Rng;
-    const CHARSET: &[u8] = b"abcdefghijklmnopqrstuvxyz0123456789";
-    let mut rng = rand::rng();
-    (0..5)
-        .map(|_| CHARSET[rng.random_range(0..CHARSET.len())] as char)
-        .collect()
-}
-
 use crate::is_owned_by;
 
 pub async fn run(store: Store, shutdown: CancellationToken) -> anyhow::Result<()> {
@@ -27,45 +18,45 @@ pub async fn run(store: Store, shutdown: CancellationToken) -> anyhow::Result<()
 
     loop {
         tokio::select! {
-        _ = shutdown.cancelled() => {
-            tracing::info!("replicaset controller shutting down");
-            return Ok(());
-        }
-        event = rs_rx.recv() => {
-            match event {
-                Ok(event) if !matches!(event.event_type, WatchEventType::Deleted) => {
-                    if let Err(e) = reconcile_rs(&store, &event.object) {
-                        tracing::warn!("rs reconcile error: {e}");
-                    }
-                }
-                Err(broadcast::error::RecvError::Lagged(_)) => reconcile_all(&store),
-                Err(broadcast::error::RecvError::Closed) => return Ok(()),
-                _ => {}
+            _ = shutdown.cancelled() => {
+                tracing::info!("replicaset controller shutting down");
+                return Ok(());
             }
-        }
-        event = pod_rx.recv() => {
-            match event {
-                Ok(event) if matches!(event.event_type, WatchEventType::Deleted) => {
-                    let pod: Pod = match serde_json::from_value(event.object) {
-                        Ok(p) => p,
-                        Err(_) => continue,
-                    };
-                    if let Some(owner) = pod.metadata.owner_references.as_deref().unwrap_or_default().iter().find(|r| r.kind == "ReplicaSet") {
-                        let resource_ref = ResourceRef {
-                            gvr: &GroupVersionResource::replica_sets(),
-                            namespace: pod.metadata.namespace.as_deref(),
-                            name: &owner.name,
-                        };
-                        if let Ok(Some(rs)) = store.get(&resource_ref) {
-                            let _ = reconcile_rs(&store, &rs);
+            event = rs_rx.recv() => {
+                match event {
+                    Ok(event) if !matches!(event.event_type, WatchEventType::Deleted) => {
+                        if let Err(e) = reconcile_rs(&store, &event.object) {
+                            tracing::warn!("rs reconcile error: {e}");
                         }
                     }
+                    Err(broadcast::error::RecvError::Lagged(_)) => reconcile_all(&store),
+                    Err(broadcast::error::RecvError::Closed) => return Ok(()),
+                    _ => {}
                 }
-                Err(broadcast::error::RecvError::Lagged(_)) => reconcile_all(&store),
-                Err(broadcast::error::RecvError::Closed) => return Ok(()),
-                _ => {}
             }
-        }
+            event = pod_rx.recv() => {
+                match event {
+                    Ok(event) if matches!(event.event_type, WatchEventType::Deleted) => {
+                        let pod: Pod = match serde_json::from_value(event.object) {
+                            Ok(p) => p,
+                            Err(_) => continue,
+                        };
+                        if let Some(owner) = crate::find_owner(&pod.metadata, "ReplicaSet") {
+                            let resource_ref = ResourceRef {
+                                gvr: &GroupVersionResource::replica_sets(),
+                                namespace: pod.metadata.namespace.as_deref(),
+                                name: &owner.name,
+                            };
+                            if let Ok(Some(rs)) = store.get(&resource_ref) {
+                                let _ = reconcile_rs(&store, &rs);
+                            }
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => reconcile_all(&store),
+                    Err(broadcast::error::RecvError::Closed) => return Ok(()),
+                    _ => {}
+                }
+            }
         }
     }
 }
@@ -129,7 +120,7 @@ fn reconcile_rs(store: &Store, rs_value: &serde_json::Value) -> anyhow::Result<(
     if current_count < desired {
         let to_create = desired - current_count;
         for _ in 0..to_create {
-            create_pod_from_template(store, rs_name, current_uid, rs_ns, template)?;
+            create_pod(store, rs_name, current_uid, rs_ns, template)?;
         }
         tracing::info!("rs '{rs_name}': created {to_create} pods ({current_count} -> {desired})");
     } else if current_count > desired {
@@ -157,18 +148,15 @@ fn reconcile_rs(store: &Store, rs_value: &serde_json::Value) -> anyhow::Result<(
     Ok(())
 }
 
-fn create_pod_from_template(
+fn create_pod(
     store: &Store,
     rs_name: &str,
     rs_uid: &str,
     namespace: Option<&str>,
     template: &PodTemplateSpec,
 ) -> anyhow::Result<()> {
-    let pod_name = format!("{}-{}", rs_name, random_suffix());
-    let labels = template
-        .metadata
-        .as_ref()
-        .and_then(|m| m.labels.clone());
+    let pod_name = format!("{}-{}", rs_name, crate::random_suffix());
+    let labels = template.metadata.as_ref().and_then(|m| m.labels.clone());
     let pod = Pod {
         metadata: ObjectMeta {
             name: Some(pod_name.clone()),
@@ -233,7 +221,7 @@ fn update_rs_status(
     match store.update(&resource_ref, &updated) {
         Ok(_) => Ok(()),
         Err(e) => {
-            tracing::debug!("rs status update conflict for '{rs_name}', will retry: {e}");
+            tracing::debug!("rs status update conflict for '{rs_name}': {e}");
             Ok(())
         }
     }

@@ -1,12 +1,11 @@
+use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use r8s_store::Store;
 use r8s_store::backend::ResourceRef;
 use r8s_store::watch::WatchEventType;
 use r8s_types::{
-    EndpointAddress, EndpointPort, EndpointSlice, EndpointSubset, Endpoints,
-    EndpointConditions, GroupVersionResource, ObjectMeta, ObjectReference, OwnerReference,
-    Pod, Service, SliceEndpoint,
+    EndpointAddress, EndpointConditions, EndpointPort, EndpointSlice, EndpointSubset, Endpoints,
+    GroupVersionResource, ObjectMeta, ObjectReference, OwnerReference, Pod, Service, SliceEndpoint,
 };
-use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
@@ -52,7 +51,14 @@ pub async fn run(store: Store, shutdown: CancellationToken) -> anyhow::Result<()
 }
 
 fn reconcile_all(store: &Store) {
-    let result = match store.list(&GroupVersionResource::services(), None, None, None, None, None) {
+    let result = match store.list(
+        &GroupVersionResource::services(),
+        None,
+        None,
+        None,
+        None,
+        None,
+    ) {
         Ok(r) => r,
         Err(e) => {
             tracing::warn!("endpoints controller list error: {e}");
@@ -64,11 +70,17 @@ fn reconcile_all(store: &Store) {
     }
 }
 
-/// Only reconcile services whose selector matches the changed pod.
 fn reconcile_services_for_pod(store: &Store, pod: &Pod) {
     let pod_ns = pod.metadata.namespace.as_deref();
     let pod_labels = pod.metadata.labels.as_ref();
-    let svcs = match store.list(&GroupVersionResource::services(), pod_ns, None, None, None, None) {
+    let svcs = match store.list(
+        &GroupVersionResource::services(),
+        pod_ns,
+        None,
+        None,
+        None,
+        None,
+    ) {
         Ok(r) => r,
         Err(e) => {
             tracing::warn!("endpoints controller list error: {e}");
@@ -94,6 +106,15 @@ fn reconcile_services_for_pod(store: &Store, pod: &Pod) {
     }
 }
 
+fn resolve_target_port(target_port: Option<&IntOrString>, default: i32) -> i32 {
+    target_port
+        .and_then(|tp| match tp {
+            IntOrString::Int(i) => Some(*i),
+            _ => None,
+        })
+        .unwrap_or(default)
+}
+
 fn reconcile_service(store: &Store, service_value: &serde_json::Value) -> anyhow::Result<()> {
     let svc: Service = serde_json::from_value(service_value.clone())?;
     let svc_name = svc
@@ -111,23 +132,19 @@ fn reconcile_service(store: &Store, service_value: &serde_json::Value) -> anyhow
 
     let selector = match svc_spec.selector.as_ref() {
         Some(s) if !s.is_empty() => s,
-        _ => return Ok(()), // no selector, skip
+        _ => return Ok(()),
     };
 
-    // Find matching pods
     let pod_gvr = GroupVersionResource::pods();
     let matching: Vec<Pod> = store
         .list_as::<Pod>(&pod_gvr, svc_ns)?
         .into_iter()
-        .filter(|pod| {
-            match pod.metadata.labels.as_ref() {
-                Some(labels) => selector.iter().all(|(k, v)| labels.get(k) == Some(v)),
-                None => false,
-            }
+        .filter(|pod| match pod.metadata.labels.as_ref() {
+            Some(labels) => selector.iter().all(|(k, v)| labels.get(k) == Some(v)),
+            None => false,
         })
         .collect();
 
-    // Build addresses
     let addresses: Vec<EndpointAddress> = matching
         .iter()
         .filter_map(|pod| {
@@ -137,11 +154,7 @@ fn reconcile_service(store: &Store, service_value: &serde_json::Value) -> anyhow
                 return None;
             }
             let pod_name = pod.metadata.name.as_deref()?;
-            let pod_ns = pod
-                .metadata
-                .namespace
-                .as_deref()
-                .unwrap_or("default");
+            let pod_ns = pod.metadata.namespace.as_deref().unwrap_or("default");
             Some(EndpointAddress {
                 ip: pod_ip.to_string(),
                 target_ref: Some(ObjectReference {
@@ -155,27 +168,16 @@ fn reconcile_service(store: &Store, service_value: &serde_json::Value) -> anyhow
         })
         .collect();
 
-    // Build ports from service spec
     let ports: Vec<EndpointPort> = svc_spec
         .ports
         .as_deref()
         .unwrap_or_default()
         .iter()
-        .map(|p| {
-            let target_port = p
-                .target_port
-                .as_ref()
-                .and_then(|tp| match tp {
-                    IntOrString::Int(i) => Some(*i),
-                    _ => None,
-                })
-                .unwrap_or(p.port);
-            EndpointPort {
-                port: target_port,
-                protocol: p.protocol.clone(),
-                name: p.name.clone(),
-                ..Default::default()
-            }
+        .map(|p| EndpointPort {
+            port: resolve_target_port(p.target_port.as_ref(), p.port),
+            protocol: p.protocol.clone(),
+            name: p.name.clone(),
+            ..Default::default()
         })
         .collect();
 
@@ -211,7 +213,6 @@ fn reconcile_service(store: &Store, service_value: &serde_json::Value) -> anyhow
 
     match store.get(&rref)? {
         Some(existing) => {
-            // Preserve resourceVersion for update
             let mut ep_value = serde_json::to_value(&ep)?;
             if let Some(rv) = existing["metadata"]["resourceVersion"].as_str() {
                 ep_value["metadata"]["resourceVersion"] = serde_json::json!(rv);
@@ -224,7 +225,7 @@ fn reconcile_service(store: &Store, service_value: &serde_json::Value) -> anyhow
         }
     }
 
-    // Also create/update EndpointSlice (used by Traefik v3 and newer controllers)
+    // Newer ingress controllers require EndpointSlice in addition to legacy Endpoints
     let es_gvr = GroupVersionResource::endpoint_slices();
     let es_ref = ResourceRef {
         gvr: &es_gvr,
@@ -232,27 +233,16 @@ fn reconcile_service(store: &Store, service_value: &serde_json::Value) -> anyhow
         name: svc_name,
     };
 
-    // Build discovery EndpointPort (different type from core EndpointPort)
     let discovery_ports: Vec<k8s_openapi::api::discovery::v1::EndpointPort> = svc_spec
         .ports
         .as_deref()
         .unwrap_or_default()
         .iter()
-        .map(|p| {
-            let target_port = p
-                .target_port
-                .as_ref()
-                .and_then(|tp| match tp {
-                    IntOrString::Int(i) => Some(*i),
-                    _ => None,
-                })
-                .unwrap_or(p.port);
-            k8s_openapi::api::discovery::v1::EndpointPort {
-                port: Some(target_port),
-                protocol: p.protocol.clone(),
-                name: p.name.clone(),
-                ..Default::default()
-            }
+        .map(|p| k8s_openapi::api::discovery::v1::EndpointPort {
+            port: Some(resolve_target_port(p.target_port.as_ref(), p.port)),
+            protocol: p.protocol.clone(),
+            name: p.name.clone(),
+            ..Default::default()
         })
         .collect();
 

@@ -19,11 +19,10 @@ use crate::{
         get_group_version_resources, get_version,
     },
     handler::{
-        RouteContext, create_cluster, create_ns, delete_cluster, delete_ns, get_cluster, get_ns,
-        list_all_ns, list_cluster, list_ns, patch_cluster, patch_ns, pod_logs_ns, update_cluster,
-        update_ns,
-        // _impl functions for dynamic dispatch
-        create_impl, delete_impl, get_impl, list_impl, patch_impl, require_json, update_impl,
+        RouteContext, create_cluster, create_impl, create_ns, delete_cluster, delete_impl,
+        delete_ns, get_cluster, get_impl, get_ns, list_all_ns, list_cluster, list_impl, list_ns,
+        patch_cluster, patch_impl, patch_ns, pod_logs_ns, require_json, update_cluster,
+        update_impl, update_ns,
     },
     params::ListParams,
     response::status_error,
@@ -45,7 +44,6 @@ fn not_found() -> Response {
     )
 }
 
-/// Parsed API path for dynamic dispatch.
 struct ApiPath {
     group: String,
     version: String,
@@ -54,13 +52,8 @@ struct ApiPath {
     name: Option<String>,
 }
 
-/// Parse `/apis/{group}/{version}/...` paths into structured components.
 fn parse_api_path(path: &str) -> Option<ApiPath> {
     let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-    // /apis/{group}/{version}/{resource}
-    // /apis/{group}/{version}/{resource}/{name}
-    // /apis/{group}/{version}/namespaces/{ns}/{resource}
-    // /apis/{group}/{version}/namespaces/{ns}/{resource}/{name}
     if parts.len() < 4 || parts[0] != "apis" {
         return None;
     }
@@ -68,7 +61,6 @@ fn parse_api_path(path: &str) -> Option<ApiPath> {
     let version = parts[2].to_string();
 
     if parts.len() >= 6 && parts[3] == "namespaces" {
-        // Namespaced: /apis/g/v/namespaces/{ns}/{resource}[/{name}]
         let ns = parts[4].to_string();
         let resource = parts[5].to_string();
         let name = parts.get(6).map(|s| s.to_string());
@@ -80,7 +72,6 @@ fn parse_api_path(path: &str) -> Option<ApiPath> {
             name,
         })
     } else {
-        // Cluster-scoped: /apis/g/v/{resource}[/{name}]
         let resource = parts[3].to_string();
         let name = parts.get(4).map(|s| s.to_string());
         Some(ApiPath {
@@ -93,7 +84,6 @@ fn parse_api_path(path: &str) -> Option<ApiPath> {
     }
 }
 
-/// Dynamic dispatch fallback: handles CRD resource requests that don't have static routes.
 async fn dynamic_dispatch(
     State(state): State<AppState>,
     Query(params): Query<ListParams>,
@@ -114,20 +104,24 @@ async fn dynamic_dispatch(
         None => return not_found(),
     };
 
-    let ctx = RouteContext {
-        resource_type: rt,
-    };
+    let ctx = RouteContext { resource_type: rt };
 
     let body = axum::body::to_bytes(req.into_body(), 1024 * 1024)
         .await
         .unwrap_or_default();
 
     match (method, api_path.name) {
-        (Method::GET, None) => list_impl(&state, &ctx, api_path.namespace.as_deref(), params, &headers),
+        (Method::GET, None) => list_impl(
+            &state,
+            &ctx,
+            api_path.namespace.as_deref(),
+            params,
+            &headers,
+        ),
         (Method::POST, None) => {
             let json = match require_json(&headers, &body) {
                 Ok(v) => v,
-                Err(resp) => return *resp,
+                Err(resp) => return resp,
             };
             create_impl(&state, &ctx, api_path.namespace.as_deref(), json)
         }
@@ -137,7 +131,7 @@ async fn dynamic_dispatch(
         (Method::PUT, Some(ref name)) => {
             let json = match require_json(&headers, &body) {
                 Ok(v) => v,
-                Err(resp) => return *resp,
+                Err(resp) => return resp,
             };
             update_impl(&state, &ctx, api_path.namespace.as_deref(), name, json)
         }
@@ -151,7 +145,6 @@ async fn dynamic_dispatch(
     }
 }
 
-/// The K8s-compatible API server built on axum.
 pub struct ApiServer {
     state: AppState,
 }
@@ -240,7 +233,7 @@ impl ApiServer {
         let router = router
             .fallback(dynamic_dispatch)
             .with_state(self.state)
-            .layer(DefaultBodyLimit::max(1024 * 1024)) // 1MB
+            .layer(DefaultBodyLimit::max(1024 * 1024))
             .layer(axum::middleware::from_fn(log_requests));
         let listener = tokio::net::TcpListener::bind(addr).await?;
         tracing::info!("API server listening on {addr}");

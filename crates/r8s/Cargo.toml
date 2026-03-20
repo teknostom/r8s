@@ -13,4 +13,5 @@ anyhow.workspace = true
 serde.workspace = true
 toml.workspace = true
 libc = "0.2"
+rustc-hash.workspace = true
 r8s-store.workspace = true

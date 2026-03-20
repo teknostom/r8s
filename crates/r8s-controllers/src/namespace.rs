@@ -21,10 +21,10 @@ pub async fn run(store: Store, shutdown: CancellationToken) -> anyhow::Result<()
                 match event {
                     Ok(event) if matches!(event.event_type, WatchEventType::Added) => {
                         let ns: Result<r8s_types::Namespace, _> = serde_json::from_value(event.object);
-                        if let Ok(ns) = ns {
-                            if let Some(name) = ns.metadata.name.as_deref() {
-                                ensure_default_sa(&store, &sa_gvr, name);
-                            }
+                        if let Ok(ns) = ns
+                            && let Some(name) = ns.metadata.name.as_deref()
+                        {
+                            ensure_default_sa(&store, &sa_gvr, name);
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {

@@ -3,7 +3,6 @@ use r8s_types::registry::ResourceRegistry;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-/// Manages the lifecycle of all built-in controllers.
 pub struct ControllerManager {
     store: Store,
     shutdown: CancellationToken,

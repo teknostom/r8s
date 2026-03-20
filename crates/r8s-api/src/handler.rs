@@ -40,26 +40,30 @@ pub struct LogParams {
     pub tail_lines: Option<u64>,
 }
 
-pub(crate) fn require_json(headers: &HeaderMap, body: &Bytes) -> Result<serde_json::Value, Box<Response>> {
+#[allow(clippy::result_large_err)]
+pub(crate) fn require_json(
+    headers: &HeaderMap,
+    body: &Bytes,
+) -> Result<serde_json::Value, Response> {
     let content_type = headers
         .get("content-type")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     if content_type.contains("protobuf") {
         return decode_k8s_protobuf(body).ok_or_else(|| {
-            Box::new(status_error(
+            status_error(
                 StatusCode::BAD_REQUEST,
                 "Invalid",
                 "failed to decode kubernetes protobuf body",
-            ))
+            )
         });
     }
     serde_json::from_slice(body).map_err(|e| {
-        Box::new(status_error(
+        status_error(
             StatusCode::BAD_REQUEST,
             "Invalid",
             &format!("invalid body: {e}"),
-        ))
+        )
     })
 }
 
@@ -137,18 +141,18 @@ pub(crate) fn create_impl(
             );
         }
     };
-    // Ensure metadata.namespace matches the URL path namespace
     if let Some(ns) = namespace {
         body["metadata"]["namespace"] = serde_json::json!(ns);
     }
 
-    // Allocate ClusterIP for services that need one
     if ctx.resource_type.gvr.resource == "services" {
         let svc_type = body["spec"]["type"].as_str().unwrap_or("ClusterIP");
         let has_cluster_ip = body["spec"]["clusterIP"]
             .as_str()
             .is_some_and(|ip| !ip.is_empty() && ip != "None");
-        if (svc_type == "ClusterIP" || svc_type == "LoadBalancer" || svc_type == "NodePort") && !has_cluster_ip {
+        if (svc_type == "ClusterIP" || svc_type == "LoadBalancer" || svc_type == "NodePort")
+            && !has_cluster_ip
+        {
             let ip = state.allocate_cluster_ip();
             body["spec"]["clusterIP"] = serde_json::json!(ip);
             body["spec"]["clusterIPs"] = serde_json::json!([ip]);
@@ -175,7 +179,7 @@ pub async fn create_ns(
 ) -> Response {
     let body = match require_json(&headers, &body) {
         Ok(v) => v,
-        Err(resp) => return *resp,
+        Err(resp) => return resp,
     };
     create_impl(&state, &ctx, Some(&ns), body)
 }
@@ -188,7 +192,7 @@ pub async fn create_cluster(
 ) -> Response {
     let body = match require_json(&headers, &body) {
         Ok(v) => v,
-        Err(resp) => return *resp,
+        Err(resp) => return resp,
     };
     create_impl(&state, &ctx, None, body)
 }
@@ -220,7 +224,7 @@ pub async fn update_ns(
 ) -> Response {
     let body = match require_json(&headers, &body) {
         Ok(v) => v,
-        Err(resp) => return *resp,
+        Err(resp) => return resp,
     };
     update_impl(&state, &ctx, Some(&ns), &name, body)
 }
@@ -234,7 +238,7 @@ pub async fn update_cluster(
 ) -> Response {
     let body = match require_json(&headers, &body) {
         Ok(v) => v,
-        Err(resp) => return *resp,
+        Err(resp) => return resp,
     };
     update_impl(&state, &ctx, None, &name, body)
 }
@@ -421,10 +425,9 @@ pub(crate) fn list_impl(
 }
 
 fn watch_impl(state: &AppState, ctx: &RouteContext, namespace: Option<&str>) -> Response {
-    // Subscribe to live events BEFORE listing, so we don't miss anything.
+    // Subscribe before listing so we don't miss events between the list and the watch.
     let rx = state.store.watch(&ctx.resource_type.gvr);
 
-    // List existing resources to emit as initial ADDED events.
     let (items, rv) = state
         .store
         .list(&ctx.resource_type.gvr, namespace, None, None, None, None)
@@ -436,19 +439,12 @@ fn watch_impl(state: &AppState, ctx: &RouteContext, namespace: Option<&str>) -> 
         .map(|obj| Ok::<_, std::io::Error>(response::watch_event_line("ADDED", &obj)));
     let initial_stream = tokio_stream::iter(initial);
 
-    let api_version = if ctx.resource_type.gvr.group.is_empty() {
-        ctx.resource_type.gvr.version.clone()
-    } else {
-        format!(
-            "{}/{}",
-            ctx.resource_type.gvr.group, ctx.resource_type.gvr.version
-        )
-    };
+    let av = api_version(ctx);
     let bookmark = tokio_stream::iter(std::iter::once(Ok::<_, std::io::Error>(
         response::watch_event_line(
             "BOOKMARK",
             &serde_json::json!({
-                "apiVersion": api_version,
+                "apiVersion": av,
                 "kind": ctx.resource_type.kind,
                 "metadata": {"resourceVersion": rv.to_string()}
             }),
@@ -456,7 +452,7 @@ fn watch_impl(state: &AppState, ctx: &RouteContext, namespace: Option<&str>) -> 
     )));
 
     let ns_filter: Option<String> = namespace.map(|s| s.to_string());
-    // On broadcast lag, terminate the stream so the client reconnects (K8s behavior).
+    // On broadcast lag, terminate so the client reconnects (standard K8s behavior).
     let live_stream = BroadcastStream::new(rx)
         .take_while(|result| result.is_ok())
         .filter_map(move |result| {
@@ -484,7 +480,7 @@ fn watch_impl(state: &AppState, ctx: &RouteContext, namespace: Option<&str>) -> 
         .header("content-type", "application/json")
         .header("transfer-encoding", "chunked")
         .body(Body::from_stream(stream))
-        .unwrap()
+        .expect("valid response")
 }
 
 pub async fn list_ns(
@@ -555,7 +551,7 @@ pub async fn pod_logs_ns(
                 .status(200)
                 .header("content-type", "text/plain")
                 .body(Body::empty())
-                .unwrap();
+                .expect("valid response");
         }
     };
 
@@ -563,7 +559,9 @@ pub async fn pod_logs_ns(
         .data_dir
         .join("logs")
         .join(format!("{container_id}.stdout"));
-    let content = std::fs::read_to_string(&log_path).unwrap_or_default();
+    let content = tokio::fs::read_to_string(&log_path)
+        .await
+        .unwrap_or_default();
 
     let output = if let Some(tail) = params.tail_lines {
         let lines: Vec<&str> = content.lines().collect();
@@ -577,5 +575,5 @@ pub async fn pod_logs_ns(
         .status(200)
         .header("content-type", "text/plain")
         .body(Body::from(output))
-        .unwrap()
+        .expect("valid response")
 }

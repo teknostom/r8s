@@ -58,7 +58,6 @@ fn reconcile_all(store: &Store) {
     }
 }
 
-/// Minimal wrapper to deserialize just what we need from Job status.
 #[derive(serde::Deserialize)]
 struct JobMeta {
     metadata: ObjectMeta,
@@ -92,7 +91,10 @@ fn is_job_succeeded(job: &JobMeta) -> bool {
     job.status
         .as_ref()
         .and_then(|s| s.conditions.as_ref())
-        .map(|cs| cs.iter().any(|c| c.type_ == "Complete" && c.status == "True"))
+        .map(|cs| {
+            cs.iter()
+                .any(|c| c.type_ == "Complete" && c.status == "True")
+        })
         .unwrap_or(false)
 }
 
@@ -123,21 +125,16 @@ fn reconcile_cronjob(store: &Store, cj_value: &serde_json::Value) -> anyhow::Res
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("CronJob has no spec"))?;
 
-    // Check if suspended
     if spec.suspend.unwrap_or(false) {
         return Ok(());
     }
 
     let schedule = &spec.schedule;
-    let concurrency_policy = spec
-        .concurrency_policy
-        .as_deref()
-        .unwrap_or("Allow");
+    let concurrency_policy = spec.concurrency_policy.as_deref().unwrap_or("Allow");
     let job_template = &spec.job_template;
 
     let now = chrono::Utc::now();
 
-    // List owned Jobs
     let job_gvr = GroupVersionResource::jobs();
     let owned_jobs: Vec<JobMeta> = store
         .list_as::<JobMeta>(&job_gvr, cj_ns)?
@@ -147,7 +144,6 @@ fn reconcile_cronjob(store: &Store, cj_value: &serde_json::Value) -> anyhow::Res
 
     let active_jobs: Vec<&JobMeta> = owned_jobs.iter().filter(|j| !is_job_finished(j)).collect();
 
-    // Check if we should run
     let last_schedule = current
         .status
         .as_ref()
@@ -164,7 +160,6 @@ fn reconcile_cronjob(store: &Store, cj_value: &serde_json::Value) -> anyhow::Res
                 );
             }
             "Replace" if !active_jobs.is_empty() => {
-                // Delete active jobs first
                 for job in &active_jobs {
                     if let Some(name) = job.metadata.name.as_deref() {
                         let job_ref = ResourceRef {
@@ -179,30 +174,25 @@ fn reconcile_cronjob(store: &Store, cj_value: &serde_json::Value) -> anyhow::Res
                 create_job(store, cj_name, current_uid, cj_ns, job_template)?;
             }
             _ => {
-                // Allow (or Forbid/Replace with no active jobs)
                 create_job(store, cj_name, current_uid, cj_ns, job_template)?;
             }
         }
     }
 
-    // Enforce history limits
     let success_limit = spec.successful_jobs_history_limit.unwrap_or(3) as usize;
     let failed_limit = spec.failed_jobs_history_limit.unwrap_or(1) as usize;
     cleanup_history(store, &owned_jobs, cj_ns, success_limit, failed_limit);
 
-    // Update status
     let active_refs: Vec<ObjectReference> = owned_jobs
         .iter()
         .filter(|j| !is_job_finished(j))
-        .filter_map(|j| {
-            Some(ObjectReference {
-                api_version: Some("batch/v1".into()),
-                kind: Some("Job".into()),
-                name: j.metadata.name.clone(),
-                namespace: j.metadata.namespace.clone(),
-                uid: j.metadata.uid.clone(),
-                ..Default::default()
-            })
+        .map(|j| ObjectReference {
+            api_version: Some("batch/v1".into()),
+            kind: Some("Job".into()),
+            name: j.metadata.name.clone(),
+            namespace: j.metadata.namespace.clone(),
+            uid: j.metadata.uid.clone(),
+            ..Default::default()
         })
         .collect();
 
@@ -210,18 +200,23 @@ fn reconcile_cronjob(store: &Store, cj_value: &serde_json::Value) -> anyhow::Res
         .iter()
         .filter(|j| is_job_succeeded(j))
         .filter_map(|j| j.metadata.creation_timestamp.clone())
-        .max_by_key(|t| t.0)
-        ;
+        .max_by_key(|t| t.0);
 
     let new_status = CronJobStatus {
         active: Some(active_refs),
         last_schedule_time: if due {
             Some(Time(now))
         } else {
-            current.status.as_ref().and_then(|s| s.last_schedule_time.clone())
+            current
+                .status
+                .as_ref()
+                .and_then(|s| s.last_schedule_time.clone())
         },
         last_successful_time: last_successful.or_else(|| {
-            current.status.as_ref().and_then(|s| s.last_successful_time.clone())
+            current
+                .status
+                .as_ref()
+                .and_then(|s| s.last_successful_time.clone())
         }),
     };
     let new_status_val = serde_json::to_value(&new_status)?;
@@ -298,11 +293,9 @@ fn cleanup_history(
         .filter(|j| is_job_finished(j) && !is_job_succeeded(j))
         .collect();
 
-    // Sort by creation timestamp (oldest first)
     succeeded.sort_by_key(|j| j.metadata.creation_timestamp.as_ref().map(|t| t.0));
     failed.sort_by_key(|j| j.metadata.creation_timestamp.as_ref().map(|t| t.0));
 
-    // Delete excess (oldest first)
     if succeeded.len() > success_limit {
         for job in &succeeded[..succeeded.len() - success_limit] {
             if let Some(name) = job.metadata.name.as_deref() {
@@ -329,9 +322,6 @@ fn cleanup_history(
     }
 }
 
-// --- Minimal cron parser ---
-
-/// Check if the cron schedule is due given the last run time and current time.
 fn should_run(
     schedule: &str,
     last_run: Option<chrono::DateTime<chrono::Utc>>,
@@ -382,21 +372,17 @@ fn should_run(
         return false;
     }
 
-    // Don't run if we already ran this minute
-    if let Some(last) = last_run {
-        if last.date_naive() == now.date_naive()
-            && last.time().hour() == now_hour
-            && last.time().minute() == now_min
-        {
-            return false;
-        }
+    if let Some(last) = last_run
+        && last.date_naive() == now.date_naive()
+        && last.time().hour() == now_hour
+        && last.time().minute() == now_min
+    {
+        return false;
     }
 
     true
 }
 
-/// Parse a single cron field into a set of allowed values.
-/// Supports: * */N N N-M N,M,O
 fn parse_cron_field(field: &str, min: u32, max: u32) -> Option<Vec<u32>> {
     let mut values = Vec::new();
 

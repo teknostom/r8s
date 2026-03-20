@@ -3,12 +3,8 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 
-/// Tracks the global monotonic resource version counter.
-/// Every mutation increments this and the new value becomes the resource's resourceVersion.
-///
-/// Note: the counter is incremented before the DB transaction commits, so a failed
-/// commit leaves a gap. This matches real K8s behavior where resourceVersion gaps are
-/// normal and expected. Consumers must not assume contiguous revision sequences.
+// Incremented before the DB commit, so failed transactions leave gaps.
+// This matches K8s where revision gaps are normal and expected.
 #[derive(Clone)]
 pub struct RevisionCounter {
     revision_id: Arc<AtomicU64>,

@@ -2,8 +2,10 @@ mod config;
 mod helm;
 
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
+use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
 
@@ -93,6 +95,14 @@ fn base_dir() -> PathBuf {
     PathBuf::from("/var/lib/r8s/clusters")
 }
 
+fn cluster_dir(name: &str) -> PathBuf {
+    base_dir().join(name)
+}
+
+fn pid_file(dir: &Path) -> PathBuf {
+    dir.join("r8sd.pid")
+}
+
 fn validate_name(name: &str) -> anyhow::Result<()> {
     if name.is_empty() {
         anyhow::bail!("cluster name cannot be empty");
@@ -100,26 +110,26 @@ fn validate_name(name: &str) -> anyhow::Result<()> {
     if name.contains('/') || name.contains('\\') || name == "." || name == ".." {
         anyhow::bail!("invalid cluster name '{name}'");
     }
-    if !name.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_') {
+    if !name
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+    {
         anyhow::bail!("cluster name must be alphanumeric (with - or _)");
     }
     Ok(())
 }
 
-fn cluster_dir(name: &str) -> PathBuf {
-    base_dir().join(name)
-}
-
-/// Resolve cluster name: use provided name, or if omitted, pick the only existing cluster.
 fn resolve_name(name: Option<String>) -> anyhow::Result<String> {
     if let Some(n) = name {
         validate_name(&n)?;
         return Ok(n);
     }
+
     let base = base_dir();
     if !base.exists() {
         anyhow::bail!("no clusters exist. Create one with: r8s create <name>");
     }
+
     let entries: Vec<String> = std::fs::read_dir(&base)?
         .filter_map(|e| {
             let e = e.ok()?;
@@ -130,6 +140,7 @@ fn resolve_name(name: Option<String>) -> anyhow::Result<String> {
             }
         })
         .collect();
+
     match entries.len() {
         0 => anyhow::bail!("no clusters exist. Create one with: r8s create <name>"),
         1 => Ok(entries.into_iter().next().unwrap()),
@@ -140,18 +151,10 @@ fn resolve_name(name: Option<String>) -> anyhow::Result<String> {
     }
 }
 
-fn pid_file(dir: &Path) -> PathBuf {
-    dir.join("r8sd.pid")
-}
-
-fn read_pid(dir: &Path) -> Option<u32> {
-    std::fs::read_to_string(pid_file(dir))
-        .ok()
-        .and_then(|s| s.trim().parse().ok())
-}
-
-fn is_running(pid: u32) -> bool {
-    Path::new(&format!("/proc/{pid}")).exists()
+fn create_cluster_dir(dir: &Path) -> anyhow::Result<()> {
+    std::fs::create_dir_all(dir.join("logs"))?;
+    std::fs::create_dir_all(dir.join("serviceaccount"))?;
+    Ok(())
 }
 
 fn write_kubeconfig(dir: &Path, name: &str) -> anyhow::Result<()> {
@@ -177,15 +180,174 @@ users:
     Ok(())
 }
 
+fn read_pid(dir: &Path) -> Option<u32> {
+    std::fs::read_to_string(pid_file(dir))
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+}
+
+fn is_running(pid: u32) -> bool {
+    Path::new(&format!("/proc/{pid}")).exists()
+}
+
+fn daemon_running(dir: &Path) -> bool {
+    read_pid(dir).is_some_and(is_running)
+}
+
 fn r8sd_binary() -> PathBuf {
-    // Look next to the r8s binary first
     let self_path = std::env::current_exe().unwrap_or_default();
     let sibling = self_path.parent().unwrap_or(Path::new(".")).join("r8sd");
     if sibling.exists() {
         return sibling;
     }
-    // Fall back to PATH
     PathBuf::from("r8sd")
+}
+
+fn spawn_daemon(dir: &Path, name: &str) -> anyhow::Result<u32> {
+    write_kubeconfig(dir, name)?;
+
+    let log_file = std::fs::File::create(dir.join("r8sd.log"))?;
+    let stderr_file = log_file.try_clone()?;
+    let mut child = Command::new(r8sd_binary())
+        .arg("--data-dir")
+        .arg(dir)
+        .stdout(log_file)
+        .stderr(stderr_file)
+        .spawn()?;
+
+    let pid = child.id();
+    std::fs::write(pid_file(dir), pid.to_string())?;
+
+    let api_addr: SocketAddr = "127.0.0.1:6443".parse().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+
+    while Instant::now() < deadline {
+        if let Some(status) = child.try_wait()? {
+            let _ = std::fs::remove_file(pid_file(dir));
+            let log = std::fs::read_to_string(dir.join("r8sd.log")).unwrap_or_default();
+            let tail: String = log
+                .lines()
+                .rev()
+                .take(10)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect::<Vec<_>>()
+                .join("\n");
+            anyhow::bail!("r8sd exited immediately ({status}):\n{tail}");
+        }
+        if TcpStream::connect_timeout(&api_addr, Duration::from_millis(100)).is_ok() {
+            println!("Cluster '{name}' started (pid {pid}).");
+            return Ok(pid);
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    println!("Cluster '{name}' started (pid {pid}), waiting for API server...");
+    Ok(pid)
+}
+
+/// Returns true if a daemon was running and was stopped.
+fn stop_daemon(dir: &Path) -> anyhow::Result<bool> {
+    let pid = match read_pid(dir) {
+        Some(pid) if is_running(pid) => pid,
+        _ => return Ok(false),
+    };
+
+    let ret = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+    if ret != 0 {
+        anyhow::bail!("failed to send SIGTERM to pid {pid}");
+    }
+
+    for _ in 0..100 {
+        if !is_running(pid) {
+            let _ = std::fs::remove_file(pid_file(dir));
+            return Ok(true);
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    eprintln!("warning: r8sd (pid {pid}) did not exit, sending SIGKILL");
+    let _ = unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+    let _ = std::fs::remove_file(pid_file(dir));
+    Ok(true)
+}
+
+fn check_root() -> anyhow::Result<()> {
+    if unsafe { libc::getuid() } != 0 {
+        anyhow::bail!("r8s requires root. Run with sudo.");
+    }
+    Ok(())
+}
+
+fn ctr_list(resource: &str) -> Vec<String> {
+    Command::new("ctr")
+        .args(["-n", "r8s", resource, "ls", "-q"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(String::from)
+        .collect()
+}
+
+fn cleanup_containerd() {
+    let tasks = ctr_list("tasks");
+    for id in &tasks {
+        let _ = Command::new("ctr")
+            .args(["-n", "r8s", "tasks", "kill", "-s", "9", id])
+            .output();
+    }
+    if !tasks.is_empty() {
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    for id in &tasks {
+        let _ = Command::new("ctr")
+            .args(["-n", "r8s", "tasks", "rm", id])
+            .output();
+    }
+
+    for id in &ctr_list("containers") {
+        let _ = Command::new("ctr")
+            .args(["-n", "r8s", "containers", "rm", id])
+            .output();
+    }
+
+    for id in &ctr_list("images") {
+        let _ = Command::new("ctr")
+            .args(["-n", "r8s", "images", "rm", id])
+            .output();
+    }
+
+    println!("Cleaned up containerd resources.");
+}
+
+fn tail_follow(path: &Path) -> anyhow::Result<()> {
+    let content = std::fs::read_to_string(path)?;
+    let lines: Vec<&str> = content.lines().collect();
+    let start = lines.len().saturating_sub(20);
+    for line in &lines[start..] {
+        println!("{line}");
+    }
+
+    let mut file = std::fs::File::open(path)?;
+    file.seek(SeekFrom::End(0))?;
+    let mut reader = BufReader::new(file);
+    loop {
+        let mut line = String::new();
+        match reader.read_line(&mut line) {
+            Ok(0) => std::thread::sleep(Duration::from_millis(100)),
+            Ok(_) => print!("{line}"),
+            Err(e) => {
+                eprintln!("error reading log: {e}");
+                break;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn main() -> anyhow::Result<()> {
@@ -199,8 +361,7 @@ fn main() -> anyhow::Result<()> {
             if dir.exists() {
                 anyhow::bail!("cluster '{name}' already exists");
             }
-            std::fs::create_dir_all(dir.join("logs"))?;
-            std::fs::create_dir_all(dir.join("serviceaccount"))?;
+            create_cluster_dir(&dir)?;
             println!("Cluster '{name}' created.");
             println!("Start it with: sudo r8s up {name}");
         }
@@ -212,17 +373,12 @@ fn main() -> anyhow::Result<()> {
             if !dir.exists() {
                 anyhow::bail!("cluster '{name}' does not exist. Create it with: r8s create {name}");
             }
-
-            // Check if already running
-            if let Some(pid) = read_pid(&dir) {
-                if is_running(pid) {
-                    anyhow::bail!("cluster '{name}' is already running (pid {pid})");
-                }
+            if daemon_running(&dir) {
+                anyhow::bail!("cluster '{name}' is already running");
             }
 
-            write_kubeconfig(&dir, &name)?;
-
             if foreground {
+                write_kubeconfig(&dir, &name)?;
                 println!("Starting cluster '{name}' in foreground...");
                 let status = Command::new(r8sd_binary())
                     .arg("--data-dir")
@@ -232,58 +388,8 @@ fn main() -> anyhow::Result<()> {
                     anyhow::bail!("r8sd exited with {status}");
                 }
             } else {
-                let log_file = std::fs::File::create(dir.join("r8sd.log"))?;
-                let stderr_file = log_file.try_clone()?;
-                let mut child = Command::new(r8sd_binary())
-                    .arg("--data-dir")
-                    .arg(&dir)
-                    .stdout(log_file)
-                    .stderr(stderr_file)
-                    .spawn()?;
-
-                std::fs::write(pid_file(&dir), child.id().to_string())?;
-
-                // Wait for boot: check process alive + API ready (up to 2s)
-                let deadline = std::time::Instant::now()
-                    + std::time::Duration::from_secs(10);
-                let api_addr: std::net::SocketAddr = "127.0.0.1:6443".parse().unwrap();
-                let mut ready = false;
-
-                while std::time::Instant::now() < deadline {
-                    match child.try_wait()? {
-                        Some(status) => {
-                            let _ = std::fs::remove_file(pid_file(&dir));
-                            let log = std::fs::read_to_string(dir.join("r8sd.log"))
-                                .unwrap_or_default();
-                            let tail: Vec<&str> = log.lines().rev().take(10).collect();
-                            let tail: String = tail.into_iter().rev()
-                                .collect::<Vec<_>>().join("\n");
-                            anyhow::bail!(
-                                "r8sd exited immediately ({status}):\n{tail}"
-                            );
-                        }
-                        None => {}
-                    }
-                    if std::net::TcpStream::connect_timeout(
-                        &api_addr,
-                        std::time::Duration::from_millis(100),
-                    ).is_ok() {
-                        ready = true;
-                        break;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(100));
-                }
-
-                let kc = dir.join("kubeconfig");
-                if ready {
-                    println!("Cluster '{name}' started (pid {}).", child.id());
-                } else {
-                    println!(
-                        "Cluster '{name}' started (pid {}), waiting for API server...",
-                        child.id()
-                    );
-                }
-                println!("export KUBECONFIG={}", kc.display());
+                spawn_daemon(&dir, &name)?;
+                println!("export KUBECONFIG={}", dir.join("kubeconfig").display());
             }
         }
 
@@ -291,35 +397,10 @@ fn main() -> anyhow::Result<()> {
             check_root()?;
             let name = resolve_name(name)?;
             let dir = cluster_dir(&name);
-
-            let pid = match read_pid(&dir) {
-                Some(pid) if is_running(pid) => pid,
-                _ => {
-                    println!("Cluster '{name}' is not running.");
-                    return Ok(());
-                }
-            };
-
-            // Send SIGTERM
-            let ret = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
-            if ret != 0 {
-                anyhow::bail!("failed to send SIGTERM to pid {pid}");
+            if !stop_daemon(&dir)? {
+                println!("Cluster '{name}' is not running.");
+                return Ok(());
             }
-
-            // Wait for exit (up to 10 seconds)
-            for _ in 0..100 {
-                if !is_running(pid) {
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(100));
-            }
-
-            if is_running(pid) {
-                eprintln!("warning: r8sd (pid {pid}) did not exit, sending SIGKILL");
-                let _ = unsafe { libc::kill(pid as i32, libc::SIGKILL) };
-            }
-
-            let _ = std::fs::remove_file(pid_file(&dir));
             println!("Cluster '{name}' stopped.");
         }
 
@@ -329,23 +410,10 @@ fn main() -> anyhow::Result<()> {
             if !dir.exists() {
                 anyhow::bail!("cluster '{name}' does not exist");
             }
-
-            // Stop if running
-            if let Some(pid) = read_pid(&dir) {
-                if is_running(pid) {
-                    check_root()?;
-                    unsafe {
-                        libc::kill(pid as i32, libc::SIGTERM);
-                    }
-                    for _ in 0..50 {
-                        if !is_running(pid) {
-                            break;
-                        }
-                        std::thread::sleep(std::time::Duration::from_millis(100));
-                    }
-                }
+            if daemon_running(&dir) {
+                check_root()?;
+                stop_daemon(&dir)?;
             }
-
             std::fs::remove_dir_all(&dir)?;
             println!("Cluster '{name}' deleted.");
         }
@@ -363,17 +431,17 @@ fn main() -> anyhow::Result<()> {
                     continue;
                 }
                 let name = entry.file_name().to_string_lossy().to_string();
-                let dir = entry.path();
-                let status = match read_pid(&dir) {
-                    Some(pid) if is_running(pid) => "running",
-                    _ => "stopped",
+                let status = if daemon_running(&entry.path()) {
+                    "running"
+                } else {
+                    "stopped"
                 };
                 entries.push((name, status));
             }
             if entries.is_empty() {
                 println!("No clusters.");
             } else {
-                println!("{:<20} {}", "NAME", "STATUS");
+                println!("{:<20} STATUS", "NAME");
                 for (name, status) in &entries {
                     println!("{:<20} {}", name, status);
                 }
@@ -386,14 +454,11 @@ fn main() -> anyhow::Result<()> {
             if !dir.exists() {
                 anyhow::bail!("cluster '{name}' does not exist");
             }
-            match read_pid(&dir) {
-                Some(pid) if is_running(pid) => {
-                    println!("Cluster '{name}': running (pid {pid})");
-                    println!("Kubeconfig: {}", dir.join("kubeconfig").display());
-                }
-                _ => {
-                    println!("Cluster '{name}': stopped");
-                }
+            if let Some(pid) = read_pid(&dir).filter(|&pid| is_running(pid)) {
+                println!("Cluster '{name}': running (pid {pid})");
+                println!("Kubeconfig: {}", dir.join("kubeconfig").display());
+            } else {
+                println!("Cluster '{name}': stopped");
             }
         }
 
@@ -422,187 +487,11 @@ fn main() -> anyhow::Result<()> {
             println!("Store size:             {:.1} KB", size as f64 / 1024.0);
         }
 
-        Cmd::Env { action } => {
-            match action {
-                EnvCmd::Up { config } => {
-                    check_root()?;
-                    let config_path = std::fs::canonicalize(&config)
-                        .map_err(|e| anyhow::anyhow!("cannot find {}: {e}", config.display()))?;
-                    let base_dir = config_path.parent().unwrap();
-                    let cfg = config::load(&config_path)?;
-
-                    let name = cfg
-                        .cluster
-                        .as_ref()
-                        .and_then(|c| c.name.clone())
-                        .unwrap_or_else(|| "default".to_string());
-                    validate_name(&name)?;
-                    let dir = cluster_dir(&name);
-
-                    // Create cluster if it doesn't exist
-                    if !dir.exists() {
-                        std::fs::create_dir_all(dir.join("logs"))?;
-                        std::fs::create_dir_all(dir.join("serviceaccount"))?;
-                        println!("Cluster '{name}' created.");
-                    }
-
-                    // Start daemon if not running
-                    let already_running = read_pid(&dir)
-                        .is_some_and(|pid| is_running(pid));
-
-                    if !already_running {
-                        write_kubeconfig(&dir, &name)?;
-
-                        let log_file = std::fs::File::create(dir.join("r8sd.log"))?;
-                        let stderr_file = log_file.try_clone()?;
-                        let mut child = Command::new(r8sd_binary())
-                            .arg("--data-dir")
-                            .arg(&dir)
-                            .stdout(log_file)
-                            .stderr(stderr_file)
-                            .spawn()?;
-
-                        std::fs::write(pid_file(&dir), child.id().to_string())?;
-
-                        let deadline =
-                            std::time::Instant::now() + std::time::Duration::from_secs(10);
-                        let api_addr: std::net::SocketAddr = "127.0.0.1:6443".parse().unwrap();
-                        let mut ready = false;
-
-                        while std::time::Instant::now() < deadline {
-                            if let Some(status) = child.try_wait()? {
-                                let _ = std::fs::remove_file(pid_file(&dir));
-                                let log = std::fs::read_to_string(dir.join("r8sd.log"))
-                                    .unwrap_or_default();
-                                let tail: Vec<&str> = log.lines().rev().take(10).collect();
-                                let tail: String =
-                                    tail.into_iter().rev().collect::<Vec<_>>().join("\n");
-                                anyhow::bail!("r8sd exited immediately ({status}):\n{tail}");
-                            }
-                            if std::net::TcpStream::connect_timeout(
-                                &api_addr,
-                                std::time::Duration::from_millis(100),
-                            )
-                            .is_ok()
-                            {
-                                ready = true;
-                                break;
-                            }
-                            std::thread::sleep(std::time::Duration::from_millis(100));
-                        }
-
-                        if ready {
-                            println!("Cluster '{name}' started (pid {}).", child.id());
-                        } else {
-                            println!(
-                                "Cluster '{name}' started (pid {}), waiting for API server...",
-                                child.id()
-                            );
-                        }
-                    } else {
-                        println!("Cluster '{name}' already running.");
-                    }
-
-                    let kubeconfig = dir.join("kubeconfig");
-
-                    // Deploy from r8s.toml
-                    helm::check_helm()?;
-                    let default_ns = cfg
-                        .cluster
-                        .as_ref()
-                        .and_then(|c| c.namespace.as_deref())
-                        .unwrap_or("default");
-
-                    for dep in &cfg.dependencies {
-                        println!("Applying dependency '{}'...", dep.name);
-                        helm::install_release(dep, &kubeconfig, base_dir, default_ns)?;
-                    }
-
-                    if let Some(app) = &cfg.app {
-                        println!("Applying app '{}'...", app.name);
-                        helm::install_release(app, &kubeconfig, base_dir, default_ns)?;
-                    }
-
-                    println!("Environment ready.");
-                    println!("export KUBECONFIG={}", kubeconfig.display());
-                }
-
-                EnvCmd::Down => {
-                    check_root()?;
-                    let name = resolve_name(None)?;
-                    let dir = cluster_dir(&name);
-
-                    let pid = match read_pid(&dir) {
-                        Some(pid) if is_running(pid) => pid,
-                        _ => {
-                            println!("Environment '{name}' is not running.");
-                            return Ok(());
-                        }
-                    };
-
-                    let ret = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
-                    if ret != 0 {
-                        anyhow::bail!("failed to send SIGTERM to pid {pid}");
-                    }
-
-                    for _ in 0..100 {
-                        if !is_running(pid) {
-                            break;
-                        }
-                        std::thread::sleep(std::time::Duration::from_millis(100));
-                    }
-
-                    if is_running(pid) {
-                        eprintln!("warning: r8sd (pid {pid}) did not exit, sending SIGKILL");
-                        let _ = unsafe { libc::kill(pid as i32, libc::SIGKILL) };
-                    }
-
-                    let _ = std::fs::remove_file(pid_file(&dir));
-                    println!("Environment '{name}' stopped. State preserved.");
-                }
-
-                EnvCmd::Nuke { config } => {
-                    check_root()?;
-                    let config_path = std::fs::canonicalize(&config)
-                        .map_err(|e| anyhow::anyhow!("cannot find {}: {e}", config.display()))?;
-                    let cfg = config::load(&config_path)?;
-
-                    let name = cfg
-                        .cluster
-                        .as_ref()
-                        .and_then(|c| c.name.clone())
-                        .unwrap_or_else(|| "default".to_string());
-                    validate_name(&name)?;
-                    let dir = cluster_dir(&name);
-
-                    if !dir.exists() {
-                        println!("Environment '{name}' does not exist.");
-                        return Ok(());
-                    }
-
-                    // Stop if running
-                    if let Some(pid) = read_pid(&dir) {
-                        if is_running(pid) {
-                            unsafe {
-                                libc::kill(pid as i32, libc::SIGTERM);
-                            }
-                            for _ in 0..50 {
-                                if !is_running(pid) {
-                                    break;
-                                }
-                                std::thread::sleep(std::time::Duration::from_millis(100));
-                            }
-                            if is_running(pid) {
-                                let _ = unsafe { libc::kill(pid as i32, libc::SIGKILL) };
-                            }
-                        }
-                    }
-
-                    std::fs::remove_dir_all(&dir)?;
-                    println!("Environment '{name}' nuked.");
-                }
-            }
-        }
+        Cmd::Env { action } => match action {
+            EnvCmd::Up { config } => env_up(config)?,
+            EnvCmd::Down => env_down()?,
+            EnvCmd::Nuke { config } => env_nuke(config)?,
+        },
 
         Cmd::Logs { name, follow } => {
             let name = resolve_name(name)?;
@@ -610,23 +499,8 @@ fn main() -> anyhow::Result<()> {
             if !log_path.exists() {
                 anyhow::bail!("no logs for cluster '{name}'");
             }
-
             if follow {
-                let mut file = std::fs::File::open(&log_path)?;
-                // Seek to end, then tail
-                file.seek(SeekFrom::End(0))?;
-                let mut reader = BufReader::new(file);
-                loop {
-                    let mut line = String::new();
-                    match reader.read_line(&mut line) {
-                        Ok(0) => std::thread::sleep(std::time::Duration::from_millis(100)),
-                        Ok(_) => print!("{line}"),
-                        Err(e) => {
-                            eprintln!("error reading log: {e}");
-                            break;
-                        }
-                    }
-                }
+                tail_follow(&log_path)?;
             } else {
                 print!("{}", std::fs::read_to_string(&log_path)?);
             }
@@ -636,9 +510,89 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn check_root() -> anyhow::Result<()> {
-    if unsafe { libc::getuid() } != 0 {
-        anyhow::bail!("r8s requires root. Run with sudo.");
+fn env_up(config: PathBuf) -> anyhow::Result<()> {
+    check_root()?;
+    let config_path = std::fs::canonicalize(&config)
+        .map_err(|e| anyhow::anyhow!("cannot find {}: {e}", config.display()))?;
+    let project_dir = config_path.parent().unwrap();
+    let cfg = config::load(&config_path)?;
+
+    let name = cfg
+        .cluster
+        .as_ref()
+        .and_then(|c| c.name.clone())
+        .unwrap_or_else(|| "default".to_string());
+    validate_name(&name)?;
+    let dir = cluster_dir(&name);
+
+    if !dir.exists() {
+        create_cluster_dir(&dir)?;
+        println!("Cluster '{name}' created.");
     }
+
+    if !daemon_running(&dir) {
+        spawn_daemon(&dir, &name)?;
+    } else {
+        println!("Cluster '{name}' already running.");
+    }
+
+    let kubeconfig = dir.join("kubeconfig");
+    helm::check_helm()?;
+
+    let default_ns = cfg
+        .cluster
+        .as_ref()
+        .and_then(|c| c.namespace.as_deref())
+        .unwrap_or("default");
+
+    for dep in &cfg.dependencies {
+        println!("Applying dependency '{}'...", dep.name);
+        helm::install_release(dep, &kubeconfig, project_dir, default_ns)?;
+    }
+    if let Some(app) = &cfg.app {
+        println!("Applying app '{}'...", app.name);
+        helm::install_release(app, &kubeconfig, project_dir, default_ns)?;
+    }
+
+    println!("Environment ready.");
+    println!("export KUBECONFIG={}", kubeconfig.display());
+    Ok(())
+}
+
+fn env_down() -> anyhow::Result<()> {
+    check_root()?;
+    let name = resolve_name(None)?;
+    let dir = cluster_dir(&name);
+    if !stop_daemon(&dir)? {
+        println!("Environment '{name}' is not running.");
+        return Ok(());
+    }
+    println!("Environment '{name}' stopped. State preserved.");
+    Ok(())
+}
+
+fn env_nuke(config: PathBuf) -> anyhow::Result<()> {
+    check_root()?;
+    let config_path = std::fs::canonicalize(&config)
+        .map_err(|e| anyhow::anyhow!("cannot find {}: {e}", config.display()))?;
+    let cfg = config::load(&config_path)?;
+
+    let name = cfg
+        .cluster
+        .as_ref()
+        .and_then(|c| c.name.clone())
+        .unwrap_or_else(|| "default".to_string());
+    validate_name(&name)?;
+    let dir = cluster_dir(&name);
+
+    if !dir.exists() {
+        println!("Environment '{name}' does not exist.");
+        return Ok(());
+    }
+
+    stop_daemon(&dir)?;
+    cleanup_containerd();
+    std::fs::remove_dir_all(&dir)?;
+    println!("Environment '{name}' nuked.");
     Ok(())
 }

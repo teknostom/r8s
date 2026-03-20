@@ -60,17 +60,13 @@ pub fn status_error(status: StatusCode, reason: &str, message: &str) -> Response
 }
 
 pub fn store_error_response(err: &StoreError) -> Response {
-    let (code, reason) = match err {
-        StoreError::AlreadyExists { .. } => (409, "AlreadyExists"),
-        StoreError::NotFound { .. } => (404, "NotFound"),
-        StoreError::Conflict { .. } => (409, "Conflict"),
-        StoreError::Internal(..) => (500, "InternalError"),
+    let (status, reason) = match err {
+        StoreError::AlreadyExists { .. } => (StatusCode::CONFLICT, "AlreadyExists"),
+        StoreError::NotFound { .. } => (StatusCode::NOT_FOUND, "NotFound"),
+        StoreError::Conflict { .. } => (StatusCode::CONFLICT, "Conflict"),
+        StoreError::Internal(..) => (StatusCode::INTERNAL_SERVER_ERROR, "InternalError"),
     };
-    status_error(
-        StatusCode::from_u16(code).unwrap(),
-        reason,
-        &err.to_string(),
-    )
+    status_error(status, reason, &err.to_string())
 }
 
 pub fn anyhow_error_response(err: anyhow::Error) -> Response {

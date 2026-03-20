@@ -5,7 +5,6 @@ use tokio_util::sync::CancellationToken;
 
 use crate::is_owned_by;
 
-/// Minimal deserializable wrapper -- we only need metadata for GC.
 #[derive(serde::Deserialize)]
 struct MetadataOnly {
     metadata: ObjectMeta,
@@ -140,7 +139,6 @@ pub async fn run(store: Store, shutdown: CancellationToken) -> anyhow::Result<()
     }
 }
 
-/// Full reconciliation after lag -- find children whose owners no longer exist.
 fn gc_orphans(store: &Store, owner_gvr: &GroupVersionResource, child_gvr: &GroupVersionResource) {
     let owners = match store.list_as::<MetadataOnly>(owner_gvr, None) {
         Ok(r) => r,
@@ -149,10 +147,8 @@ fn gc_orphans(store: &Store, owner_gvr: &GroupVersionResource, child_gvr: &Group
             return;
         }
     };
-    let owner_uids: std::collections::HashSet<String> = owners
-        .into_iter()
-        .filter_map(|m| m.metadata.uid)
-        .collect();
+    let owner_uids: rustc_hash::FxHashSet<String> =
+        owners.into_iter().filter_map(|m| m.metadata.uid).collect();
 
     let children = match store.list_as::<MetadataOnly>(child_gvr, None) {
         Ok(r) => r,

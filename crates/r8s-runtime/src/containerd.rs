@@ -7,8 +7,8 @@ use containerd_client::{
         content_client::ContentClient,
         images_client::ImagesClient,
         snapshots::{
-            MountsRequest, PrepareSnapshotRequest, RemoveSnapshotRequest,
-            StatSnapshotRequest, snapshots_client::SnapshotsClient,
+            MountsRequest, PrepareSnapshotRequest, RemoveSnapshotRequest, StatSnapshotRequest,
+            snapshots_client::SnapshotsClient,
         },
         tasks_client::TasksClient,
         transfer_client::TransferClient,
@@ -21,7 +21,7 @@ use containerd_client::{
 };
 use oci_spec::runtime::{
     Capability, LinuxBuilder, LinuxCapabilitiesBuilder, LinuxNamespaceBuilder, LinuxNamespaceType,
-    MountBuilder, ProcessBuilder, RootBuilder, SpecBuilder, get_default_mounts,
+    Mount as OciMount, MountBuilder, ProcessBuilder, RootBuilder, SpecBuilder, get_default_mounts,
 };
 use sha2::{Digest, Sha256};
 
@@ -41,8 +41,6 @@ impl ContainerdRuntime {
         })
     }
 
-    /// Remove any stale task, container, and snapshot for a given name.
-    /// All errors are ignored — the resources may not exist.
     async fn cleanup_stale(&self, name: &str) {
         let mut tasks = TasksClient::new(self.channel.clone());
         let kill = KillRequest {
@@ -71,12 +69,7 @@ impl ContainerdRuntime {
             .await;
     }
 
-    /// Read the image config from containerd's content store.
-    ///
-    /// Returns the chain ID (for snapshot parent) and the image defaults
-    /// (entrypoint, cmd, env, working dir).
     async fn image_info(&self, image_ref: &str) -> anyhow::Result<ImageInfo> {
-        // 1. Get image metadata to find the target descriptor
         let req = GetImageRequest {
             name: image_ref.to_string(),
         };
@@ -91,7 +84,7 @@ impl ContainerdRuntime {
             .target
             .ok_or_else(|| anyhow::anyhow!("image has no target descriptor"))?;
 
-        // 2. If it's a manifest index (multi-arch), resolve to platform-specific manifest
+        // Resolve multi-arch manifest index to the platform-specific manifest
         let manifest_digest =
             if target.media_type.contains("index") || target.media_type.contains("manifest.list") {
                 let index_bytes = self.read_content(&target.digest).await?;
@@ -112,14 +105,12 @@ impl ContainerdRuntime {
                 target.digest
             };
 
-        // 3. Read manifest to get config digest
         let manifest_bytes = self.read_content(&manifest_digest).await?;
         let manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes)?;
         let config_digest = manifest["config"]["digest"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("manifest has no config digest"))?;
 
-        // 4. Read config to get rootfs.diff_ids and image defaults
         let config_bytes = self.read_content(config_digest).await?;
         let config: serde_json::Value = serde_json::from_slice(&config_bytes)?;
 
@@ -131,27 +122,20 @@ impl ContainerdRuntime {
             .collect();
 
         let chain_id = compute_chain_id(&diff_ids)?;
-
-        // Extract image defaults from config.config (ENTRYPOINT, CMD, ENV, WorkingDir)
         let img_config = &config["config"];
-        let entrypoint = json_string_array(&img_config["Entrypoint"]);
-        let cmd = json_string_array(&img_config["Cmd"]);
-        let env = json_string_array(&img_config["Env"]);
-        let working_dir = img_config["WorkingDir"]
-            .as_str()
-            .filter(|s| !s.is_empty())
-            .map(String::from);
 
         Ok(ImageInfo {
             chain_id,
-            entrypoint,
-            cmd,
-            env,
-            working_dir,
+            entrypoint: json_string_array(&img_config["Entrypoint"]),
+            cmd: json_string_array(&img_config["Cmd"]),
+            env: json_string_array(&img_config["Env"]),
+            working_dir: img_config["WorkingDir"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .map(String::from),
         })
     }
 
-    /// Read a blob from containerd's content store by digest.
     async fn read_content(&self, digest: &str) -> anyhow::Result<Vec<u8>> {
         let req = ReadContentRequest {
             digest: digest.to_string(),
@@ -216,10 +200,8 @@ fn current_oci_arch() -> &'static str {
     }
 }
 
-/// Compute the chain ID of the topmost layer from diff_ids.
-///
-/// chain_id\[0\] = diff_id\[0\]
-/// chain_id\[i\] = "sha256:" + hex(sha256(chain_id\[i-1\] + " " + diff_id\[i\]))
+/// chain_id[0] = diff_id[0]
+/// chain_id[i] = sha256(chain_id[i-1] + " " + diff_id[i])
 fn compute_chain_id(diff_ids: &[String]) -> anyhow::Result<String> {
     let mut chain_id = diff_ids
         .first()
@@ -235,25 +217,96 @@ fn compute_chain_id(diff_ids: &[String]) -> anyhow::Result<String> {
     Ok(chain_id)
 }
 
-#[allow(clippy::disallowed_types)] // oci_spec::Capabilities requires std HashSet
+fn build_container_mounts(
+    config: &ContainerConfig,
+    data_dir: &std::path::Path,
+) -> anyhow::Result<Vec<OciMount>> {
+    let mut mounts = get_default_mounts();
+    let pod_name = config
+        .name
+        .rsplit_once('_')
+        .map(|(p, _)| p)
+        .unwrap_or(&config.name);
+
+    let resolv_dir = data_dir.join("resolv");
+    std::fs::create_dir_all(&resolv_dir)?;
+    let resolv_path = resolv_dir.join(format!("{}.conf", config.name));
+    std::fs::write(
+        &resolv_path,
+        format!(
+            "nameserver 10.244.0.1\nsearch {ns}.svc.cluster.local svc.cluster.local cluster.local\noptions ndots:5\n",
+            ns = config.namespace,
+        ),
+    )?;
+    mounts.push(
+        MountBuilder::default()
+            .destination("/etc/resolv.conf")
+            .source(resolv_path)
+            .typ("bind")
+            .options(vec!["rbind".into(), "ro".into()])
+            .build()?,
+    );
+
+    // /etc/hosts maps the pod hostname to localhost for InetAddress.getLocalHost() compatibility
+    let hosts_dir = data_dir.join("hosts");
+    std::fs::create_dir_all(&hosts_dir)?;
+    let hosts_path = hosts_dir.join(format!("{}.hosts", config.name));
+    std::fs::write(
+        &hosts_path,
+        format!("127.0.0.1\tlocalhost\n::1\tlocalhost\n127.0.0.1\t{pod_name}\n"),
+    )?;
+    mounts.push(
+        MountBuilder::default()
+            .destination("/etc/hosts")
+            .source(hosts_path)
+            .typ("bind")
+            .options(vec!["rbind".into(), "ro".into()])
+            .build()?,
+    );
+
+    mounts.push(
+        MountBuilder::default()
+            .destination("/var/run/secrets/kubernetes.io/serviceaccount")
+            .source(data_dir.join("serviceaccount"))
+            .typ("bind")
+            .options(vec!["rbind".into(), "ro".into()])
+            .build()?,
+    );
+
+    for m in &config.mounts {
+        mounts.push(
+            MountBuilder::default()
+                .destination(&m.container_path)
+                .source(&m.host_path)
+                .typ("bind")
+                .options(if m.readonly {
+                    vec!["rbind".into(), "ro".into()]
+                } else {
+                    vec!["rbind".into(), "rw".into()]
+                })
+                .build()?,
+        );
+    }
+
+    Ok(mounts)
+}
+
+#[allow(clippy::disallowed_types)] // oci_spec Capabilities requires std HashSet
 fn build_oci_spec(
     config: &ContainerConfig,
     image: &ImageInfo,
     data_dir: &std::path::Path,
 ) -> anyhow::Result<Vec<u8>> {
-    // K8s semantics: pod command overrides ENTRYPOINT, pod args overrides CMD.
-    // If neither is set, use image defaults.
+    // K8s semantics: command overrides ENTRYPOINT, args overrides CMD
     let args = if !config.command.is_empty() {
         let mut args = config.command.clone();
         args.extend(config.args.iter().cloned());
         args
     } else if !config.args.is_empty() {
-        // Pod args only: use image entrypoint + pod args
         let mut args = image.entrypoint.clone();
         args.extend(config.args.iter().cloned());
         args
     } else {
-        // Neither set: use image entrypoint + image cmd
         let mut args = image.entrypoint.clone();
         args.extend(image.cmd.iter().cloned());
         if args.is_empty() {
@@ -263,7 +316,6 @@ fn build_oci_spec(
         }
     };
 
-    // Start with image env, then layer pod env on top
     let env: Vec<String> = image
         .env
         .iter()
@@ -277,7 +329,7 @@ fn build_oci_spec(
         .or(image.working_dir.as_deref())
         .unwrap_or("/");
 
-    // Default capabilities matching Docker defaults
+    // Docker-default capabilities
     let default_caps = [
         Capability::AuditWrite,
         Capability::Chown,
@@ -303,7 +355,15 @@ fn build_oci_spec(
         .inheritable(default_caps)
         .build()?;
 
+    let hostname = config
+        .name
+        .rsplit_once('_')
+        .map(|(p, _)| p)
+        .unwrap_or(&config.name);
+    let mounts = build_container_mounts(config, data_dir)?;
+
     let spec = SpecBuilder::default()
+        .hostname(hostname)
         .root(
             RootBuilder::default()
                 .path("rootfs")
@@ -319,53 +379,7 @@ fn build_oci_spec(
                 .capabilities(capabilities)
                 .build()?,
         )
-        .mounts({
-            let mut mounts = get_default_mounts();
-
-            // Generate per-container resolv.conf with the pod's namespace in the search path
-            let resolv_dir = data_dir.join("resolv");
-            std::fs::create_dir_all(&resolv_dir)?;
-            let resolv_path = resolv_dir.join(format!("{}.conf", config.name));
-            std::fs::write(
-                &resolv_path,
-                format!(
-                    "nameserver 10.244.0.1\nsearch {ns}.svc.cluster.local svc.cluster.local cluster.local\noptions ndots:5\n",
-                    ns = config.namespace,
-                ),
-            )?;
-
-            mounts.push(
-                MountBuilder::default()
-                    .destination("/etc/resolv.conf")
-                    .source(resolv_path)
-                    .typ("bind")
-                    .options(vec!["rbind".into(), "ro".into()])
-                    .build()?,
-            );
-            mounts.push(
-                MountBuilder::default()
-                    .destination("/var/run/secrets/kubernetes.io/serviceaccount")
-                    .source(data_dir.join("serviceaccount"))
-                    .typ("bind")
-                    .options(vec!["rbind".into(), "ro".into()])
-                    .build()?,
-            );
-            for m in &config.mounts {
-                mounts.push(
-                    MountBuilder::default()
-                        .destination(&m.container_path)
-                        .source(&m.host_path)
-                        .typ("bind")
-                        .options(if m.readonly {
-                            vec!["rbind".into(), "ro".into()]
-                        } else {
-                            vec!["rbind".into(), "rw".into()]
-                        })
-                        .build()?,
-                );
-            }
-            mounts
-        })
+        .mounts(mounts)
         .linux(
             LinuxBuilder::default()
                 .namespaces(vec![
@@ -396,7 +410,20 @@ fn build_oci_spec(
 }
 
 impl ContainerRuntime for ContainerdRuntime {
-    async fn pull_image(&self, image: &str, auth: Option<&RegistryAuth>) -> anyhow::Result<ImageId> {
+    async fn has_image(&self, image: &str) -> bool {
+        let full_ref = normalize_image_ref(image);
+        let req = GetImageRequest { name: full_ref };
+        ImagesClient::new(self.channel.clone())
+            .get(with_namespace!(req, NAMESPACE))
+            .await
+            .is_ok()
+    }
+
+    async fn pull_image(
+        &self,
+        image: &str,
+        auth: Option<&RegistryAuth>,
+    ) -> anyhow::Result<ImageId> {
         let full_image_ref = normalize_image_ref(image);
         let resolver = auth.map(|a| {
             use base64::Engine;
@@ -441,14 +468,10 @@ impl ContainerRuntime for ContainerdRuntime {
 
     async fn create_container(&self, config: &ContainerConfig) -> anyhow::Result<ContainerId> {
         let image_ref = normalize_image_ref(&config.image);
-
-        // Read image config to get chain ID and default command/env
         let image_info = self.image_info(&image_ref).await?;
-
-        // Clean up any stale state from a previous run (task → container → snapshot)
         self.cleanup_stale(&config.name).await;
 
-        // Wait for image snapshot to be ready (unpack may still be in progress)
+        // Wait for image unpack to complete
         let snapshot_key = config.name.clone();
         let mut snapshots = SnapshotsClient::new(self.channel.clone());
         for i in 0..50 {
@@ -470,25 +493,20 @@ impl ContainerRuntime for ContainerdRuntime {
             }
         }
 
-        // Prepare a writable snapshot for this container
         let req = PrepareSnapshotRequest {
             snapshotter: SNAPSHOTTER.to_string(),
             key: snapshot_key.clone(),
             parent: image_info.chain_id.clone(),
             labels: Default::default(),
         };
-        snapshots
-            .prepare(with_namespace!(req, NAMESPACE))
-            .await?;
+        snapshots.prepare(with_namespace!(req, NAMESPACE)).await?;
 
-        // Build OCI runtime spec and wrap in protobuf Any
         let spec_json = build_oci_spec(config, &image_info, &self.data_dir)?;
         let spec = prost_types::Any {
             type_url: "types.containerd.io/opencontainers/runtime-spec/1/Spec".to_string(),
             value: spec_json,
         };
 
-        // Create container metadata in containerd
         let container = Container {
             id: config.name.clone(),
             image: image_ref,
@@ -513,17 +531,27 @@ impl ContainerRuntime for ContainerdRuntime {
     }
 
     async fn start_container(&self, id: &ContainerId) -> anyhow::Result<()> {
-        // Get rootfs mounts from the prepared snapshot
-        let req = MountsRequest {
-            snapshotter: SNAPSHOTTER.to_string(),
-            key: id.0.clone(),
-        };
-        let resp = SnapshotsClient::new(self.channel.clone())
-            .mounts(with_namespace!(req, NAMESPACE))
-            .await?;
-        let mounts = resp.into_inner().mounts;
+        let mut snapshots = SnapshotsClient::new(self.channel.clone());
+        let mut mounts = Vec::new();
+        for i in 0..50 {
+            let req = MountsRequest {
+                snapshotter: SNAPSHOTTER.to_string(),
+                key: id.0.clone(),
+            };
+            match snapshots.mounts(with_namespace!(req, NAMESPACE)).await {
+                Ok(resp) => {
+                    mounts = resp.into_inner().mounts;
+                    break;
+                }
+                Err(_) if i < 49 => {
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                }
+                Err(e) => {
+                    anyhow::bail!("snapshot '{}' not found after 10s: {e}", id.0);
+                }
+            }
+        }
 
-        // Set up log files for stdout/stderr (must exist before task creation)
         let log_dir = self.data_dir.join("logs");
         std::fs::create_dir_all(&log_dir)?;
         let stdout_path = log_dir.join(format!("{}.stdout", id.0));
@@ -531,7 +559,6 @@ impl ContainerRuntime for ContainerdRuntime {
         std::fs::File::create(&stdout_path)?;
         std::fs::File::create(&stderr_path)?;
 
-        // Create task (prepare the runtime shim + rootfs)
         let req = CreateTaskRequest {
             container_id: id.0.clone(),
             rootfs: mounts,
@@ -543,7 +570,6 @@ impl ContainerRuntime for ContainerdRuntime {
             .create(with_namespace!(req, NAMESPACE))
             .await?;
 
-        // Start task (exec the container process)
         let req = StartRequest {
             container_id: id.0.clone(),
             ..Default::default()
@@ -563,37 +589,33 @@ impl ContainerRuntime for ContainerdRuntime {
     ) -> anyhow::Result<()> {
         let mut tasks = TasksClient::new(self.channel.clone());
 
-        // Send SIGTERM
         let req = KillRequest {
             container_id: id.0.clone(),
-            signal: 15, // SIGTERM
+            signal: 15,
             all: true,
             ..Default::default()
         };
         if let Err(e) = tasks.kill(with_namespace!(req, NAMESPACE)).await {
-            tracing::debug!(id = id.0, error = %e, "kill SIGTERM failed (task may already be stopped)");
+            tracing::debug!(id = id.0, error = %e, "SIGTERM failed, task may already be stopped");
         }
 
-        // Wait for exit with timeout
         let wait_req = WaitRequest {
             container_id: id.0.clone(),
             ..Default::default()
         };
-        let wait_result =
+        let exited =
             tokio::time::timeout(timeout, tasks.wait(with_namespace!(wait_req, NAMESPACE))).await;
 
-        if wait_result.is_err() {
-            // Timeout — force kill
+        if exited.is_err() {
             tracing::warn!(id = id.0, "container did not stop in time, sending SIGKILL");
             let req = KillRequest {
                 container_id: id.0.clone(),
-                signal: 9, // SIGKILL
+                signal: 9,
                 all: true,
                 ..Default::default()
             };
             let _ = tasks.kill(with_namespace!(req, NAMESPACE)).await;
 
-            // Brief wait for SIGKILL to take effect
             let wait_req = WaitRequest {
                 container_id: id.0.clone(),
                 ..Default::default()
@@ -605,7 +627,6 @@ impl ContainerRuntime for ContainerdRuntime {
             .await;
         }
 
-        // Delete the task
         let req = DeleteTaskRequest {
             container_id: id.0.clone(),
         };
@@ -616,7 +637,6 @@ impl ContainerRuntime for ContainerdRuntime {
     }
 
     async fn remove_container(&self, id: &ContainerId) -> anyhow::Result<()> {
-        // Delete task (ignore errors — may not exist or already deleted)
         let req = DeleteTaskRequest {
             container_id: id.0.clone(),
         };
@@ -624,13 +644,11 @@ impl ContainerRuntime for ContainerdRuntime {
             .delete(with_namespace!(req, NAMESPACE))
             .await;
 
-        // Delete container metadata
         let req = DeleteContainerRequest { id: id.0.clone() };
         let _ = ContainersClient::new(self.channel.clone())
             .delete(with_namespace!(req, NAMESPACE))
             .await;
 
-        // Remove snapshot
         let req = RemoveSnapshotRequest {
             snapshotter: SNAPSHOTTER.to_string(),
             key: id.0.clone(),

@@ -9,10 +9,8 @@ struct RegistryInner {
     by_resource: FxHashMap<String, Arc<ResourceType>>,
 }
 
-/// Thread-safe registry of known resource types.
-///
-/// Uses interior mutability so the CRD controller can register new types
-/// at runtime while the API server reads concurrently.
+/// Interior mutability lets the CRD controller register types at runtime
+/// while the API server reads concurrently.
 #[derive(Clone)]
 pub struct ResourceRegistry {
     inner: Arc<RwLock<RegistryInner>>,
@@ -36,29 +34,29 @@ impl ResourceRegistry {
 
     pub fn register(&self, rt: ResourceType) {
         let rt = Arc::new(rt);
-        let mut inner = self.inner.write().unwrap();
+        let mut inner = self.inner.write().expect("registry lock poisoned");
         inner.by_gvr.insert(rt.gvr.key_prefix(), Arc::clone(&rt));
         inner.by_resource.insert(rt.gvr.resource.clone(), rt);
     }
 
     pub fn unregister(&self, gvr: &GroupVersionResource) {
-        let mut inner = self.inner.write().unwrap();
+        let mut inner = self.inner.write().expect("registry lock poisoned");
         inner.by_gvr.remove(&gvr.key_prefix());
         inner.by_resource.remove(&gvr.resource);
     }
 
     pub fn get_by_gvr(&self, gvr: &GroupVersionResource) -> Option<Arc<ResourceType>> {
-        let inner = self.inner.read().unwrap();
+        let inner = self.inner.read().expect("registry lock poisoned");
         inner.by_gvr.get(&gvr.key_prefix()).cloned()
     }
 
     pub fn get_by_resource(&self, resource: &str) -> Option<Arc<ResourceType>> {
-        let inner = self.inner.read().unwrap();
+        let inner = self.inner.read().expect("registry lock poisoned");
         inner.by_resource.get(resource).cloned()
     }
 
     pub fn iter(&self) -> Vec<Arc<ResourceType>> {
-        let inner = self.inner.read().unwrap();
+        let inner = self.inner.read().expect("registry lock poisoned");
         inner.by_gvr.values().cloned().collect()
     }
 
@@ -67,7 +65,7 @@ impl ResourceRegistry {
         group: &str,
         version: &str,
     ) -> Vec<Arc<ResourceType>> {
-        let inner = self.inner.read().unwrap();
+        let inner = self.inner.read().expect("registry lock poisoned");
         inner
             .by_gvr
             .values()
@@ -76,126 +74,164 @@ impl ResourceRegistry {
             .collect()
     }
 
+    #[allow(clippy::type_complexity)]
     pub fn default_mvp() -> Self {
         let r = Self::new();
 
-        // Core/v1
-        for (resource, kind, namespaced, singular, short) in [
-            ("pods", "Pod", true, "pod", vec!["po"]),
-            ("namespaces", "Namespace", false, "namespace", vec!["ns"]),
-            ("configmaps", "ConfigMap", true, "configmap", vec!["cm"]),
-            ("secrets", "Secret", true, "secret", vec![]),
-            ("services", "Service", true, "service", vec!["svc"]),
+        let types: &[(&str, &str, &str, &str, bool, &str, &[&str])] = &[
+            ("", "v1", "pods", "Pod", true, "pod", &["po"]),
             (
+                "",
+                "v1",
+                "namespaces",
+                "Namespace",
+                false,
+                "namespace",
+                &["ns"],
+            ),
+            (
+                "",
+                "v1",
+                "configmaps",
+                "ConfigMap",
+                true,
+                "configmap",
+                &["cm"],
+            ),
+            ("", "v1", "secrets", "Secret", true, "secret", &[]),
+            ("", "v1", "services", "Service", true, "service", &["svc"]),
+            (
+                "",
+                "v1",
                 "serviceaccounts",
                 "ServiceAccount",
                 true,
                 "serviceaccount",
-                vec!["sa"],
+                &["sa"],
             ),
-            ("endpoints", "Endpoints", true, "endpoints", vec!["ep"]),
-            ("nodes", "Node", false, "node", vec!["no"]),
-            ("events", "Event", true, "event", vec!["ev"]),
-        ] {
-            r.register(ResourceType {
-                gvr: GroupVersionResource::new("", "v1", resource),
-                kind: kind.to_string(),
-                namespaced,
-                singular: singular.to_string(),
-                short_names: short.into_iter().map(String::from).collect(),
-                subresources: vec![],
-            });
-        }
-
-        // Apps/v1
-        for (resource, kind, singular, short) in [
-            ("deployments", "Deployment", "deployment", vec!["deploy"]),
-            ("replicasets", "ReplicaSet", "replicaset", vec!["rs"]),
-            ("statefulsets", "StatefulSet", "statefulset", vec!["sts"]),
-            ("daemonsets", "DaemonSet", "daemonset", vec!["ds"]),
-        ] {
-            r.register(ResourceType {
-                gvr: GroupVersionResource::new("apps", "v1", resource),
-                kind: kind.to_string(),
-                namespaced: true,
-                singular: singular.to_string(),
-                short_names: short.into_iter().map(String::from).collect(),
-                subresources: vec![],
-            });
-        }
-
-        r.register(ResourceType {
-            gvr: GroupVersionResource::new("networking.k8s.io", "v1", "ingresses"),
-            kind: "Ingress".to_string(),
-            namespaced: true,
-            short_names: vec!["ing".to_string()],
-            singular: "ingress".to_string(),
-            subresources: vec![],
-        });
-        r.register(ResourceType {
-            gvr: GroupVersionResource::new("networking.k8s.io", "v1", "ingressclasses"),
-            kind: "IngressClass".to_string(),
-            namespaced: false,
-            short_names: vec![],
-            singular: "ingressclass".to_string(),
-            subresources: vec![],
-        });
-        r.register(ResourceType {
-            gvr: GroupVersionResource::new("discovery.k8s.io", "v1", "endpointslices"),
-            kind: "EndpointSlice".to_string(),
-            namespaced: true,
-            short_names: vec![],
-            singular: "endpointslice".to_string(),
-            subresources: vec![],
-        });
-
-        // policy/v1
-        r.register(ResourceType {
-            gvr: GroupVersionResource::new("policy", "v1", "poddisruptionbudgets"),
-            kind: "PodDisruptionBudget".to_string(),
-            namespaced: true,
-            singular: "poddisruptionbudget".to_string(),
-            short_names: vec!["pdb".to_string()],
-            subresources: vec![],
-        });
-
-        // Batch/v1
-        for (resource, kind, singular, short) in [
-            ("jobs", "Job", "job", vec![]),
-            ("cronjobs", "CronJob", "cronjob", vec!["cj"]),
-        ] {
-            r.register(ResourceType {
-                gvr: GroupVersionResource::new("batch", "v1", resource),
-                kind: kind.to_string(),
-                namespaced: true,
-                singular: singular.to_string(),
-                short_names: short.into_iter().map(String::from).collect(),
-                subresources: vec![],
-            });
-        }
-
-        // autoscaling/v2
-        r.register(ResourceType {
-            gvr: GroupVersionResource::new("autoscaling", "v2", "horizontalpodautoscalers"),
-            kind: "HorizontalPodAutoscaler".to_string(),
-            namespaced: true,
-            singular: "horizontalpodautoscaler".to_string(),
-            short_names: vec!["hpa".to_string()],
-            subresources: vec![],
-        });
-
-        r.register(ResourceType {
-            gvr: GroupVersionResource::new(
+            (
+                "",
+                "v1",
+                "endpoints",
+                "Endpoints",
+                true,
+                "endpoints",
+                &["ep"],
+            ),
+            ("", "v1", "nodes", "Node", false, "node", &["no"]),
+            ("", "v1", "events", "Event", true, "event", &["ev"]),
+            (
+                "apps",
+                "v1",
+                "deployments",
+                "Deployment",
+                true,
+                "deployment",
+                &["deploy"],
+            ),
+            (
+                "apps",
+                "v1",
+                "replicasets",
+                "ReplicaSet",
+                true,
+                "replicaset",
+                &["rs"],
+            ),
+            (
+                "apps",
+                "v1",
+                "statefulsets",
+                "StatefulSet",
+                true,
+                "statefulset",
+                &["sts"],
+            ),
+            (
+                "apps",
+                "v1",
+                "daemonsets",
+                "DaemonSet",
+                true,
+                "daemonset",
+                &["ds"],
+            ),
+            (
+                "networking.k8s.io",
+                "v1",
+                "ingresses",
+                "Ingress",
+                true,
+                "ingress",
+                &["ing"],
+            ),
+            (
+                "networking.k8s.io",
+                "v1",
+                "ingressclasses",
+                "IngressClass",
+                false,
+                "ingressclass",
+                &[],
+            ),
+            (
+                "discovery.k8s.io",
+                "v1",
+                "endpointslices",
+                "EndpointSlice",
+                true,
+                "endpointslice",
+                &[],
+            ),
+            (
+                "policy",
+                "v1",
+                "poddisruptionbudgets",
+                "PodDisruptionBudget",
+                true,
+                "poddisruptionbudget",
+                &["pdb"],
+            ),
+            ("batch", "v1", "jobs", "Job", true, "job", &[]),
+            (
+                "batch",
+                "v1",
+                "cronjobs",
+                "CronJob",
+                true,
+                "cronjob",
+                &["cj"],
+            ),
+            (
+                "autoscaling",
+                "v2",
+                "horizontalpodautoscalers",
+                "HorizontalPodAutoscaler",
+                true,
+                "horizontalpodautoscaler",
+                &["hpa"],
+            ),
+            (
                 "apiextensions.k8s.io",
                 "v1",
                 "customresourcedefinitions",
+                "CustomResourceDefinition",
+                false,
+                "customresourcedefinition",
+                &["crd", "crds"],
             ),
-            kind: "CustomResourceDefinition".to_string(),
-            namespaced: false,
-            singular: "customresourcedefinition".to_string(),
-            short_names: vec!["crd".to_string(), "crds".to_string()],
-            subresources: vec![],
-        });
+        ];
+
+        for &(group, version, resource, kind, namespaced, singular, short_names) in types {
+            r.register(ResourceType {
+                gvr: GroupVersionResource::new(group, version, resource),
+                kind: kind.to_string(),
+                namespaced,
+                singular: singular.to_string(),
+                short_names: short_names.iter().map(|s| s.to_string()).collect(),
+                subresources: vec![],
+            });
+        }
 
         r
     }

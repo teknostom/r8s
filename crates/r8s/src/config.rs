@@ -58,7 +58,7 @@ fn validate(config: &Config, config_path: &Path) -> anyhow::Result<()> {
     }
 
     // Check for duplicate dependency names
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = rustc_hash::FxHashSet::default();
     for name in &names {
         if !seen.insert(name) {
             anyhow::bail!("duplicate dependency name '{name}'");
@@ -115,7 +115,10 @@ chart = "./charts/myapp"
 values = []
 "#;
         let config: Config = toml::from_str(toml).unwrap();
-        assert_eq!(config.cluster.as_ref().unwrap().name.as_deref(), Some("myproject"));
+        assert_eq!(
+            config.cluster.as_ref().unwrap().name.as_deref(),
+            Some("myproject")
+        );
         assert_eq!(config.dependencies.len(), 2);
         assert_eq!(config.dependencies[0].name, "postgresql");
         assert_eq!(config.dependencies[0].version.as_deref(), Some("16.0.0"));

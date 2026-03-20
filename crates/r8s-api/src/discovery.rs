@@ -17,14 +17,15 @@ pub struct ApiState {
     pub store: Store,
     pub registry: ResourceRegistry,
     pub data_dir: std::path::PathBuf,
-    /// Counter for allocating ClusterIPs in the 10.96.0.0/16 range.
-    /// Starts at 2 (10.96.0.1 is reserved for the kubernetes service).
+    /// Starts at 2 because 10.96.0.1 is reserved for the kubernetes service.
     pub next_cluster_ip: AtomicU32,
 }
 
 impl ApiState {
     pub fn allocate_cluster_ip(&self) -> String {
-        let n = self.next_cluster_ip.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let n = self
+            .next_cluster_ip
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let b3 = (n >> 8) as u8;
         let b4 = n as u8;
         format!("10.96.{b3}.{b4}")

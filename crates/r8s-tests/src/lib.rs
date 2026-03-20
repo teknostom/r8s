@@ -84,7 +84,6 @@ impl TestCluster {
         }
     }
 
-    /// Shut down the cluster cleanly.
     pub async fn shutdown(self) {
         self.shutdown.cancel();
         for handle in self._handles {
@@ -109,11 +108,15 @@ where
 {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
-        let resource_ref = ResourceRef { gvr, namespace: ns, name };
-        if let Ok(Some(val)) = store.get(&resource_ref) {
-            if condition(&val) {
-                return true;
-            }
+        let resource_ref = ResourceRef {
+            gvr,
+            namespace: ns,
+            name,
+        };
+        if let Ok(Some(val)) = store.get(&resource_ref)
+            && condition(&val)
+        {
+            return true;
         }
         if tokio::time::Instant::now() > deadline {
             return false;
@@ -184,7 +187,6 @@ where
     }
 }
 
-/// Wait until zero resources match a filter.
 pub async fn wait_for_zero<F>(
     store: &Store,
     gvr: &GroupVersionResource,

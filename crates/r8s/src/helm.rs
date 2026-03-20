@@ -18,17 +18,13 @@ pub fn check_helm() -> anyhow::Result<()> {
     }
 }
 
-/// Render chart via `helm template`, then apply with `kubectl apply --validate=false`.
 pub fn install_release(
     release: &Release,
     kubeconfig: &Path,
     base_dir: &Path,
     default_namespace: &str,
 ) -> anyhow::Result<()> {
-    let ns = release
-        .namespace
-        .as_deref()
-        .unwrap_or(default_namespace);
+    let ns = release.namespace.as_deref().unwrap_or(default_namespace);
 
     // helm template to render manifests
     let mut cmd = Command::new("helm");

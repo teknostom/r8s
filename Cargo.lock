@@ -1226,6 +1226,7 @@ dependencies = [
  "clap",
  "libc",
  "r8s-store",
+ "rustc-hash",
  "serde",
  "toml",
 ]
@@ -1378,7 +1379,6 @@ dependencies = [
  "k8s-openapi",
  "rustc-hash",
  "serde",
- "serde_json",
 ]
 
 [[package]]

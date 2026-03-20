@@ -31,7 +31,6 @@ pub struct LabelSelector {
 }
 
 impl LabelSelector {
-    /// Check if an object's labels satisfy all requirements.
     pub fn matches(&self, object: &serde_json::Value) -> bool {
         let labels = object["metadata"]["labels"].as_object();
         self.requirements.iter().all(|req| match req {
@@ -116,19 +115,8 @@ fn extract_field(obj: &serde_json::Value, path: &str) -> Option<String> {
 }
 
 impl LabelIndex {
-    pub fn new() -> Self {
-        Self {
-            index: Arc::new(Mutex::new(FxHashMap::default())),
-        }
-    }
-
-    pub fn update(
-        &self,
-        gvr_prefix: &str,
-        resource_key: &str,
-        labels: &BTreeMap<String, String>,
-    ) {
-        let mut map = self.index.lock().expect("Failed to lock index. FATAL");
+    pub fn update(&self, gvr_prefix: &str, resource_key: &str, labels: &BTreeMap<String, String>) {
+        let mut map = self.index.lock().expect("label index lock poisoned");
         let inner = map.entry(gvr_prefix.to_string()).or_default();
 
         for key_set in inner.values_mut() {
@@ -149,7 +137,7 @@ impl LabelIndex {
     }
 
     pub fn matches(&self, gvr_prefix: &str, selector: &LabelSelector) -> Option<FxHashSet<String>> {
-        let map = self.index.lock().expect("Failed to lock index. FATAL");
+        let map = self.index.lock().expect("label index lock poisoned");
         let inner = map.get(gvr_prefix)?;
 
         let mut result: Option<FxHashSet<String>> = None;
@@ -159,7 +147,7 @@ impl LabelIndex {
                 let label_string = format!("{key}={value}");
                 let matching = inner.get(&label_string).cloned().unwrap_or_default();
                 result = Some(match result {
-                    Some(exisiting) => exisiting.intersection(&matching).cloned().collect(),
+                    Some(existing) => existing.intersection(&matching).cloned().collect(),
                     None => matching,
                 });
             }

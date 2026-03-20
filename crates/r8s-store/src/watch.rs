@@ -4,7 +4,6 @@ use std::sync::{Arc, Mutex};
 use rustc_hash::FxHashMap;
 use tokio::sync::broadcast;
 
-/// Watch event types matching K8s watch semantics.
 #[derive(Debug, Clone)]
 pub enum WatchEventType {
     Added,
@@ -12,7 +11,6 @@ pub enum WatchEventType {
     Deleted,
 }
 
-/// A watch event containing the event type, resource version, and serialized object.
 #[derive(Debug, Clone)]
 pub struct WatchEvent {
     pub event_type: WatchEventType,
@@ -26,17 +24,8 @@ pub struct WatchHub {
 }
 
 impl WatchHub {
-    pub fn new() -> Self {
-        Self {
-            channels: Arc::new(Mutex::new(FxHashMap::default())),
-        }
-    }
-
     pub fn subscribe(&self, gvr_prefix: &str) -> broadcast::Receiver<WatchEvent> {
-        let mut map = self
-            .channels
-            .lock()
-            .expect("Unable to lock channels mutex. FATAL");
+        let mut map = self.channels.lock().expect("watch channels lock poisoned");
         match map.entry(gvr_prefix.to_string()) {
             Occupied(entry) => entry.get().subscribe(),
             Vacant(slot) => {
@@ -48,12 +37,9 @@ impl WatchHub {
     }
 
     pub fn notify(&self, gvr_prefix: &str, event: WatchEvent) {
-        let mut map = self
-            .channels
-            .lock()
-            .expect("Unable to lock channels mutex. FATAL");
+        let mut map = self.channels.lock().expect("watch channels lock poisoned");
         if let Occupied(sender) = map.entry(gvr_prefix.to_string()) {
-            let _ = sender.get().send(event); // Ignore no receivers error
+            let _ = sender.get().send(event);
         }
     }
 }

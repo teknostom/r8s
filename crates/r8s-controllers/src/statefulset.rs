@@ -41,7 +41,7 @@ pub async fn run(store: Store, shutdown: CancellationToken) -> anyhow::Result<()
                             Ok(p) => p,
                             Err(_) => continue,
                         };
-                        if let Some(owner) = pod.metadata.owner_references.as_deref().unwrap_or_default().iter().find(|r| r.kind == "StatefulSet") {
+                        if let Some(owner) = crate::find_owner(&pod.metadata, "StatefulSet") {
                             let resource_ref = ResourceRef {
                                 gvr: &GroupVersionResource::stateful_sets(),
                                 namespace: pod.metadata.namespace.as_deref(),
@@ -113,15 +113,12 @@ fn reconcile_sts(store: &Store, sts_value: &serde_json::Value) -> anyhow::Result
         .filter(|p| is_owned_by(&p.metadata, current_uid))
         .collect();
 
-    // Sort by ordinal so we create/delete in order
-    owned.sort_by_key(|p| pod_ordinal(p));
+    owned.sort_by_key(pod_ordinal);
 
     let current_count = owned.len() as u64;
 
     if current_count < desired {
-        // Find the next ordinal to create
-        let existing_ordinals: std::collections::HashSet<u64> =
-            owned.iter().map(|p| pod_ordinal(p)).collect();
+        let existing_ordinals: rustc_hash::FxHashSet<u64> = owned.iter().map(pod_ordinal).collect();
         let mut created = 0u64;
         let mut ordinal = 0u64;
         while created < desired - current_count {
@@ -131,11 +128,8 @@ fn reconcile_sts(store: &Store, sts_value: &serde_json::Value) -> anyhow::Result
             }
             ordinal += 1;
         }
-        tracing::info!(
-            "sts '{sts_name}': created {created} pods ({current_count} -> {desired})"
-        );
+        tracing::info!("sts '{sts_name}': created {created} pods ({current_count} -> {desired})");
     } else if current_count > desired {
-        // Delete from highest ordinal down
         let to_delete = current_count - desired;
         for pod in owned.iter().rev().take(to_delete as usize) {
             if let Some(pod_name) = pod.metadata.name.as_deref() {
@@ -147,12 +141,9 @@ fn reconcile_sts(store: &Store, sts_value: &serde_json::Value) -> anyhow::Result
                 store.delete(&pod_ref)?;
             }
         }
-        tracing::info!(
-            "sts '{sts_name}': deleted {to_delete} pods ({current_count} -> {desired})"
-        );
+        tracing::info!("sts '{sts_name}': deleted {to_delete} pods ({current_count} -> {desired})");
     }
 
-    // Update status
     let final_owned: Vec<Pod> = store
         .list_as::<Pod>(&pod_gvr, sts_ns)?
         .into_iter()
@@ -248,8 +239,6 @@ fn update_sts_status(
         None => return Ok(()),
     };
 
-    // Skip no-op status updates to avoid hot reconcile loops
-    let old_status = current.get("status");
     let new_status = StatefulSetStatus {
         replicas: total,
         ready_replicas: Some(ready),
@@ -257,7 +246,7 @@ fn update_sts_status(
         ..Default::default()
     };
     let new_status_val = serde_json::to_value(&new_status)?;
-    if old_status == Some(&new_status_val) {
+    if current.get("status") == Some(&new_status_val) {
         return Ok(());
     }
 
@@ -267,7 +256,7 @@ fn update_sts_status(
     match store.update(&resource_ref, &updated) {
         Ok(_) => Ok(()),
         Err(e) => {
-            tracing::debug!("sts status update conflict for '{sts_name}', will retry: {e}");
+            tracing::debug!("sts status update conflict for '{sts_name}': {e}");
             Ok(())
         }
     }

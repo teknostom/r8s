@@ -32,7 +32,6 @@ pub fn bootstrap_namespaces(store: &Store) -> anyhow::Result<()> {
             tracing::info!("bootstrapped namespace '{ns_name}'");
         }
     }
-    // Bootstrap the "kubernetes" service in default namespace
     let svc_gvr = GroupVersionResource::services();
     let svc_ref = ResourceRef {
         gvr: &svc_gvr,
@@ -68,7 +67,6 @@ pub fn bootstrap_namespaces(store: &Store) -> anyhow::Result<()> {
         tracing::info!("bootstrapped 'kubernetes' service");
     }
 
-    // Bootstrap endpoints for the kubernetes service
     let ep_gvr = GroupVersionResource::endpoints();
     let ep_ref = ResourceRef {
         gvr: &ep_gvr,

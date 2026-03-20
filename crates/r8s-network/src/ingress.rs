@@ -1,9 +1,3 @@
-//! Built-in L7 ingress controller.
-//!
-//! Watches Ingress and Endpoints resources in the store, builds a route table,
-//! and runs an HTTP reverse proxy on port 80. Backs off for Ingresses that
-//! specify an `ingressClassName` other than `"r8s"`.
-
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
@@ -62,7 +56,7 @@ fn rebuild_routes(store: &Store) -> Vec<Route> {
     let ingresses = match store.list_as::<Ingress>(&GroupVersionResource::ingresses(), None) {
         Ok(r) => r,
         Err(e) => {
-            tracing::warn!("ingress: failed to list ingresses: {e}");
+            tracing::warn!("failed to list ingresses: {e}");
             return Vec::new();
         }
     };
@@ -70,83 +64,42 @@ fn rebuild_routes(store: &Store) -> Vec<Route> {
     let mut routes = Vec::new();
 
     for ing in &ingresses {
-
         let spec = match ing.spec.as_ref() {
             Some(s) => s,
             None => continue,
         };
 
-        // Backoff: skip if ingressClassName is set and not "r8s"
-        if let Some(ref class) = spec.ingress_class_name {
-            if class != "r8s" {
-                continue;
-            }
+        if spec
+            .ingress_class_name
+            .as_deref()
+            .is_some_and(|c| c != "r8s")
+        {
+            continue;
         }
 
         let ing_ns = ing.metadata.namespace.as_deref().unwrap_or("default");
 
-        let rules = spec.rules.as_deref().unwrap_or_default();
-
-        for rule in rules {
+        for rule in spec.rules.as_deref().unwrap_or_default() {
             let host = rule.host.clone();
-
             let http = match &rule.http {
                 Some(h) => h,
                 None => continue,
             };
 
             for path_entry in &http.paths {
-                let path = path_entry
-                    .path
-                    .clone()
-                    .unwrap_or_else(|| "/".to_string());
+                let path = path_entry.path.clone().unwrap_or_else(|| "/".to_string());
                 let prefix = path_entry.path_type.as_str() != "Exact";
 
                 let svc_backend = match &path_entry.backend.service {
                     Some(s) => s,
                     None => continue,
                 };
-                let svc_port = match svc_backend
-                    .port
-                    .as_ref()
-                    .and_then(|p| p.number)
-                {
+                let svc_port = match svc_backend.port.as_ref().and_then(|p| p.number) {
                     Some(p) => p as u16,
                     None => continue,
                 };
 
-                // Resolve backends from Endpoints
-                let ep_gvr = GroupVersionResource::endpoints();
-                let ep_ref = r8s_store::backend::ResourceRef {
-                    gvr: &ep_gvr,
-                    namespace: Some(ing_ns),
-                    name: &svc_backend.name,
-                };
-
-                let backends = match store.get_as::<Endpoints>(&ep_ref) {
-                    Ok(Some(ep)) => {
-                        let mut addrs = Vec::new();
-                        for subset in ep.subsets.as_deref().unwrap_or_default() {
-                            let target_port = subset
-                                .ports
-                                .as_ref()
-                                .and_then(|p| p.first())
-                                .map(|p| p.port as u16)
-                                .unwrap_or(svc_port);
-
-                            for addr in subset.addresses.as_deref().unwrap_or_default() {
-                                if let Ok(ip) = addr.ip.parse() {
-                                    addrs.push(Backend {
-                                        addr: SocketAddr::new(ip, target_port),
-                                    });
-                                }
-                            }
-                        }
-                        addrs
-                    }
-                    _ => Vec::new(),
-                };
-
+                let backends = resolve_backends(store, ing_ns, &svc_backend.name, svc_port);
                 if !backends.is_empty() {
                     routes.push(Route {
                         host: host.clone(),
@@ -160,12 +113,49 @@ fn rebuild_routes(store: &Store) -> Vec<Route> {
         }
     }
 
-    // Sort longest path first for correct prefix matching
-    routes.sort_by(|a, b| b.path.len().cmp(&a.path.len()));
+    // Longest path first for correct prefix matching
+    routes.sort_by_key(|r| std::cmp::Reverse(r.path.len()));
     routes
 }
 
-/// Response body type: either a static error message or a streamed backend response.
+fn resolve_backends(
+    store: &Store,
+    namespace: &str,
+    service_name: &str,
+    service_port: u16,
+) -> Vec<Backend> {
+    let gvr = GroupVersionResource::endpoints();
+    let ep_ref = r8s_store::backend::ResourceRef {
+        gvr: &gvr,
+        namespace: Some(namespace),
+        name: service_name,
+    };
+
+    let ep: Endpoints = match store.get_as::<Endpoints>(&ep_ref) {
+        Ok(Some(ep)) => ep,
+        _ => return Vec::new(),
+    };
+
+    let mut backends = Vec::new();
+    for subset in ep.subsets.as_deref().unwrap_or_default() {
+        let target_port = subset
+            .ports
+            .as_ref()
+            .and_then(|p| p.first())
+            .map(|p| p.port as u16)
+            .unwrap_or(service_port);
+
+        for addr in subset.addresses.as_deref().unwrap_or_default() {
+            if let Ok(ip) = addr.ip.parse() {
+                backends.push(Backend {
+                    addr: SocketAddr::new(ip, target_port),
+                });
+            }
+        }
+    }
+    backends
+}
+
 type ProxyBody = Either<Full<Bytes>, Incoming>;
 
 fn error_response(status: u16, msg: &str) -> Response<ProxyBody> {
@@ -187,7 +177,7 @@ async fn proxy_request(
     let path = req.uri().path().to_string();
 
     let backend_addr = {
-        let table = routes.read().unwrap();
+        let table = routes.read().expect("route table lock poisoned");
         table
             .iter()
             .find(|r| r.matches(host.as_deref(), &path))
@@ -199,11 +189,10 @@ async fn proxy_request(
         None => return Ok(error_response(404, "no matching ingress route\n")),
     };
 
-    // Connect to backend
     let stream = match TcpStream::connect(backend_addr).await {
         Ok(s) => s,
         Err(e) => {
-            tracing::warn!("ingress: backend {backend_addr} connect failed: {e}");
+            tracing::warn!("backend {backend_addr} connect failed: {e}");
             return Ok(error_response(502, "bad gateway\n"));
         }
     };
@@ -212,7 +201,7 @@ async fn proxy_request(
     let (mut sender, conn) = match hyper::client::conn::http1::handshake(io).await {
         Ok(r) => r,
         Err(e) => {
-            tracing::warn!("ingress: backend {backend_addr} handshake failed: {e}");
+            tracing::warn!("backend {backend_addr} handshake failed: {e}");
             return Ok(error_response(502, "bad gateway\n"));
         }
     };
@@ -220,24 +209,19 @@ async fn proxy_request(
 
     match sender.send_request(req).await {
         Ok(resp) => {
-            // Stream the response body directly -- no buffering
             let (parts, body) = resp.into_parts();
             Ok(Response::from_parts(parts, Either::Right(body)))
         }
         Err(e) => {
-            tracing::warn!("ingress: backend {backend_addr} request failed: {e}");
+            tracing::warn!("backend {backend_addr} request failed: {e}");
             Ok(error_response(502, "bad gateway\n"))
         }
     }
 }
 
 pub async fn run_ingress_proxy(store: Store, shutdown: CancellationToken) -> anyhow::Result<()> {
-    let routes: Arc<RwLock<RouteTable>> = Arc::new(RwLock::new(Vec::new()));
+    let routes: Arc<RwLock<RouteTable>> = Arc::new(RwLock::new(rebuild_routes(&store)));
 
-    // Initial route build
-    *routes.write().unwrap() = rebuild_routes(&store);
-
-    // Spawn watcher task
     let watcher_routes = routes.clone();
     let watcher_store = store.clone();
     let watcher_shutdown = shutdown.clone();
@@ -246,29 +230,20 @@ pub async fn run_ingress_proxy(store: Store, shutdown: CancellationToken) -> any
         let mut ep_rx = watcher_store.watch(&GroupVersionResource::endpoints());
 
         loop {
-            tokio::select! {
+            let changed = tokio::select! {
                 _ = watcher_shutdown.cancelled() => return,
-                event = ing_rx.recv() => {
-                    match event {
-                        Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {
-                            *watcher_routes.write().unwrap() = rebuild_routes(&watcher_store);
-                        }
-                        Err(broadcast::error::RecvError::Closed) => return,
-                    }
-                }
-                event = ep_rx.recv() => {
-                    match event {
-                        Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {
-                            *watcher_routes.write().unwrap() = rebuild_routes(&watcher_store);
-                        }
-                        Err(broadcast::error::RecvError::Closed) => return,
-                    }
-                }
+                r = ing_rx.recv() => !matches!(r, Err(broadcast::error::RecvError::Closed)),
+                r = ep_rx.recv() => !matches!(r, Err(broadcast::error::RecvError::Closed)),
+            };
+            if changed {
+                *watcher_routes.write().expect("route table lock poisoned") =
+                    rebuild_routes(&watcher_store);
+            } else {
+                return;
             }
         }
     });
 
-    // Start HTTP server on port 80
     let listener = TcpListener::bind("0.0.0.0:80").await?;
     tracing::info!("ingress proxy listening on :80");
 
@@ -286,10 +261,10 @@ pub async fn run_ingress_proxy(store: Store, shutdown: CancellationToken) -> any
                     let service = hyper::service::service_fn(move |req| {
                         proxy_request(req, routes.clone())
                     });
-                    if let Err(e) = server_http1::Builder::new().serve_connection(io, service).await {
-                        if !e.is_incomplete_message() {
-                            tracing::debug!("ingress: connection error: {e}");
-                        }
+                    if let Err(e) = server_http1::Builder::new().serve_connection(io, service).await
+                        && !e.is_incomplete_message()
+                    {
+                        tracing::debug!("connection error: {e}");
                     }
                 });
             }

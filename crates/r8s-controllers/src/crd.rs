@@ -1,7 +1,6 @@
 use r8s_store::{Store, watch::WatchEventType};
 use r8s_types::{
-    CustomResourceDefinition, GroupVersionResource, ResourceType,
-    registry::ResourceRegistry,
+    CustomResourceDefinition, GroupVersionResource, ResourceType, registry::ResourceRegistry,
 };
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
@@ -50,11 +49,7 @@ pub async fn run(
     }
 }
 
-fn reconcile_all(
-    store: &Store,
-    crd_gvr: &GroupVersionResource,
-    registry: &ResourceRegistry,
-) {
+fn reconcile_all(store: &Store, crd_gvr: &GroupVersionResource, registry: &ResourceRegistry) {
     let crds = match store.list_as::<CustomResourceDefinition>(crd_gvr, None) {
         Ok(r) => r,
         Err(e) => {

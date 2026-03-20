@@ -15,7 +15,6 @@ use crate::{
 const RESOURCES: TableDefinition<&str, &[u8]> = TableDefinition::new("resources");
 const REVISIONS: TableDefinition<u64, &[u8]> = TableDefinition::new("revisions");
 
-/// The main storage backend, wrapping redb with K8s-compatible semantics.
 #[derive(Clone)]
 pub struct Store {
     db: Arc<Database>,
@@ -46,12 +45,9 @@ impl ResourceRef<'_> {
 }
 
 impl Store {
-    /// Open or create a store at the given path.
     pub fn open(path: &Path) -> anyhow::Result<Self> {
         let db = Database::create(path)?;
-        // Opening tables in transaction, creates if not exists.
         let w_transaction = db.begin_write()?;
-        // Scoped to drop before the commit
         {
             let _table = w_transaction.open_table(RESOURCES)?;
             let _table = w_transaction.open_table(REVISIONS)?;
@@ -127,11 +123,9 @@ impl Store {
 
         w_transaction.commit()?;
 
-        let meta: ObjectMeta =
-            serde_json::from_value(obj["metadata"].clone()).unwrap_or_default();
-        let empty_labels = std::collections::BTreeMap::new();
-        self.index
-            .update(&resource.gvr.key_prefix(), &key, meta.labels.as_ref().unwrap_or(&empty_labels));
+        let meta: ObjectMeta = serde_json::from_value(obj["metadata"].clone()).unwrap_or_default();
+        let labels = meta.labels.unwrap_or_default();
+        self.index.update(&resource.gvr.key_prefix(), &key, &labels);
 
         self.watches.notify(
             &resource.gvr.key_prefix(),
@@ -207,7 +201,7 @@ impl Store {
 
         {
             let mut table = w_transaction.open_table(RESOURCES)?;
-            table.insert(key.as_str(), &serde_json::to_vec(&obj)?.as_slice())?;
+            table.insert(key.as_str(), serde_json::to_vec(&obj)?.as_slice())?;
         }
 
         {
@@ -222,11 +216,9 @@ impl Store {
 
         w_transaction.commit()?;
 
-        let meta: ObjectMeta =
-            serde_json::from_value(obj["metadata"].clone()).unwrap_or_default();
-        let empty_labels = std::collections::BTreeMap::new();
-        self.index
-            .update(&resource.gvr.key_prefix(), &key, meta.labels.as_ref().unwrap_or(&empty_labels));
+        let meta: ObjectMeta = serde_json::from_value(obj["metadata"].clone()).unwrap_or_default();
+        let labels = meta.labels.unwrap_or_default();
+        self.index.update(&resource.gvr.key_prefix(), &key, &labels);
 
         self.watches.notify(
             &resource.gvr.key_prefix(),
@@ -305,7 +297,6 @@ impl Store {
 
         let candidates = label_selector.and_then(|s| self.index.matches(&gvr.key_prefix(), s));
 
-        // If continue_token is set, decode it and start scanning after that key
         let range_start = match continue_token {
             Some(token) => String::from_utf8(
                 BASE64_STANDARD
@@ -316,7 +307,7 @@ impl Store {
             None => scan_prefix.clone(),
         };
 
-        let mut skipped_first = continue_token.is_none(); // skip the continue key itself
+        let mut skipped_first = continue_token.is_none();
 
         for entry in table.range(range_start.as_str()..)? {
             let (key, value) = entry?;
@@ -324,7 +315,6 @@ impl Store {
                 break;
             }
 
-            // Skip the continue_token key itself (exclusive start)
             if !skipped_first {
                 skipped_first = true;
                 continue;
@@ -356,7 +346,6 @@ impl Store {
             }
         }
 
-        // If we hit the limit, encode the last key as continue token
         let continue_token = if let Some(limit) = limit {
             if items.len() >= limit {
                 last_key.map(|k| BASE64_STANDARD.encode(k))
@@ -374,7 +363,6 @@ impl Store {
         })
     }
 
-    /// Returns (current_revision, revision_table_entries, resource_count).
     pub fn stats(&self) -> anyhow::Result<(u64, u64, u64)> {
         let current_rev = self.revision.current();
         let r_transaction = self.db.begin_read()?;
@@ -385,7 +373,6 @@ impl Store {
         Ok((current_rev, rev_count, res_count))
     }
 
-    /// Get and deserialize a resource.
     pub fn get_as<T: serde::de::DeserializeOwned>(
         &self,
         resource: &ResourceRef,
@@ -396,7 +383,6 @@ impl Store {
         }
     }
 
-    /// List and deserialize resources, skipping any that fail to deserialize.
     pub fn list_as<T: serde::de::DeserializeOwned>(
         &self,
         gvr: &GroupVersionResource,
@@ -439,7 +425,6 @@ fn compact(db: &Database, revision: &RevisionCounter, keep: u64) -> anyhow::Resu
     let w_transaction = db.begin_write()?;
     {
         let mut table = w_transaction.open_table(REVISIONS)?;
-        // Drain all entries with key <= cutoff
         let to_remove: Vec<u64> = table
             .range(..=cutoff)?
             .map(|entry| entry.map(|(k, _)| k.value()))

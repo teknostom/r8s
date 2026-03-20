@@ -2,8 +2,8 @@ use std::hash::{Hash, Hasher};
 
 use r8s_store::{Store, backend::ResourceRef, watch::WatchEventType};
 use r8s_types::{
-    Deployment, DeploymentCondition, DeploymentStatus, GroupVersionResource,
-    ObjectMeta, OwnerReference, ReplicaSet, ReplicaSetSpec,
+    Deployment, DeploymentCondition, DeploymentStatus, GroupVersionResource, ObjectMeta,
+    OwnerReference, ReplicaSet, ReplicaSetSpec,
 };
 use rustc_hash::FxHasher;
 use tokio::sync::broadcast;
@@ -52,7 +52,7 @@ pub async fn run(store: Store, shutdown: CancellationToken) -> anyhow::Result<()
                             Ok(r) => r,
                             Err(_) => continue,
                         };
-                        if let Some(owner) = rs.metadata.owner_references.as_deref().unwrap_or_default().iter().find(|r| r.kind == "Deployment") {
+                        if let Some(owner) = crate::find_owner(&rs.metadata, "Deployment") {
                             let d_gvr = GroupVersionResource::deployments();
                             let rref = ResourceRef {
                                 gvr: &d_gvr,
@@ -121,7 +121,6 @@ fn reconcile_deployment(store: &Store, deploy_value: &serde_json::Value) -> anyh
     let hash = template_hash(&template_value);
     let rs_name = format!("{deploy_name}-{hash}");
 
-    // List RSes owned by this deployment
     let rs_gvr = GroupVersionResource::replica_sets();
     let owned_rs: Vec<ReplicaSet> = store
         .list_as::<ReplicaSet>(&rs_gvr, deploy_ns)?
@@ -129,13 +128,11 @@ fn reconcile_deployment(store: &Store, deploy_value: &serde_json::Value) -> anyh
         .filter(|rs| is_owned_by(&rs.metadata, current_uid))
         .collect();
 
-    // Find or create the matching RS
     let matching = owned_rs
         .iter()
         .find(|rs| rs.metadata.name.as_deref() == Some(rs_name.as_str()));
 
     if let Some(existing_rs) = matching {
-        // Ensure replicas match
         let existing_replicas = existing_rs
             .spec
             .as_ref()
@@ -156,7 +153,6 @@ fn reconcile_deployment(store: &Store, deploy_value: &serde_json::Value) -> anyh
             }
         }
     } else {
-        // Create new RS
         let mut labels = current_spec
             .selector
             .match_labels
@@ -199,14 +195,9 @@ fn reconcile_deployment(store: &Store, deploy_value: &serde_json::Value) -> anyh
         );
     }
 
-    // Scale down old RSes
     for old_rs in &owned_rs {
         let name = old_rs.metadata.name.as_deref().unwrap_or("");
-        let old_replicas = old_rs
-            .spec
-            .as_ref()
-            .and_then(|s| s.replicas)
-            .unwrap_or(0);
+        let old_replicas = old_rs.spec.as_ref().and_then(|s| s.replicas).unwrap_or(0);
         if name != rs_name && old_replicas > 0 {
             let rs_rref = ResourceRef {
                 gvr: &rs_gvr,
@@ -221,7 +212,6 @@ fn reconcile_deployment(store: &Store, deploy_value: &serde_json::Value) -> anyh
         }
     }
 
-    // Update deployment status
     update_deploy_status(store, &current_value)?;
 
     Ok(())

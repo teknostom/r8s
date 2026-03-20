@@ -4,8 +4,6 @@ use std::time::Duration;
 
 use crate::traits::*;
 
-/// A mock container runtime that tracks state in memory without running real containers.
-/// Useful for testing controllers and the API server.
 pub struct MockRuntime {
     containers: Mutex<FxHashMap<String, MockContainer>>,
     next_id: Mutex<u64>,
@@ -31,16 +29,12 @@ impl MockRuntime {
         Self::default()
     }
 
-    /// Stop all containers whose config name contains the given substring.
-    /// Simulates process exit for testing (e.g. Job pod completion).
     pub fn stop_matching(&self, name_contains: &str) {
         self.stop_matching_with_code(name_contains, 0);
     }
 
-    /// Stop matching containers with a specific exit code.
-    /// Use exit_code=0 for success, non-zero for failure.
     pub fn stop_matching_with_code(&self, name_contains: &str, code: i32) {
-        let mut containers = self.containers.lock().unwrap();
+        let mut containers = self.containers.lock().expect("mock lock poisoned");
         for c in containers.values_mut() {
             if c.config.name.contains(name_contains) && c.running {
                 c.running = false;
@@ -51,17 +45,25 @@ impl MockRuntime {
 }
 
 impl ContainerRuntime for MockRuntime {
-    async fn pull_image(&self, image: &str, _auth: Option<&RegistryAuth>) -> anyhow::Result<ImageId> {
+    async fn has_image(&self, _image: &str) -> bool {
+        true
+    }
+
+    async fn pull_image(
+        &self,
+        image: &str,
+        _auth: Option<&RegistryAuth>,
+    ) -> anyhow::Result<ImageId> {
         tracing::info!(image, "mock: pulling image");
         Ok(ImageId(format!("mock-{image}")))
     }
 
     async fn create_container(&self, config: &ContainerConfig) -> anyhow::Result<ContainerId> {
-        let mut next_id = self.next_id.lock().unwrap();
+        let mut next_id = self.next_id.lock().expect("mock lock poisoned");
         let id = format!("mock-container-{next_id}");
         *next_id += 1;
 
-        let mut containers = self.containers.lock().unwrap();
+        let mut containers = self.containers.lock().expect("mock lock poisoned");
         containers.insert(
             id.clone(),
             MockContainer {
@@ -75,7 +77,7 @@ impl ContainerRuntime for MockRuntime {
     }
 
     async fn start_container(&self, id: &ContainerId) -> anyhow::Result<()> {
-        let mut containers = self.containers.lock().unwrap();
+        let mut containers = self.containers.lock().expect("mock lock poisoned");
         if let Some(c) = containers.get_mut(&id.0) {
             c.running = true;
             c.exit_code = None;
@@ -85,7 +87,7 @@ impl ContainerRuntime for MockRuntime {
     }
 
     async fn stop_container(&self, id: &ContainerId, _timeout: Duration) -> anyhow::Result<()> {
-        let mut containers = self.containers.lock().unwrap();
+        let mut containers = self.containers.lock().expect("mock lock poisoned");
         if let Some(c) = containers.get_mut(&id.0) {
             c.running = false;
             if c.exit_code.is_none() {
@@ -97,14 +99,14 @@ impl ContainerRuntime for MockRuntime {
     }
 
     async fn remove_container(&self, id: &ContainerId) -> anyhow::Result<()> {
-        let mut containers = self.containers.lock().unwrap();
+        let mut containers = self.containers.lock().expect("mock lock poisoned");
         containers.remove(&id.0);
         tracing::info!(id = id.0, "mock: removed container");
         Ok(())
     }
 
     async fn container_status(&self, id: &ContainerId) -> anyhow::Result<ContainerStatus> {
-        let containers = self.containers.lock().unwrap();
+        let containers = self.containers.lock().expect("mock lock poisoned");
         match containers.get(&id.0) {
             Some(c) => Ok(ContainerStatus {
                 id: id.clone(),

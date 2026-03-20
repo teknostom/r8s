@@ -3,8 +3,6 @@ use axum::response::Response;
 
 use crate::response::object_response;
 
-/// POST /apis/authorization.k8s.io/v1/selfsubjectaccessreviews
-/// Always returns allowed: true (no auth enforcement).
 pub async fn self_subject_access_review(body: Bytes) -> Response {
     let body: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
     object_response(&serde_json::json!({
@@ -18,8 +16,6 @@ pub async fn self_subject_access_review(body: Bytes) -> Response {
     }))
 }
 
-/// POST /apis/authorization.k8s.io/v1/selfsubjectrulesreviews
-/// Returns wildcard rules (full access).
 pub async fn self_subject_rules_review(body: Bytes) -> Response {
     let body: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
     object_response(&serde_json::json!({

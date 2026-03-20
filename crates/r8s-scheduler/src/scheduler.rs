@@ -40,6 +40,7 @@ pub async fn run(store: Store, shutdown: CancellationToken) -> anyhow::Result<()
     }
 }
 
+#[allow(clippy::needless_update)]
 fn register_node(store: &Store) -> anyhow::Result<()> {
     let gvr = GroupVersionResource::nodes();
     let resource_ref = ResourceRef {
@@ -57,12 +58,13 @@ fn register_node(store: &Store) -> anyhow::Result<()> {
     let cpu_count = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1);
-    let memory_ki = read_memtotal_ki().unwrap_or(8 * 1024 * 1024); // fallback 8Gi
+    let memory_ki = read_memtotal_ki().unwrap_or(8 * 1024 * 1024);
     let capacity = BTreeMap::from([
         ("cpu".into(), Quantity(cpu_count.to_string())),
         ("memory".into(), Quantity(format!("{memory_ki}Ki"))),
         ("pods".into(), Quantity("110".into())),
     ]);
+
     let node = Node {
         metadata: ObjectMeta {
             name: Some(NODE_NAME.into()),
@@ -105,7 +107,7 @@ fn schedule_all(store: &Store) {
     let result = match store.list(&GroupVersionResource::pods(), None, None, None, None, None) {
         Ok(r) => r,
         Err(e) => {
-            tracing::warn!("scheduler list error: {e}");
+            tracing::warn!("failed to list pods: {e}");
             return;
         }
     };
@@ -114,74 +116,68 @@ fn schedule_all(store: &Store) {
     }
 }
 
-fn schedule_pod(store: &Store, pod_value: &serde_json::Value) {
-    let pod: Pod = match serde_json::from_value(pod_value.clone()) {
-        Ok(p) => p,
-        Err(_) => return,
-    };
-
-    // Already scheduled
-    if pod
-        .spec
+fn is_scheduled(pod: &Pod) -> bool {
+    pod.spec
         .as_ref()
         .and_then(|s| s.node_name.as_ref())
         .is_some_and(|n| !n.is_empty())
-    {
+}
+
+fn schedule_pod(store: &Store, pod_value: &serde_json::Value) {
+    let pod: Pod = match serde_json::from_value(pod_value.clone()) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!("failed to deserialize pod: {e}");
+            return;
+        }
+    };
+
+    if is_scheduled(&pod) {
         return;
     }
 
-    let pod_name = match pod.metadata.name.as_deref() {
+    let name = match pod.metadata.name.as_deref() {
         Some(n) => n,
         None => return,
     };
-    let pod_ns = pod.metadata.namespace.as_deref();
+    let namespace = pod.metadata.namespace.as_deref();
 
     let gvr = GroupVersionResource::pods();
     let resource_ref = ResourceRef {
         gvr: &gvr,
-        namespace: pod_ns,
-        name: pod_name,
+        namespace,
+        name,
     };
 
+    // Re-read from store — the watch event may be stale
     let mut current = match store.get(&resource_ref) {
-        Ok(Some(p)) => p,
+        Ok(Some(v)) => v,
         _ => return,
     };
-
-    // Double-check still unscheduled after re-read
     let current_pod: Pod = match serde_json::from_value(current.clone()) {
         Ok(p) => p,
         Err(_) => return,
     };
-    if current_pod
-        .spec
-        .as_ref()
-        .and_then(|s| s.node_name.as_ref())
-        .is_some_and(|n| !n.is_empty())
-    {
+    if is_scheduled(&current_pod) {
         return;
     }
 
-    // Set nodeName on the original Value to preserve unknown fields
+    // Mutate the raw Value to preserve fields not in our Pod struct
     current["spec"]["nodeName"] = serde_json::json!(NODE_NAME);
-
-    // Set scheduling condition
-    let now = Time(chrono::Utc::now());
-    let conditions = vec![PodCondition {
+    current["status"]["conditions"] = serde_json::to_value(&[PodCondition {
         type_: "PodScheduled".into(),
         status: "True".into(),
-        last_transition_time: Some(now),
+        last_transition_time: Some(Time(chrono::Utc::now())),
         ..Default::default()
-    }];
-    current["status"]["conditions"] = serde_json::to_value(&conditions).unwrap_or_default();
+    }])
+    .unwrap_or_default();
 
     match store.update(&resource_ref, &current) {
-        Ok(_) => tracing::info!("scheduled pod '{pod_name}' to node '{NODE_NAME}'"),
-        Err(e) => tracing::debug!("scheduler update conflict for '{pod_name}': {e}"),
+        Ok(_) => tracing::info!("scheduled pod '{name}' to node '{NODE_NAME}'"),
+        Err(e) => tracing::debug!("scheduler update conflict for '{name}': {e}"),
     }
 }
 
-/// Read MemTotal from /proc/meminfo, returning KiB.
 fn read_memtotal_ki() -> Option<u64> {
     let contents = std::fs::read_to_string("/proc/meminfo").ok()?;
     let line = contents.lines().find(|l| l.starts_with("MemTotal:"))?;
