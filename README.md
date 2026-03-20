@@ -1,13 +1,15 @@
 # r8s
 
-Lightweight single-node Kubernetes distribution written in Rust.
+A lightweight single-node Kubernetes distribution written in Rust. Designed for local development — drop an `r8s.toml` in your project, run `sudo r8s env up`, and get a working cluster with your dependencies and app deployed.
+
+> **Early development.** This project is under active development. APIs and behavior may change. Container leaks can occur — if you hit issues, `sudo r8s env nuke` will clean up.
 
 ## Requirements
 
 - Linux (x86_64)
-- containerd running (`/run/containerd/containerd.sock`)
-- Root access (networking requires it)
-- Helm and kubectl (for `r8s env` commands)
+- containerd running (`sudo systemctl start containerd`)
+- Root access (networking setup requires it)
+- Helm and kubectl on PATH (for `r8s env` commands)
 
 ## Install
 
@@ -16,9 +18,11 @@ cargo build --release -p r8s -p r8sd
 sudo cp target/release/r8s target/release/r8sd /usr/local/bin/
 ```
 
-## Quick start with r8s.toml
+## The env workflow
 
-Add an `r8s.toml` to your project:
+The intended way to use r8s is with an `r8s.toml` at the root of your project. It declares your cluster, dependencies, and app — then a single command brings everything up.
+
+### 1. Define your environment
 
 ```toml
 [cluster]
@@ -38,25 +42,33 @@ chart = "./deployment"
 values = ["values/myapp.yaml"]
 ```
 
-Then:
+### 2. Bring it up
 
 ```bash
-# Create cluster, start it, deploy deps then app
+sudo r8s env up
+export KUBECONFIG=$(r8s kubeconfig)
+kubectl get pods -A
+```
+
+This creates the cluster (if it doesn't exist), starts the daemon, and deploys dependencies in order followed by your app.
+
+### 3. Develop
+
+```bash
+# Redeploy after changes
 sudo r8s env up
 
-# Export kubeconfig
-export KUBECONFIG=$(r8s kubeconfig)
-
-# Check pods
-kubectl get pods -A
-
-# Stop cluster (state preserved, restarts where it left off)
+# Stop the cluster (state is preserved)
 sudo r8s env down
 
-# Restart (skips install, pods resume from saved state)
+# Restart (pods resume from saved state)
 sudo r8s env up
+```
 
-# Destroy everything
+### 4. Clean up
+
+```bash
+# Tear down everything — cluster, containers, data
 sudo r8s env nuke
 ```
 
@@ -82,19 +94,16 @@ Each release (dependency or app) supports:
 
 ## Manual cluster management
 
+You can also manage clusters directly without `r8s.toml`:
+
 ```bash
-# Create and start a cluster
 r8s create mycluster
 sudo r8s up mycluster
-
-# Point kubectl at it
 export KUBECONFIG=$(r8s kubeconfig mycluster)
 
-# Use kubectl / helm as normal
 kubectl get nodes
 kubectl apply -f manifest.yaml --validate=false
 
-# Stop / delete
 sudo r8s down mycluster
 r8s delete mycluster
 ```
@@ -109,11 +118,20 @@ r8s stats [name]            # Show store statistics
 r8s logs [name] [-f]        # Tail daemon logs
 ```
 
-## Notes
+## Accessing services
 
-- `r8s env up` uses `helm template` + `kubectl apply --validate=false` under the hood
-- Dependencies are installed in declaration order, app is installed last
-- `r8s env down` just stops the daemon — all state is preserved in the store
-- `r8s env nuke` stops the daemon and deletes all cluster data
-- ClusterIPs are auto-assigned to services
-- Pod DNS resolves service names within and across namespaces
+Services are reachable from the host via their ClusterIPs. r8s auto-assigns these when services are created. To find a service's IP:
+
+```bash
+kubectl get svc -n myproject
+```
+
+Then connect directly — e.g. `psql -h 10.96.0.5 -U postgres`.
+
+## How it works
+
+r8s runs a single daemon (`r8sd`) that bundles an API server, scheduler, kubelet, controller manager, DNS server, and ingress proxy. State is stored in an embedded database. Containers are managed through containerd. Networking uses a bridge with nftables NAT rules.
+
+## License
+
+MIT

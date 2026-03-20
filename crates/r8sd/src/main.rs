@@ -86,6 +86,12 @@ async fn main() -> anyhow::Result<()> {
         _ => {
             let socket = std::env::var("CONTAINERD_SOCKET")
                 .unwrap_or_else(|_| "/run/containerd/containerd.sock".to_string());
+            if !std::path::Path::new(&socket).exists() {
+                anyhow::bail!(
+                    "containerd socket not found at '{socket}'. Is containerd running? \
+                     (try: sudo systemctl start containerd)"
+                );
+            }
             tracing::info!(socket, "using containerd runtime");
             let runtime = Arc::new(ContainerdRuntime::new(&socket, data_dir.clone()).await?);
             spawn(
