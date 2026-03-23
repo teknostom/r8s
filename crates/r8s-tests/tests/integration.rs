@@ -2709,6 +2709,283 @@ async fn kubelet_restart_on_failure_fail() {
     cluster.shutdown().await;
 }
 
+// ---------------------------------------------------------------
+// readyReplicas / availableReplicas reflect actual pod readiness
+// ---------------------------------------------------------------
+
+#[tokio::test]
+async fn rs_ready_replicas_reflects_pod_readiness() {
+    let cluster = TestCluster::start().await;
+    let store = &cluster.store;
+
+    // Pods created by a deployment have no readiness probe, so the kubelet
+    // marks them Ready immediately. readyReplicas must equal replicas once
+    // all pods are Running.
+    let deploy = make_deployment("rr-deploy", 2, "rr-deploy");
+    let deploy_gvr = GroupVersionResource::deployments();
+    store
+        .create(
+            ResourceRef {
+                gvr: &deploy_gvr,
+                namespace: Some("default"),
+                name: "rr-deploy",
+            },
+            &serde_json::to_value(&deploy).unwrap(),
+        )
+        .unwrap();
+
+    let pod_gvr = GroupVersionResource::pods();
+
+    // Wait for both pods to be Running
+    let both_running = wait_for_count(
+        store,
+        &pod_gvr,
+        Some("default"),
+        |v| {
+            v["metadata"]["labels"]["app"].as_str() == Some("rr-deploy")
+                && v["status"]["phase"].as_str() == Some("Running")
+        },
+        2,
+        TIMEOUT,
+    )
+    .await;
+    assert!(both_running, "both pods should be Running");
+
+    // Allow a reconcile cycle so RS and Deployment statuses are updated
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let rs_gvr = GroupVersionResource::replica_sets();
+    let rs_val = store
+        .list(&rs_gvr, Some("default"), None, None, None, None)
+        .unwrap()
+        .items
+        .into_iter()
+        .find(|v| {
+            v["metadata"]["labels"]["app"].as_str() == Some("rr-deploy")
+        })
+        .expect("ReplicaSet should exist");
+
+    let rs_ready = rs_val["status"]["readyReplicas"].as_i64().unwrap_or(0);
+    assert_eq!(rs_ready, 2, "RS readyReplicas should equal 2 when both pods are Ready");
+
+    let deploy_val = store
+        .get(&ResourceRef {
+            gvr: &deploy_gvr,
+            namespace: Some("default"),
+            name: "rr-deploy",
+        })
+        .unwrap()
+        .unwrap();
+    let deploy_ready = deploy_val["status"]["readyReplicas"].as_i64().unwrap_or(0);
+    assert_eq!(deploy_ready, 2, "Deployment readyReplicas should equal 2");
+
+    cluster.shutdown().await;
+}
+
+// ---------------------------------------------------------------
+// Startup probe gates readiness
+// ---------------------------------------------------------------
+
+#[tokio::test]
+async fn kubelet_startup_probe_gates_readiness() {
+    let cluster = TestCluster::start().await;
+    let store = &cluster.store;
+
+    // Pod with a startup probe. In the mock environment container_pid() always
+    // fails so the probe never runs — the pod stays in the "starting" state
+    // (ready = false) until the startup probe would succeed.
+    let pod = Pod {
+        metadata: ObjectMeta {
+            name: Some("startup-pod".into()),
+            namespace: Some("default".into()),
+            labels: Some(BTreeMap::from([("app".into(), "startup-pod".into())])),
+            ..Default::default()
+        },
+        spec: Some(PodSpec {
+            containers: vec![Container {
+                name: "worker".into(),
+                image: Some("busybox:latest".into()),
+                startup_probe: Some(Probe {
+                    tcp_socket: Some(TCPSocketAction {
+                        port: IntOrString::Int(8080),
+                        ..Default::default()
+                    }),
+                    period_seconds: Some(1),
+                    failure_threshold: Some(30),
+                    timeout_seconds: Some(1),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }),
+        status: None,
+    };
+
+    let pod_gvr = GroupVersionResource::pods();
+    store
+        .create(
+            ResourceRef {
+                gvr: &pod_gvr,
+                namespace: Some("default"),
+                name: "startup-pod",
+            },
+            &serde_json::to_value(&pod).unwrap(),
+        )
+        .unwrap();
+
+    // Pod should reach Running phase (containers started)
+    let running = wait_for(
+        store,
+        &pod_gvr,
+        Some("default"),
+        "startup-pod",
+        |v| {
+            v.get("status")
+                .and_then(|s| s.get("phase"))
+                .and_then(|p| p.as_str())
+                == Some("Running")
+        },
+        TIMEOUT,
+    )
+    .await;
+    assert!(running, "pod should reach Running phase");
+
+    // Give a health tick to propagate readiness status
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let pod_val = store
+        .get(&ResourceRef {
+            gvr: &pod_gvr,
+            namespace: Some("default"),
+            name: "startup-pod",
+        })
+        .unwrap()
+        .unwrap();
+
+    let ready_cond = pod_val["status"]["conditions"]
+        .as_array()
+        .and_then(|c| c.iter().find(|c| c["type"].as_str() == Some("Ready")))
+        .and_then(|c| c["status"].as_str());
+
+    assert_eq!(
+        ready_cond,
+        Some("False"),
+        "pod with pending startup probe should have Ready=False"
+    );
+
+    cluster.shutdown().await;
+}
+
+// ---------------------------------------------------------------
+// startedAt is stable across status updates
+// ---------------------------------------------------------------
+
+#[tokio::test]
+async fn kubelet_started_at_is_stable() {
+    let cluster = TestCluster::start().await;
+    let store = &cluster.store;
+
+    let pod = Pod {
+        metadata: ObjectMeta {
+            name: Some("stable-ts".into()),
+            namespace: Some("default".into()),
+            ..Default::default()
+        },
+        spec: Some(PodSpec {
+            containers: vec![Container {
+                name: "worker".into(),
+                image: Some("busybox:latest".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }),
+        status: None,
+    };
+
+    let pod_gvr = GroupVersionResource::pods();
+    store
+        .create(
+            ResourceRef {
+                gvr: &pod_gvr,
+                namespace: Some("default"),
+                name: "stable-ts",
+            },
+            &serde_json::to_value(&pod).unwrap(),
+        )
+        .unwrap();
+
+    // Wait for Running
+    let running = wait_for(
+        store,
+        &pod_gvr,
+        Some("default"),
+        "stable-ts",
+        |v| {
+            v.get("status")
+                .and_then(|s| s.get("phase"))
+                .and_then(|p| p.as_str())
+                == Some("Running")
+        },
+        TIMEOUT,
+    )
+    .await;
+    assert!(running, "pod should reach Running");
+
+    // Record startedAt from first Running status write
+    let first_val = store
+        .get(&ResourceRef {
+            gvr: &pod_gvr,
+            namespace: Some("default"),
+            name: "stable-ts",
+        })
+        .unwrap()
+        .unwrap();
+    let first_started_at = first_val["status"]["containerStatuses"][0]["state"]["running"]
+        ["startedAt"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+    let first_start_time = first_val["status"]["startTime"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+    assert!(!first_started_at.is_empty(), "startedAt should be set");
+    assert!(!first_start_time.is_empty(), "startTime should be set");
+
+    // Wait for several health ticks to fire
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    let later_val = store
+        .get(&ResourceRef {
+            gvr: &pod_gvr,
+            namespace: Some("default"),
+            name: "stable-ts",
+        })
+        .unwrap()
+        .unwrap();
+    let later_started_at = later_val["status"]["containerStatuses"][0]["state"]["running"]
+        ["startedAt"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+    let later_start_time = later_val["status"]["startTime"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+
+    assert_eq!(
+        first_started_at, later_started_at,
+        "startedAt should not change across status updates"
+    );
+    assert_eq!(
+        first_start_time, later_start_time,
+        "startTime should not change across status updates"
+    );
+
+    cluster.shutdown().await;
+}
+
 // ===============================================================
 // Scheduler
 // ===============================================================
