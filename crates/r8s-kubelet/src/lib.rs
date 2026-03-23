@@ -292,6 +292,8 @@ async fn reconcile_pod<R: ContainerRuntime>(
             }
         };
 
+        container_ids.push(container_id.clone());
+
         if let Err(e) = runtime.start_container(&container_id).await {
             tracing::error!("pod '{pod_name}': failed to start container '{container_name}': {e}");
             failed = true;
@@ -302,7 +304,6 @@ async fn reconcile_pod<R: ContainerRuntime>(
             "pod '{pod_name}': started container '{container_name}' (id={})",
             container_id.0
         );
-        container_ids.push(container_id);
     }
 
     if failed {
