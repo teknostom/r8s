@@ -221,7 +221,9 @@ fn update_ds_status(
     }
 
     let mut updated = current;
-    updated["status"] = new_status_val;
+    if let Some(obj) = updated.as_object_mut() {
+        obj.insert("status".to_string(), new_status_val);
+    }
 
     match store.update(&resource_ref, &updated) {
         Ok(_) => Ok(()),

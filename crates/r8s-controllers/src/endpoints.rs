@@ -214,8 +214,13 @@ fn reconcile_service(store: &Store, service_value: &serde_json::Value) -> anyhow
     match store.get(&rref)? {
         Some(existing) => {
             let mut ep_value = serde_json::to_value(&ep)?;
-            if let Some(rv) = existing["metadata"]["resourceVersion"].as_str() {
-                ep_value["metadata"]["resourceVersion"] = serde_json::json!(rv);
+            if let Some(rv) = existing
+                .get("metadata")
+                .and_then(|m| m.get("resourceVersion"))
+                .and_then(|v| v.as_str())
+                && let Some(meta) = ep_value.get_mut("metadata").and_then(|v| v.as_object_mut())
+            {
+                meta.insert("resourceVersion".to_string(), serde_json::json!(rv));
             }
             let _ = store.update(&rref, &ep_value);
         }
@@ -274,8 +279,13 @@ fn reconcile_service(store: &Store, service_value: &serde_json::Value) -> anyhow
     match store.get(&es_ref)? {
         Some(existing) => {
             let mut es_value = serde_json::to_value(&es)?;
-            if let Some(rv) = existing["metadata"]["resourceVersion"].as_str() {
-                es_value["metadata"]["resourceVersion"] = serde_json::json!(rv);
+            if let Some(rv) = existing
+                .get("metadata")
+                .and_then(|m| m.get("resourceVersion"))
+                .and_then(|v| v.as_str())
+                && let Some(meta) = es_value.get_mut("metadata").and_then(|v| v.as_object_mut())
+            {
+                meta.insert("resourceVersion".to_string(), serde_json::json!(rv));
             }
             let _ = store.update(&es_ref, &es_value);
         }

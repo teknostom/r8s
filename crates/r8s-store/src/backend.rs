@@ -80,8 +80,9 @@ impl Store {
         let w_transaction = self.db.begin_write()?;
         let mut obj = object.clone();
         let rev = self.revision.next();
-        let metadata = obj["metadata"]
-            .as_object_mut()
+        let metadata = obj
+            .get_mut("metadata")
+            .and_then(|v| v.as_object_mut())
             .ok_or_else(|| anyhow::anyhow!("metadata must be an object"))?;
 
         metadata.insert(
@@ -123,7 +124,9 @@ impl Store {
 
         w_transaction.commit()?;
 
-        let meta: ObjectMeta = serde_json::from_value(obj["metadata"].clone()).unwrap_or_default();
+        let meta: ObjectMeta =
+            serde_json::from_value(obj.get("metadata").cloned().unwrap_or_default())
+                .unwrap_or_default();
         let labels = meta.labels.unwrap_or_default();
         self.index.update(&resource.gvr.key_prefix(), &key, &labels);
 
@@ -171,9 +174,11 @@ impl Store {
         };
 
         let incoming_meta: ObjectMeta =
-            serde_json::from_value(object["metadata"].clone()).unwrap_or_default();
+            serde_json::from_value(object.get("metadata").cloned().unwrap_or_default())
+                .unwrap_or_default();
         let stored_meta: ObjectMeta =
-            serde_json::from_value(existing["metadata"].clone()).unwrap_or_default();
+            serde_json::from_value(existing.get("metadata").cloned().unwrap_or_default())
+                .unwrap_or_default();
         let incoming_rv = incoming_meta.resource_version.as_deref().unwrap_or("");
         let stored_rv = stored_meta.resource_version.as_deref().unwrap_or("");
         if incoming_rv != stored_rv {
@@ -190,8 +195,9 @@ impl Store {
         let rev = self.revision.next();
 
         let mut obj = object.clone();
-        let metadata = obj["metadata"]
-            .as_object_mut()
+        let metadata = obj
+            .get_mut("metadata")
+            .and_then(|v| v.as_object_mut())
             .ok_or_else(|| anyhow::anyhow!("metadata must be an object"))?;
 
         metadata.insert(
@@ -216,7 +222,9 @@ impl Store {
 
         w_transaction.commit()?;
 
-        let meta: ObjectMeta = serde_json::from_value(obj["metadata"].clone()).unwrap_or_default();
+        let meta: ObjectMeta =
+            serde_json::from_value(obj.get("metadata").cloned().unwrap_or_default())
+                .unwrap_or_default();
         let labels = meta.labels.unwrap_or_default();
         self.index.update(&resource.gvr.key_prefix(), &key, &labels);
 

@@ -163,14 +163,33 @@ fn schedule_pod(store: &Store, pod_value: &serde_json::Value) {
     }
 
     // Mutate the raw Value to preserve fields not in our Pod struct
-    current["spec"]["nodeName"] = serde_json::json!(NODE_NAME);
-    current["status"]["conditions"] = serde_json::to_value(&[PodCondition {
-        type_: "PodScheduled".into(),
-        status: "True".into(),
-        last_transition_time: Some(Time(chrono::Utc::now())),
-        ..Default::default()
-    }])
-    .unwrap_or_default();
+    if let Some(spec) = current.get_mut("spec").and_then(|v| v.as_object_mut()) {
+        spec.insert("nodeName".to_string(), serde_json::json!(NODE_NAME));
+    }
+    if let Some(status) = current.get_mut("status").and_then(|v| v.as_object_mut()) {
+        status.insert(
+            "conditions".to_string(),
+            serde_json::to_value(&[PodCondition {
+                type_: "PodScheduled".into(),
+                status: "True".into(),
+                last_transition_time: Some(Time(chrono::Utc::now())),
+                ..Default::default()
+            }])
+            .unwrap_or_default(),
+        );
+    } else if let Some(obj) = current.as_object_mut() {
+        obj.insert(
+            "status".to_string(),
+            serde_json::json!({
+                "conditions": serde_json::to_value(&[PodCondition {
+                    type_: "PodScheduled".into(),
+                    status: "True".into(),
+                    last_transition_time: Some(Time(chrono::Utc::now())),
+                    ..Default::default()
+                }]).unwrap_or_default()
+            }),
+        );
+    }
 
     match store.update(&resource_ref, &current) {
         Ok(_) => tracing::info!("scheduled pod '{name}' to node '{NODE_NAME}'"),

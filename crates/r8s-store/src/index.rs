@@ -32,7 +32,10 @@ pub struct LabelSelector {
 
 impl LabelSelector {
     pub fn matches(&self, object: &serde_json::Value) -> bool {
-        let labels = object["metadata"]["labels"].as_object();
+        let labels = object
+            .get("metadata")
+            .and_then(|m| m.get("labels"))
+            .and_then(|l| l.as_object());
         self.requirements.iter().all(|req| match req {
             Requirement::Equals(key, value) => {
                 labels.and_then(|l| l.get(key)).and_then(|v| v.as_str()) == Some(value.as_str())

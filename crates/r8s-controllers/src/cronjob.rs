@@ -229,7 +229,9 @@ fn reconcile_cronjob(store: &Store, cj_value: &serde_json::Value) -> anyhow::Res
         return Ok(());
     }
     let mut updated = current_val;
-    updated["status"] = new_status_val;
+    if let Some(obj) = updated.as_object_mut() {
+        obj.insert("status".to_string(), new_status_val);
+    }
     let _ = store.update(&resource_ref, &updated);
 
     Ok(())

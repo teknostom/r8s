@@ -120,31 +120,46 @@ pub fn columns_for(resource: &str) -> Vec<ColumnDef> {
     }
 }
 
+fn val<'a>(obj: &'a Value, keys: &[&str]) -> &'a Value {
+    let mut current = obj;
+    for &key in keys {
+        match current.get(key) {
+            Some(v) => current = v,
+            None => return &Value::Null,
+        }
+    }
+    current
+}
+
+fn str_val<'a>(obj: &'a Value, keys: &[&str]) -> Option<&'a str> {
+    val(obj, keys).as_str()
+}
+
 pub fn extract_cells(resource: &str, obj: &Value) -> Vec<Value> {
     match resource {
         "pods" => {
-            let name = obj["metadata"]["name"].as_str().unwrap_or("");
-            let statuses = obj["status"]["containerStatuses"].as_array();
-            let total = obj["spec"]["containers"]
+            let name = str_val(obj, &["metadata", "name"]).unwrap_or("");
+            let statuses = val(obj, &["status", "containerStatuses"]).as_array();
+            let total = val(obj, &["spec", "containers"])
                 .as_array()
                 .map(|a| a.len())
                 .unwrap_or(0);
             let ready = statuses
                 .map(|s| {
                     s.iter()
-                        .filter(|c| c["ready"].as_bool() == Some(true))
+                        .filter(|c| c.get("ready").and_then(|v| v.as_bool()) == Some(true))
                         .count()
                 })
                 .unwrap_or(0);
-            let phase = obj["status"]["phase"].as_str().unwrap_or("Pending");
+            let phase = str_val(obj, &["status", "phase"]).unwrap_or("Pending");
             let restarts: u64 = statuses
                 .map(|s| {
                     s.iter()
-                        .map(|c| c["restartCount"].as_u64().unwrap_or(0))
+                        .map(|c| c.get("restartCount").and_then(|v| v.as_u64()).unwrap_or(0))
                         .sum()
                 })
                 .unwrap_or(0);
-            let age = format_age(obj["metadata"]["creationTimestamp"].as_str());
+            let age = format_age(str_val(obj, &["metadata", "creationTimestamp"]));
             vec![
                 json!(name),
                 json!(format!("{ready}/{total}")),
@@ -154,12 +169,16 @@ pub fn extract_cells(resource: &str, obj: &Value) -> Vec<Value> {
             ]
         }
         "deployments" => {
-            let name = obj["metadata"]["name"].as_str().unwrap_or("");
-            let desired = obj["spec"]["replicas"].as_u64().unwrap_or(0);
-            let ready = obj["status"]["readyReplicas"].as_u64().unwrap_or(0);
-            let updated = obj["status"]["updatedReplicas"].as_u64().unwrap_or(0);
-            let available = obj["status"]["availableReplicas"].as_u64().unwrap_or(0);
-            let age = format_age(obj["metadata"]["creationTimestamp"].as_str());
+            let name = str_val(obj, &["metadata", "name"]).unwrap_or("");
+            let desired = val(obj, &["spec", "replicas"]).as_u64().unwrap_or(0);
+            let ready = val(obj, &["status", "readyReplicas"]).as_u64().unwrap_or(0);
+            let updated = val(obj, &["status", "updatedReplicas"])
+                .as_u64()
+                .unwrap_or(0);
+            let available = val(obj, &["status", "availableReplicas"])
+                .as_u64()
+                .unwrap_or(0);
+            let age = format_age(str_val(obj, &["metadata", "creationTimestamp"]));
             vec![
                 json!(name),
                 json!(format!("{ready}/{desired}")),
@@ -169,11 +188,11 @@ pub fn extract_cells(resource: &str, obj: &Value) -> Vec<Value> {
             ]
         }
         "replicasets" => {
-            let name = obj["metadata"]["name"].as_str().unwrap_or("");
-            let desired = obj["spec"]["replicas"].as_u64().unwrap_or(0);
-            let current = obj["status"]["replicas"].as_u64().unwrap_or(0);
-            let ready = obj["status"]["readyReplicas"].as_u64().unwrap_or(0);
-            let age = format_age(obj["metadata"]["creationTimestamp"].as_str());
+            let name = str_val(obj, &["metadata", "name"]).unwrap_or("");
+            let desired = val(obj, &["spec", "replicas"]).as_u64().unwrap_or(0);
+            let current = val(obj, &["status", "replicas"]).as_u64().unwrap_or(0);
+            let ready = val(obj, &["status", "readyReplicas"]).as_u64().unwrap_or(0);
+            let age = format_age(str_val(obj, &["metadata", "creationTimestamp"]));
             vec![
                 json!(name),
                 json!(desired),
@@ -183,24 +202,24 @@ pub fn extract_cells(resource: &str, obj: &Value) -> Vec<Value> {
             ]
         }
         "services" => {
-            let name = obj["metadata"]["name"].as_str().unwrap_or("");
-            let svc_type = obj["spec"]["type"].as_str().unwrap_or("ClusterIP");
-            let cluster_ip = obj["spec"]["clusterIP"].as_str().unwrap_or("<none>");
-            let external_ip = obj["spec"]["externalIP"].as_str().unwrap_or("<none>");
-            let ports = obj["spec"]["ports"]
+            let name = str_val(obj, &["metadata", "name"]).unwrap_or("");
+            let svc_type = str_val(obj, &["spec", "type"]).unwrap_or("ClusterIP");
+            let cluster_ip = str_val(obj, &["spec", "clusterIP"]).unwrap_or("<none>");
+            let external_ip = str_val(obj, &["spec", "externalIP"]).unwrap_or("<none>");
+            let ports = val(obj, &["spec", "ports"])
                 .as_array()
                 .map(|ps| {
                     ps.iter()
                         .map(|p| {
-                            let port = p["port"].as_u64().unwrap_or(0);
-                            let proto = p["protocol"].as_str().unwrap_or("TCP");
+                            let port = p.get("port").and_then(|v| v.as_u64()).unwrap_or(0);
+                            let proto = p.get("protocol").and_then(|v| v.as_str()).unwrap_or("TCP");
                             format!("{port}/{proto}")
                         })
                         .collect::<Vec<_>>()
                         .join(",")
                 })
                 .unwrap_or_else(|| "<none>".to_string());
-            let age = format_age(obj["metadata"]["creationTimestamp"].as_str());
+            let age = format_age(str_val(obj, &["metadata", "creationTimestamp"]));
             vec![
                 json!(name),
                 json!(svc_type),
@@ -211,32 +230,39 @@ pub fn extract_cells(resource: &str, obj: &Value) -> Vec<Value> {
             ]
         }
         "namespaces" => {
-            let name = obj["metadata"]["name"].as_str().unwrap_or("");
-            let phase = obj["status"]["phase"].as_str().unwrap_or("Active");
-            let age = format_age(obj["metadata"]["creationTimestamp"].as_str());
+            let name = str_val(obj, &["metadata", "name"]).unwrap_or("");
+            let phase = str_val(obj, &["status", "phase"]).unwrap_or("Active");
+            let age = format_age(str_val(obj, &["metadata", "creationTimestamp"]));
             vec![json!(name), json!(phase), json!(age)]
         }
         "nodes" => {
-            let name = obj["metadata"]["name"].as_str().unwrap_or("");
-            let conditions = obj["status"]["conditions"].as_array();
+            let name = str_val(obj, &["metadata", "name"]).unwrap_or("");
+            let conditions = val(obj, &["status", "conditions"]).as_array();
             let status = conditions
-                .and_then(|c| c.iter().find(|c| c["type"] == "Ready"))
+                .and_then(|c| {
+                    c.iter()
+                        .find(|c| c.get("type").and_then(|v| v.as_str()) == Some("Ready"))
+                })
                 .map(|c| {
-                    if c["status"] == "True" {
+                    if c.get("status").and_then(|v| v.as_str()) == Some("True") {
                         "Ready"
                     } else {
                         "NotReady"
                     }
                 })
                 .unwrap_or("Unknown");
-            let roles = obj["metadata"]["labels"]["node-role.kubernetes.io/control-plane"]
-                .as_str()
-                .map(|_| "control-plane")
-                .unwrap_or("<none>");
-            let age = format_age(obj["metadata"]["creationTimestamp"].as_str());
-            let version = obj["status"]["nodeInfo"]["kubeletVersion"]
-                .as_str()
-                .unwrap_or("");
+            let roles = str_val(
+                obj,
+                &[
+                    "metadata",
+                    "labels",
+                    "node-role.kubernetes.io/control-plane",
+                ],
+            )
+            .map(|_| "control-plane")
+            .unwrap_or("<none>");
+            let age = format_age(str_val(obj, &["metadata", "creationTimestamp"]));
+            let version = str_val(obj, &["status", "nodeInfo", "kubeletVersion"]).unwrap_or("");
             vec![
                 json!(name),
                 json!(status),
@@ -246,16 +272,24 @@ pub fn extract_cells(resource: &str, obj: &Value) -> Vec<Value> {
             ]
         }
         "configmaps" => {
-            let name = obj["metadata"]["name"].as_str().unwrap_or("");
-            let data_count = obj["data"].as_object().map(|m| m.len()).unwrap_or(0);
-            let age = format_age(obj["metadata"]["creationTimestamp"].as_str());
+            let name = str_val(obj, &["metadata", "name"]).unwrap_or("");
+            let data_count = obj
+                .get("data")
+                .and_then(|v| v.as_object())
+                .map(|m| m.len())
+                .unwrap_or(0);
+            let age = format_age(str_val(obj, &["metadata", "creationTimestamp"]));
             vec![json!(name), json!(data_count), json!(age)]
         }
         "secrets" => {
-            let name = obj["metadata"]["name"].as_str().unwrap_or("");
-            let secret_type = obj["type"].as_str().unwrap_or("Opaque");
-            let data_count = obj["data"].as_object().map(|m| m.len()).unwrap_or(0);
-            let age = format_age(obj["metadata"]["creationTimestamp"].as_str());
+            let name = str_val(obj, &["metadata", "name"]).unwrap_or("");
+            let secret_type = obj.get("type").and_then(|v| v.as_str()).unwrap_or("Opaque");
+            let data_count = obj
+                .get("data")
+                .and_then(|v| v.as_object())
+                .map(|m| m.len())
+                .unwrap_or(0);
+            let age = format_age(str_val(obj, &["metadata", "creationTimestamp"]));
             vec![
                 json!(name),
                 json!(secret_type),
@@ -264,29 +298,35 @@ pub fn extract_cells(resource: &str, obj: &Value) -> Vec<Value> {
             ]
         }
         "endpoints" => {
-            let name = obj["metadata"]["name"].as_str().unwrap_or("");
-            let addrs = obj["subsets"]
-                .as_array()
+            let name = str_val(obj, &["metadata", "name"]).unwrap_or("");
+            let addrs = obj
+                .get("subsets")
+                .and_then(|v| v.as_array())
                 .map(|subsets| {
                     subsets
                         .iter()
-                        .flat_map(|s| s["addresses"].as_array().into_iter().flatten())
-                        .filter_map(|a| a["ip"].as_str())
+                        .flat_map(|s| {
+                            s.get("addresses")
+                                .and_then(|v| v.as_array())
+                                .into_iter()
+                                .flatten()
+                        })
+                        .filter_map(|a| a.get("ip").and_then(|v| v.as_str()))
                         .collect::<Vec<_>>()
                         .join(", ")
                 })
                 .unwrap_or_else(|| "<none>".to_string());
-            let age = format_age(obj["metadata"]["creationTimestamp"].as_str());
+            let age = format_age(str_val(obj, &["metadata", "creationTimestamp"]));
             vec![json!(name), json!(addrs), json!(age)]
         }
         "events" => {
-            let last_seen = format_age(obj["lastTimestamp"].as_str());
-            let event_type = obj["type"].as_str().unwrap_or("Normal");
-            let reason = obj["reason"].as_str().unwrap_or("");
-            let kind = obj["involvedObject"]["kind"].as_str().unwrap_or("");
-            let obj_name = obj["involvedObject"]["name"].as_str().unwrap_or("");
+            let last_seen = format_age(obj.get("lastTimestamp").and_then(|v| v.as_str()));
+            let event_type = obj.get("type").and_then(|v| v.as_str()).unwrap_or("Normal");
+            let reason = obj.get("reason").and_then(|v| v.as_str()).unwrap_or("");
+            let kind = str_val(obj, &["involvedObject", "kind"]).unwrap_or("");
+            let obj_name = str_val(obj, &["involvedObject", "name"]).unwrap_or("");
             let object = format!("{kind}/{obj_name}");
-            let message = obj["message"].as_str().unwrap_or("");
+            let message = obj.get("message").and_then(|v| v.as_str()).unwrap_or("");
             vec![
                 json!(last_seen),
                 json!(event_type),
@@ -296,26 +336,28 @@ pub fn extract_cells(resource: &str, obj: &Value) -> Vec<Value> {
             ]
         }
         "statefulsets" => {
-            let name = obj["metadata"]["name"].as_str().unwrap_or("");
-            let desired = obj["spec"]["replicas"].as_u64().unwrap_or(0);
-            let ready = obj["status"]["readyReplicas"].as_u64().unwrap_or(0);
-            let age = format_age(obj["metadata"]["creationTimestamp"].as_str());
+            let name = str_val(obj, &["metadata", "name"]).unwrap_or("");
+            let desired = val(obj, &["spec", "replicas"]).as_u64().unwrap_or(0);
+            let ready = val(obj, &["status", "readyReplicas"]).as_u64().unwrap_or(0);
+            let age = format_age(str_val(obj, &["metadata", "creationTimestamp"]));
             vec![json!(name), json!(format!("{ready}/{desired}")), json!(age)]
         }
         "daemonsets" => {
-            let name = obj["metadata"]["name"].as_str().unwrap_or("");
-            let desired = obj["status"]["desiredNumberScheduled"]
+            let name = str_val(obj, &["metadata", "name"]).unwrap_or("");
+            let desired = val(obj, &["status", "desiredNumberScheduled"])
                 .as_u64()
                 .unwrap_or(0);
-            let current = obj["status"]["currentNumberScheduled"]
+            let current = val(obj, &["status", "currentNumberScheduled"])
                 .as_u64()
                 .unwrap_or(0);
-            let ready = obj["status"]["numberReady"].as_u64().unwrap_or(0);
-            let updated = obj["status"]["updatedNumberScheduled"]
+            let ready = val(obj, &["status", "numberReady"]).as_u64().unwrap_or(0);
+            let updated = val(obj, &["status", "updatedNumberScheduled"])
                 .as_u64()
                 .unwrap_or(0);
-            let available = obj["status"]["numberAvailable"].as_u64().unwrap_or(0);
-            let age = format_age(obj["metadata"]["creationTimestamp"].as_str());
+            let available = val(obj, &["status", "numberAvailable"])
+                .as_u64()
+                .unwrap_or(0);
+            let age = format_age(str_val(obj, &["metadata", "creationTimestamp"]));
             vec![
                 json!(name),
                 json!(desired),
@@ -327,14 +369,18 @@ pub fn extract_cells(resource: &str, obj: &Value) -> Vec<Value> {
             ]
         }
         "serviceaccounts" => {
-            let name = obj["metadata"]["name"].as_str().unwrap_or("");
-            let secrets = obj["secrets"].as_array().map(|a| a.len()).unwrap_or(0);
-            let age = format_age(obj["metadata"]["creationTimestamp"].as_str());
+            let name = str_val(obj, &["metadata", "name"]).unwrap_or("");
+            let secrets = obj
+                .get("secrets")
+                .and_then(|v| v.as_array())
+                .map(|a| a.len())
+                .unwrap_or(0);
+            let age = format_age(str_val(obj, &["metadata", "creationTimestamp"]));
             vec![json!(name), json!(secrets), json!(age)]
         }
         _ => {
-            let name = obj["metadata"]["name"].as_str().unwrap_or("");
-            let age = format_age(obj["metadata"]["creationTimestamp"].as_str());
+            let name = str_val(obj, &["metadata", "name"]).unwrap_or("");
+            let age = format_age(str_val(obj, &["metadata", "creationTimestamp"]));
             vec![json!(name), json!(age)]
         }
     }
@@ -389,16 +435,16 @@ pub fn table_response(
                 "object": {
                     "apiVersion": "meta.k8s.io/v1",
                     "kind": "PartialObjectMetadata",
-                    "metadata": obj["metadata"],
+                    "metadata": obj.get("metadata").cloned().unwrap_or(Value::Null),
                 }
             })
         })
         .collect();
 
-    let mut metadata = json!({});
-    if let Some(rv) = resource_version {
-        metadata["resourceVersion"] = json!(rv.to_string());
-    }
+    let metadata = match resource_version {
+        Some(rv) => json!({"resourceVersion": rv.to_string()}),
+        None => json!({}),
+    };
 
     let body = json!({
         "apiVersion": "meta.k8s.io/v1",

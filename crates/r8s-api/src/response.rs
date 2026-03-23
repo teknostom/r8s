@@ -32,8 +32,10 @@ pub fn list_response(
     let mut metadata = serde_json::json!({
         "resourceVersion": rv.to_string(),
     });
-    if let Some(token) = continue_token {
-        metadata["continue"] = serde_json::json!(token);
+    if let Some(token) = continue_token
+        && let Some(obj) = metadata.as_object_mut()
+    {
+        obj.insert("continue".to_string(), serde_json::json!(token));
     }
 
     let body = serde_json::json!({

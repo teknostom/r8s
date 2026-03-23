@@ -145,7 +145,9 @@ fn reconcile_deployment(store: &Store, deploy_value: &serde_json::Value) -> anyh
                 name: &rs_name,
             };
             if let Ok(Some(mut rs_value)) = store.get(&rs_rref) {
-                rs_value["spec"]["replicas"] = serde_json::json!(desired_replicas);
+                if let Some(spec) = rs_value.get_mut("spec").and_then(|v| v.as_object_mut()) {
+                    spec.insert("replicas".to_string(), serde_json::json!(desired_replicas));
+                }
                 let _ = store.update(&rs_rref, &rs_value);
                 tracing::info!(
                     "deployment '{deploy_name}': scaled RS '{rs_name}' to {desired_replicas}"
@@ -205,7 +207,9 @@ fn reconcile_deployment(store: &Store, deploy_value: &serde_json::Value) -> anyh
                 name,
             };
             if let Ok(Some(mut rs_value)) = store.get(&rs_rref) {
-                rs_value["spec"]["replicas"] = serde_json::json!(0);
+                if let Some(spec) = rs_value.get_mut("spec").and_then(|v| v.as_object_mut()) {
+                    spec.insert("replicas".to_string(), serde_json::json!(0));
+                }
                 let _ = store.update(&rs_rref, &rs_value);
                 tracing::info!("deployment '{deploy_name}': scaled down old RS '{name}' to 0");
             }
@@ -270,7 +274,9 @@ fn update_deploy_status(store: &Store, deploy_value: &serde_json::Value) -> anyh
         return Ok(());
     }
 
-    current["status"] = new_status_val;
+    if let Some(obj) = current.as_object_mut() {
+        obj.insert("status".to_string(), new_status_val);
+    }
 
     match store.update(&resource_ref, &current) {
         Ok(_) => Ok(()),

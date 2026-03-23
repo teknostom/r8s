@@ -5,7 +5,9 @@ pub fn json_merge_patch(target: &mut Value, patch: &Value) {
         if !target.is_object() {
             *target = serde_json::json!({});
         }
-        let target_obj = target.as_object_mut().unwrap();
+        let Some(target_obj) = target.as_object_mut() else {
+            return;
+        };
         for (key, value) in patch_obj {
             if value.is_null() {
                 target_obj.remove(key);

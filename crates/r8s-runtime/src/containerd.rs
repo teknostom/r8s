@@ -90,15 +90,22 @@ impl ContainerdRuntime {
                 let index_bytes = self.read_content(&target.digest).await?;
                 let index: serde_json::Value = serde_json::from_slice(&index_bytes)?;
                 let arch = current_oci_arch();
-                index["manifests"]
-                    .as_array()
+                index
+                    .get("manifests")
+                    .and_then(|v| v.as_array())
                     .and_then(|manifests| {
                         manifests.iter().find(|m| {
-                            m["platform"]["os"].as_str() == Some("linux")
-                                && m["platform"]["architecture"].as_str() == Some(arch)
+                            m.get("platform")
+                                .and_then(|p| p.get("os"))
+                                .and_then(|v| v.as_str())
+                                == Some("linux")
+                                && m.get("platform")
+                                    .and_then(|p| p.get("architecture"))
+                                    .and_then(|v| v.as_str())
+                                    == Some(arch)
                         })
                     })
-                    .and_then(|m| m["digest"].as_str())
+                    .and_then(|m| m.get("digest").and_then(|v| v.as_str()))
                     .ok_or_else(|| anyhow::anyhow!("no manifest for linux/{arch}"))?
                     .to_string()
             } else {
@@ -107,30 +114,39 @@ impl ContainerdRuntime {
 
         let manifest_bytes = self.read_content(&manifest_digest).await?;
         let manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes)?;
-        let config_digest = manifest["config"]["digest"]
-            .as_str()
+        let config_digest = manifest
+            .get("config")
+            .and_then(|c| c.get("digest"))
+            .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("manifest has no config digest"))?;
 
         let config_bytes = self.read_content(config_digest).await?;
         let config: serde_json::Value = serde_json::from_slice(&config_bytes)?;
 
-        let diff_ids: Vec<String> = config["rootfs"]["diff_ids"]
-            .as_array()
+        let diff_ids: Vec<String> = config
+            .get("rootfs")
+            .and_then(|r| r.get("diff_ids"))
+            .and_then(|v| v.as_array())
             .ok_or_else(|| anyhow::anyhow!("config has no rootfs.diff_ids"))?
             .iter()
             .filter_map(|v| v.as_str().map(String::from))
             .collect();
 
         let chain_id = compute_chain_id(&diff_ids)?;
-        let img_config = &config["config"];
+        let img_config = config.get("config").unwrap_or(&serde_json::Value::Null);
 
         Ok(ImageInfo {
             chain_id,
-            entrypoint: json_string_array(&img_config["Entrypoint"]),
-            cmd: json_string_array(&img_config["Cmd"]),
-            env: json_string_array(&img_config["Env"]),
-            working_dir: img_config["WorkingDir"]
-                .as_str()
+            entrypoint: json_string_array(
+                img_config
+                    .get("Entrypoint")
+                    .unwrap_or(&serde_json::Value::Null),
+            ),
+            cmd: json_string_array(img_config.get("Cmd").unwrap_or(&serde_json::Value::Null)),
+            env: json_string_array(img_config.get("Env").unwrap_or(&serde_json::Value::Null)),
+            working_dir: img_config
+                .get("WorkingDir")
+                .and_then(|v| v.as_str())
                 .filter(|s| !s.is_empty())
                 .map(String::from),
         })

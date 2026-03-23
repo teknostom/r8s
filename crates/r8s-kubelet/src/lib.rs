@@ -419,7 +419,12 @@ fn update_pod_status(store: &Store, tracked: &TrackedPod) {
         container_statuses: Some(container_statuses),
         ..Default::default()
     };
-    current["status"] = serde_json::to_value(&status).unwrap_or_default();
+    if let Some(obj) = current.as_object_mut() {
+        obj.insert(
+            "status".to_string(),
+            serde_json::to_value(&status).unwrap_or_default(),
+        );
+    }
 
     match store.update(&resource_ref, &current) {
         Ok(_) => tracing::info!(
@@ -530,7 +535,12 @@ async fn check_health<R: ContainerRuntime>(
             .get(&resource_ref)
             .ok()
             .flatten()
-            .and_then(|p| p["spec"]["restartPolicy"].as_str().map(String::from))
+            .and_then(|p| {
+                p.get("spec")
+                    .and_then(|s| s.get("restartPolicy"))
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+            })
             .unwrap_or_else(|| "Always".to_string());
 
         let succeeded = exit_code == Some(0);
@@ -540,7 +550,9 @@ async fn check_health<R: ContainerRuntime>(
             "Never" => {
                 let phase = if succeeded { "Succeeded" } else { "Failed" };
                 if let Ok(Some(mut pod)) = store.get(&resource_ref) {
-                    pod["status"]["phase"] = serde_json::json!(phase);
+                    if let Some(status) = pod.get_mut("status").and_then(|v| v.as_object_mut()) {
+                        status.insert("phase".to_string(), serde_json::json!(phase));
+                    }
                     let _ = store.update(&resource_ref, &pod);
                 }
                 tracing::info!(
@@ -551,7 +563,9 @@ async fn check_health<R: ContainerRuntime>(
             }
             "OnFailure" if succeeded => {
                 if let Ok(Some(mut pod)) = store.get(&resource_ref) {
-                    pod["status"]["phase"] = serde_json::json!("Succeeded");
+                    if let Some(status) = pod.get_mut("status").and_then(|v| v.as_object_mut()) {
+                        status.insert("phase".to_string(), serde_json::json!("Succeeded"));
+                    }
                     let _ = store.update(&resource_ref, &pod);
                 }
                 tracing::info!(
@@ -562,7 +576,9 @@ async fn check_health<R: ContainerRuntime>(
             // Delete so controller recreates
             _ => {
                 if let Ok(Some(mut pod)) = store.get(&resource_ref) {
-                    pod["status"]["phase"] = serde_json::json!("Failed");
+                    if let Some(status) = pod.get_mut("status").and_then(|v| v.as_object_mut()) {
+                        status.insert("phase".to_string(), serde_json::json!("Failed"));
+                    }
                     let _ = store.update(&resource_ref, &pod);
                 }
                 let _ = store.delete(&resource_ref);
@@ -602,12 +618,15 @@ fn resolve_pull_secrets_auth(
     pod_value: &serde_json::Value,
     image: &str,
 ) -> Option<RegistryAuth> {
-    let pull_secrets = pod_value["spec"]["imagePullSecrets"].as_array()?;
+    let pull_secrets = pod_value
+        .get("spec")
+        .and_then(|s| s.get("imagePullSecrets"))
+        .and_then(|v| v.as_array())?;
     let host = registry_host(image);
     let gvr = GroupVersionResource::secrets();
 
     for entry in pull_secrets {
-        let secret_name = match entry["name"].as_str() {
+        let secret_name = match entry.get("name").and_then(|v| v.as_str()) {
             Some(n) => n,
             None => continue,
         };
@@ -620,7 +639,11 @@ fn resolve_pull_secrets_auth(
             Ok(Some(s)) => s,
             _ => continue,
         };
-        let b64 = match secret["data"][".dockerconfigjson"].as_str() {
+        let b64 = match secret
+            .get("data")
+            .and_then(|d| d.get(".dockerconfigjson"))
+            .and_then(|v| v.as_str())
+        {
             Some(s) => s,
             None => continue,
         };
@@ -658,12 +681,15 @@ fn parse_docker_config_b64(b64: &str, host: &str) -> Option<RegistryAuth> {
 }
 
 fn find_registry_auth(config: &serde_json::Value, host: &str) -> Option<RegistryAuth> {
-    let auths = config["auths"].as_object()?;
+    let auths = config.get("auths").and_then(|v| v.as_object())?;
     let https_host = format!("https://{host}");
     let https_host_v1 = format!("https://{host}/v1/");
     for key in [host, https_host.as_str(), https_host_v1.as_str()] {
         if let Some(entry) = auths.get(key) {
-            if let Some(auth_b64) = entry["auth"].as_str().filter(|s| !s.is_empty())
+            if let Some(auth_b64) = entry
+                .get("auth")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
                 && let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(auth_b64)
             {
                 let decoded = String::from_utf8_lossy(&decoded);
@@ -674,8 +700,16 @@ fn find_registry_auth(config: &serde_json::Value, host: &str) -> Option<Registry
                     });
                 }
             }
-            let username = entry["username"].as_str().unwrap_or_default().to_string();
-            let password = entry["password"].as_str().unwrap_or_default().to_string();
+            let username = entry
+                .get("username")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let password = entry
+                .get("password")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
             if !username.is_empty() {
                 return Some(RegistryAuth { username, password });
             }
@@ -738,7 +772,7 @@ fn project_configmap(
     let cm = store
         .get(&resource_ref)?
         .ok_or_else(|| anyhow::anyhow!("configmap '{name}' not found"))?;
-    if let Some(data) = cm["data"].as_object() {
+    if let Some(data) = cm.get("data").and_then(|v| v.as_object()) {
         for (key, value) in data {
             if let Some(s) = value.as_str() {
                 std::fs::write(dir.join(key), s)?;
@@ -763,7 +797,7 @@ fn project_secret(
     let secret = store
         .get(&resource_ref)?
         .ok_or_else(|| anyhow::anyhow!("secret '{name}' not found"))?;
-    if let Some(data) = secret["data"].as_object() {
+    if let Some(data) = secret.get("data").and_then(|v| v.as_object()) {
         for (key, value) in data {
             if let Some(b64) = value.as_str() {
                 let bytes = base64::engine::general_purpose::STANDARD

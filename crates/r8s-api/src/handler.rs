@@ -131,7 +131,11 @@ pub(crate) fn create_impl(
     namespace: Option<&str>,
     mut body: serde_json::Value,
 ) -> Response {
-    let name = match body["metadata"]["name"].as_str() {
+    let name = match body
+        .get("metadata")
+        .and_then(|m| m.get("name"))
+        .and_then(|n| n.as_str())
+    {
         Some(n) => n.to_string(),
         None => {
             return status_error(
@@ -141,21 +145,31 @@ pub(crate) fn create_impl(
             );
         }
     };
-    if let Some(ns) = namespace {
-        body["metadata"]["namespace"] = serde_json::json!(ns);
+    if let Some(ns) = namespace
+        && let Some(meta) = body.get_mut("metadata").and_then(|v| v.as_object_mut())
+    {
+        meta.insert("namespace".to_string(), serde_json::json!(ns));
     }
 
     if ctx.resource_type.gvr.resource == "services" {
-        let svc_type = body["spec"]["type"].as_str().unwrap_or("ClusterIP");
-        let has_cluster_ip = body["spec"]["clusterIP"]
-            .as_str()
+        let svc_type = body
+            .get("spec")
+            .and_then(|s| s.get("type"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("ClusterIP");
+        let has_cluster_ip = body
+            .get("spec")
+            .and_then(|s| s.get("clusterIP"))
+            .and_then(|v| v.as_str())
             .is_some_and(|ip| !ip.is_empty() && ip != "None");
         if (svc_type == "ClusterIP" || svc_type == "LoadBalancer" || svc_type == "NodePort")
             && !has_cluster_ip
         {
             let ip = state.allocate_cluster_ip();
-            body["spec"]["clusterIP"] = serde_json::json!(ip);
-            body["spec"]["clusterIPs"] = serde_json::json!([ip]);
+            if let Some(spec) = body.get_mut("spec").and_then(|v| v.as_object_mut()) {
+                spec.insert("clusterIP".to_string(), serde_json::json!(ip));
+                spec.insert("clusterIPs".to_string(), serde_json::json!([ip]));
+            }
         }
     }
 
@@ -313,9 +327,18 @@ pub(crate) fn patch_impl(
         Ok(None) => {
             // Server-side apply: create if not found
             let mut body = patch;
-            body["metadata"]["name"] = serde_json::json!(name);
-            if let Some(ns) = namespace {
-                body["metadata"]["namespace"] = serde_json::json!(ns);
+            if let Some(meta) = body.get_mut("metadata").and_then(|v| v.as_object_mut()) {
+                meta.insert("name".to_string(), serde_json::json!(name));
+                if let Some(ns) = namespace {
+                    meta.insert("namespace".to_string(), serde_json::json!(ns));
+                }
+            } else if let Some(obj) = body.as_object_mut() {
+                let mut meta = serde_json::Map::new();
+                meta.insert("name".to_string(), serde_json::json!(name));
+                if let Some(ns) = namespace {
+                    meta.insert("namespace".to_string(), serde_json::json!(ns));
+                }
+                obj.insert("metadata".to_string(), serde_json::Value::Object(meta));
             }
             match state.store.create(rref, &body) {
                 Ok(obj) => response::created_response(&obj),
@@ -458,7 +481,12 @@ fn watch_impl(state: &AppState, ctx: &RouteContext, namespace: Option<&str>) -> 
         .filter_map(move |result| {
             let event = result.ok()?;
             if let Some(ref ns) = ns_filter
-                && event.object["metadata"]["namespace"].as_str() != Some(ns.as_str())
+                && event
+                    .object
+                    .get("metadata")
+                    .and_then(|m| m.get("namespace"))
+                    .and_then(|v| v.as_str())
+                    != Some(ns.as_str())
             {
                 return None;
             }
@@ -535,16 +563,23 @@ pub async fn pod_logs_ns(
         Err(e) => return response::anyhow_error_response(e),
     };
 
-    let statuses = pod["status"]["containerStatuses"].as_array();
+    let statuses = pod
+        .get("status")
+        .and_then(|s| s.get("containerStatuses"))
+        .and_then(|v| v.as_array());
     let status = statuses.and_then(|s| {
         if let Some(ref c) = params.container {
-            s.iter().find(|cs| cs["name"].as_str() == Some(c.as_str()))
+            s.iter()
+                .find(|cs| cs.get("name").and_then(|v| v.as_str()) == Some(c.as_str()))
         } else {
             s.first()
         }
     });
 
-    let container_id = match status.and_then(|s| s["containerID"].as_str()) {
+    let container_id = match status
+        .and_then(|s| s.get("containerID"))
+        .and_then(|v| v.as_str())
+    {
         Some(id) => id,
         None => {
             return Response::builder()
