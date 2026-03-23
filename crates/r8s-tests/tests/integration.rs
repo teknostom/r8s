@@ -2448,64 +2448,91 @@ async fn kubelet_restart_always() {
     let cluster = TestCluster::start().await;
     let store = &cluster.store;
 
-    // Create deployment (restartPolicy defaults to Always) with 1 replica
-    let deploy = make_deployment("restart-always", 1, "restart-always");
-    let deploy_gvr = GroupVersionResource::deployments();
+    // Create a standalone pod (no controller) with restartPolicy=Always (default)
+    let pod = Pod {
+        metadata: ObjectMeta {
+            name: Some("restart-always".into()),
+            namespace: Some("default".into()),
+            labels: Some(BTreeMap::from([("app".into(), "restart-always".into())])),
+            ..Default::default()
+        },
+        spec: Some(PodSpec {
+            containers: vec![Container {
+                name: "worker".into(),
+                image: Some("busybox:latest".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }),
+        status: None,
+    };
+
+    let pod_gvr = GroupVersionResource::pods();
     let rref = ResourceRef {
-        gvr: &deploy_gvr,
+        gvr: &pod_gvr,
         namespace: Some("default"),
         name: "restart-always",
     };
     store
-        .create(rref, &serde_json::to_value(&deploy).unwrap())
+        .create(rref, &serde_json::to_value(&pod).unwrap())
         .unwrap();
 
-    let pod_gvr = GroupVersionResource::pods();
-    let running = wait_for_count(
+    let running = wait_for(
         store,
         &pod_gvr,
         Some("default"),
+        "restart-always",
         |v| {
-            v["metadata"]["labels"]["app"].as_str() == Some("restart-always")
-                && v["status"]["phase"].as_str() == Some("Running")
+            v.get("status")
+                .and_then(|s| s.get("phase"))
+                .and_then(|v| v.as_str())
+                == Some("Running")
         },
-        1,
         TIMEOUT,
     )
     .await;
     assert!(running, "pod should reach Running");
 
-    // Get the current pod's UID
-    let pods = store
-        .list(&pod_gvr, Some("default"), None, None, None, None)
-        .unwrap();
-    let original = pods
-        .items
-        .iter()
-        .find(|v| v["metadata"]["labels"]["app"].as_str() == Some("restart-always"))
-        .unwrap();
-    let original_uid = original["metadata"]["uid"].as_str().unwrap().to_string();
+    // Record original UID
+    let original_uid = get_uid(store, &pod_gvr, Some("default"), "restart-always");
 
     // Simulate container crash
     cluster.runtime.stop_matching("restart-always");
 
-    // Pod should be deleted (restartPolicy=Always) and RS should recreate
-    let replaced = wait_for_count(
+    // Pod should restart in-place: same UID, restartCount > 0, back to Running
+    let restarted = wait_for(
         store,
         &pod_gvr,
         Some("default"),
+        "restart-always",
         |v| {
-            v["metadata"]["labels"]["app"].as_str() == Some("restart-always")
-                && v["metadata"]["uid"].as_str() != Some(&original_uid)
-                && v["status"]["phase"].as_str() == Some("Running")
+            let phase = v
+                .get("status")
+                .and_then(|s| s.get("phase"))
+                .and_then(|v| v.as_str());
+            let restart_count = v
+                .get("status")
+                .and_then(|s| s.get("containerStatuses"))
+                .and_then(|v| v.as_array())
+                .and_then(|a| a.first())
+                .and_then(|c| c.get("restartCount"))
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
+            phase == Some("Running") && restart_count >= 1
         },
-        1,
         TIMEOUT,
     )
     .await;
     assert!(
-        replaced,
-        "restartPolicy=Always should delete pod; RS recreates it"
+        restarted,
+        "restartPolicy=Always should restart in-place with restartCount >= 1"
+    );
+
+    // Verify same UID (not recreated)
+    let new_uid = get_uid(store, &pod_gvr, Some("default"), "restart-always");
+    assert_eq!(
+        original_uid, new_uid,
+        "pod UID should not change on in-place restart"
     );
 
     cluster.shutdown().await;
@@ -2552,7 +2579,12 @@ async fn kubelet_restart_on_failure_success() {
         &pod_gvr,
         Some("default"),
         "onfail-ok",
-        |v| v["status"]["phase"].as_str() == Some("Running"),
+        |v| {
+            v.get("status")
+                .and_then(|s| s.get("phase"))
+                .and_then(|v| v.as_str())
+                == Some("Running")
+        },
         TIMEOUT,
     )
     .await;
@@ -2567,7 +2599,12 @@ async fn kubelet_restart_on_failure_success() {
         &pod_gvr,
         Some("default"),
         "onfail-ok",
-        |v| v["status"]["phase"].as_str() == Some("Succeeded"),
+        |v| {
+            v.get("status")
+                .and_then(|s| s.get("phase"))
+                .and_then(|v| v.as_str())
+                == Some("Succeeded")
+        },
         TIMEOUT,
     )
     .await;
@@ -2618,39 +2655,55 @@ async fn kubelet_restart_on_failure_fail() {
         &pod_gvr,
         Some("default"),
         "onfail-err",
-        |v| v["status"]["phase"].as_str() == Some("Running"),
+        |v| {
+            v.get("status")
+                .and_then(|s| s.get("phase"))
+                .and_then(|v| v.as_str())
+                == Some("Running")
+        },
         TIMEOUT,
     )
     .await;
     assert!(running, "pod should reach Running");
 
+    let original_uid = get_uid(store, &pod_gvr, Some("default"), "onfail-err");
+
     // Simulate failed exit (code 1)
     cluster.runtime.stop_matching_with_code("onfail-err", 1);
 
-    // Pod should be deleted (OnFailure + failure → delete for retry)
-    let _deleted = wait_for(
+    // Pod should restart in-place (OnFailure + failure → restart)
+    let restarted = wait_for(
         store,
         &pod_gvr,
         Some("default"),
         "onfail-err",
-        |_| false, // will timeout if pod still exists
-        Duration::from_secs(3),
+        |v| {
+            let phase = v
+                .get("status")
+                .and_then(|s| s.get("phase"))
+                .and_then(|v| v.as_str());
+            let restart_count = v
+                .get("status")
+                .and_then(|s| s.get("containerStatuses"))
+                .and_then(|v| v.as_array())
+                .and_then(|a| a.first())
+                .and_then(|c| c.get("restartCount"))
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
+            phase == Some("Running") && restart_count >= 1
+        },
+        TIMEOUT,
     )
     .await;
-    // If the pod was deleted, wait_for will keep returning Ok(Some(val)) until it's gone
-    // Then it returns Ok(None) which doesn't call condition. So it times out.
-    // Let's check directly after a delay.
-    tokio::time::sleep(Duration::from_secs(2)).await;
-    let pod_val = store
-        .get(&ResourceRef {
-            gvr: &pod_gvr,
-            namespace: Some("default"),
-            name: "onfail-err",
-        })
-        .unwrap();
     assert!(
-        pod_val.is_none(),
-        "restartPolicy=OnFailure + exit 1 should delete pod"
+        restarted,
+        "restartPolicy=OnFailure + exit 1 should restart in-place"
+    );
+
+    let new_uid = get_uid(store, &pod_gvr, Some("default"), "onfail-err");
+    assert_eq!(
+        original_uid, new_uid,
+        "pod UID should not change on restart"
     );
 
     cluster.shutdown().await;
@@ -2819,6 +2872,273 @@ async fn scheduler_skips_already_scheduled() {
         Some("other-node"),
         "scheduler should not re-schedule already-assigned pod"
     );
+
+    cluster.shutdown().await;
+}
+
+// ---------------------------------------------------------------
+// Kubelet: readiness probe gates endpoint membership
+// ---------------------------------------------------------------
+
+#[tokio::test]
+async fn kubelet_readiness_probe_gates_endpoints() {
+    let cluster = TestCluster::start().await;
+    let store = &cluster.store;
+
+    // Pod with a TCP readiness probe to a port that won't be open.
+    // The mock environment has no real 10.244.0.x network, so the probe
+    // fails and the pod stays NotReady → excluded from Endpoints.
+    let pod = Pod {
+        metadata: ObjectMeta {
+            name: Some("probe-unready".into()),
+            namespace: Some("default".into()),
+            labels: Some(BTreeMap::from([("app".into(), "probe-unready".into())])),
+            ..Default::default()
+        },
+        spec: Some(PodSpec {
+            containers: vec![Container {
+                name: "worker".into(),
+                image: Some("busybox:latest".into()),
+                readiness_probe: Some(Probe {
+                    tcp_socket: Some(TCPSocketAction {
+                        port: IntOrString::Int(9999),
+                        ..Default::default()
+                    }),
+                    period_seconds: Some(1),
+                    failure_threshold: Some(1),
+                    timeout_seconds: Some(1),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }),
+        status: None,
+    };
+
+    let pod_gvr = GroupVersionResource::pods();
+    store
+        .create(
+            ResourceRef {
+                gvr: &pod_gvr,
+                namespace: Some("default"),
+                name: "probe-unready",
+            },
+            &serde_json::to_value(&pod).unwrap(),
+        )
+        .unwrap();
+
+    // Create a Service that selects the pod
+    let svc = make_service(
+        "probe-unready-svc",
+        BTreeMap::from([("app".into(), "probe-unready".into())]),
+        80,
+    );
+    let svc_gvr = GroupVersionResource::services();
+    store
+        .create(
+            ResourceRef {
+                gvr: &svc_gvr,
+                namespace: Some("default"),
+                name: "probe-unready-svc",
+            },
+            &serde_json::to_value(&svc).unwrap(),
+        )
+        .unwrap();
+
+    // Wait for pod to be Running
+    let running = wait_for(
+        store,
+        &pod_gvr,
+        Some("default"),
+        "probe-unready",
+        |v| {
+            v.get("status")
+                .and_then(|s| s.get("phase"))
+                .and_then(|p| p.as_str())
+                == Some("Running")
+        },
+        TIMEOUT,
+    )
+    .await;
+    assert!(running, "pod should reach Running phase");
+
+    // Wait for Endpoints to be created for the service
+    let ep_gvr = GroupVersionResource::endpoints();
+    let ep_created = wait_for(
+        store,
+        &ep_gvr,
+        Some("default"),
+        "probe-unready-svc",
+        |_| true,
+        TIMEOUT,
+    )
+    .await;
+    assert!(ep_created, "Endpoints should be created for the service");
+
+    // Allow one reconcile cycle
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let ep_val = store
+        .get(&ResourceRef {
+            gvr: &ep_gvr,
+            namespace: Some("default"),
+            name: "probe-unready-svc",
+        })
+        .unwrap()
+        .unwrap();
+
+    let addr_count = ep_val
+        .get("subsets")
+        .and_then(|s| s.as_array())
+        .and_then(|a| a.first())
+        .and_then(|s| s.get("addresses"))
+        .and_then(|a| a.as_array())
+        .map(|a| a.len())
+        .unwrap_or(0);
+
+    assert_eq!(
+        addr_count, 0,
+        "pod with failing readiness probe should not appear in Endpoints (got {addr_count})"
+    );
+
+    cluster.shutdown().await;
+}
+
+// ---------------------------------------------------------------
+// Kubelet: exponential backoff between restarts
+// ---------------------------------------------------------------
+
+#[tokio::test]
+async fn kubelet_restart_backoff() {
+    let cluster = TestCluster::start().await;
+    let store = &cluster.store;
+
+    let pod = Pod {
+        metadata: ObjectMeta {
+            name: Some("backoff-pod".into()),
+            namespace: Some("default".into()),
+            ..Default::default()
+        },
+        spec: Some(PodSpec {
+            containers: vec![Container {
+                name: "worker".into(),
+                image: Some("busybox:latest".into()),
+                ..Default::default()
+            }],
+            ..Default::default() // restartPolicy defaults to "Always"
+        }),
+        status: None,
+    };
+
+    let pod_gvr = GroupVersionResource::pods();
+    store
+        .create(
+            ResourceRef {
+                gvr: &pod_gvr,
+                namespace: Some("default"),
+                name: "backoff-pod",
+            },
+            &serde_json::to_value(&pod).unwrap(),
+        )
+        .unwrap();
+
+    // Wait for initial Running
+    let running = wait_for(
+        store,
+        &pod_gvr,
+        Some("default"),
+        "backoff-pod",
+        |v| {
+            v.get("status")
+                .and_then(|s| s.get("phase"))
+                .and_then(|p| p.as_str())
+                == Some("Running")
+        },
+        TIMEOUT,
+    )
+    .await;
+    assert!(running, "pod should reach Running");
+
+    // First crash → restartCount = 1
+    cluster.runtime.stop_matching("backoff-pod");
+
+    let first_restart = wait_for(
+        store,
+        &pod_gvr,
+        Some("default"),
+        "backoff-pod",
+        |v| {
+            let phase = v
+                .get("status")
+                .and_then(|s| s.get("phase"))
+                .and_then(|p| p.as_str());
+            let count = v
+                .get("status")
+                .and_then(|s| s.get("containerStatuses"))
+                .and_then(|v| v.as_array())
+                .and_then(|a| a.first())
+                .and_then(|c| c.get("restartCount"))
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
+            phase == Some("Running") && count >= 1
+        },
+        TIMEOUT,
+    )
+    .await;
+    assert!(first_restart, "first restart should complete");
+
+    // Second crash immediately after first restart
+    cluster.runtime.stop_matching("backoff-pod");
+
+    // After 2s, pod must NOT have restarted yet (backoff = 10s after first restart)
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let val = store
+        .get(&ResourceRef {
+            gvr: &pod_gvr,
+            namespace: Some("default"),
+            name: "backoff-pod",
+        })
+        .unwrap()
+        .unwrap();
+    let count_after_2s = val
+        .get("status")
+        .and_then(|s| s.get("containerStatuses"))
+        .and_then(|v| v.as_array())
+        .and_then(|a| a.first())
+        .and_then(|c| c.get("restartCount"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    assert_eq!(
+        count_after_2s, 1,
+        "pod should not restart within backoff window (restartCount should still be 1)"
+    );
+
+    // After the 10s backoff expires the pod should restart (restartCount = 2)
+    let second_restart = wait_for(
+        store,
+        &pod_gvr,
+        Some("default"),
+        "backoff-pod",
+        |v| {
+            let phase = v
+                .get("status")
+                .and_then(|s| s.get("phase"))
+                .and_then(|p| p.as_str());
+            let count = v
+                .get("status")
+                .and_then(|s| s.get("containerStatuses"))
+                .and_then(|v| v.as_array())
+                .and_then(|a| a.first())
+                .and_then(|c| c.get("restartCount"))
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
+            phase == Some("Running") && count >= 2
+        },
+        Duration::from_secs(20), // 10s backoff + margin
+    )
+    .await;
+    assert!(second_restart, "second restart should happen after backoff expires");
 
     cluster.shutdown().await;
 }

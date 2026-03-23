@@ -7,10 +7,11 @@ pub use k8s_openapi::api::core::v1::{
     ConfigMap, ConfigMapVolumeSource, Container, ContainerPort, ContainerState,
     ContainerStateRunning, ContainerStateTerminated, ContainerStateWaiting, ContainerStatus,
     EmptyDirVolumeSource, EndpointAddress, EndpointPort, EndpointSubset, Endpoints, EnvVar,
-    EnvVarSource, HostPathVolumeSource, LocalObjectReference, Namespace, NamespaceStatus, Node,
-    NodeCondition, NodeSpec, NodeStatus, NodeSystemInfo, ObjectReference, Pod, PodCondition, PodIP,
-    PodSpec, PodStatus, PodTemplateSpec, Secret, SecretVolumeSource, Service, ServiceAccount,
-    ServicePort, ServiceSpec, Volume, VolumeMount,
+    EnvVarSource, ExecAction, HTTPGetAction, HostPathVolumeSource, LocalObjectReference, Namespace,
+    NamespaceStatus, Node, NodeCondition, NodeSpec, NodeStatus, NodeSystemInfo, ObjectReference,
+    Pod, PodCondition, PodIP, PodSpec, PodStatus, PodTemplateSpec, Probe, Secret,
+    SecretVolumeSource, Service, ServiceAccount, ServicePort, ServiceSpec, TCPSocketAction, Volume,
+    VolumeMount,
 };
 
 pub use k8s_openapi::apimachinery::pkg::api::resource::Quantity;

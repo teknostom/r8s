@@ -121,7 +121,11 @@ mod tests {
         assert!(!has_raw_value_indexing(r#"&["foo", "bar"]"#));
         assert!(!has_raw_value_indexing(r#"vec!["hello"]"#));
         assert!(!has_raw_value_indexing(r#".args(["apply", "-f"])"#));
-        assert!(!has_raw_value_indexing(r#"for ns in ["default", "kube-system"]"#));
-        assert!(!has_raw_value_indexing(r#"str_val(obj, &["metadata", "name"])"#));
+        assert!(!has_raw_value_indexing(
+            r#"for ns in ["default", "kube-system"]"#
+        ));
+        assert!(!has_raw_value_indexing(
+            r#"str_val(obj, &["metadata", "name"])"#
+        ));
     }
 }

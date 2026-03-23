@@ -153,6 +153,14 @@ fn reconcile_service(store: &Store, service_value: &serde_json::Value) -> anyhow
             if status.phase.as_deref() != Some("Running") {
                 return None;
             }
+            let ready = status
+                .conditions
+                .as_ref()
+                .and_then(|c| c.iter().find(|c| c.type_ == "Ready"))
+                .is_some_and(|c| c.status == "True");
+            if !ready {
+                return None;
+            }
             let pod_name = pod.metadata.name.as_deref()?;
             let pod_ns = pod.metadata.namespace.as_deref().unwrap_or("default");
             Some(EndpointAddress {

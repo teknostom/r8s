@@ -1,3 +1,5 @@
+mod probe;
+
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
@@ -9,19 +11,32 @@ use r8s_runtime::{ContainerConfig, ContainerId, ContainerRuntime, Mount, Registr
 use r8s_store::{Store, backend::ResourceRef, watch::WatchEventType};
 use r8s_types::{
     ContainerState, ContainerStateRunning, ContainerStatus, GroupVersionResource, Pod,
-    PodCondition, PodIP, PodStatus, Time, Volume, VolumeMount,
+    PodCondition, PodIP, PodSpec, PodStatus, Time, Volume, VolumeMount,
 };
 use rustc_hash::FxHashMap;
 use tokio::sync::{Mutex, broadcast};
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 const NODE_NAME: &str = "r8s-node";
+const MAX_BACKOFF: Duration = Duration::from_secs(300);
+const INITIAL_BACKOFF: Duration = Duration::from_secs(10);
+
+struct ProbeState {
+    last_check: Instant,
+    consecutive_failures: i32,
+}
 
 struct TrackedPod {
     container_ids: Vec<ContainerId>,
     ip_num: u32,
     name: String,
     namespace: Option<String>,
+    restart_count: i32,
+    last_restart: Option<Instant>,
+    liveness: Option<ProbeState>,
+    readiness: Option<ProbeState>,
+    ready: bool,
 }
 
 struct PodState {
@@ -57,6 +72,16 @@ impl IpPool {
     fn release(&mut self, ip: u32) {
         self.free.push(ip);
     }
+}
+
+fn restart_backoff(restart_count: i32) -> Duration {
+    if restart_count <= 0 {
+        return Duration::ZERO;
+    }
+    let secs = INITIAL_BACKOFF
+        .as_secs()
+        .saturating_mul(1u64 << (restart_count - 1).min(30));
+    Duration::from_secs(secs).min(MAX_BACKOFF)
 }
 
 pub async fn run<R: ContainerRuntime + 'static>(
@@ -222,8 +247,85 @@ async fn reconcile_pod<R: ContainerRuntime>(
         }
     };
 
+    let container_ids = match start_containers(
+        runtime,
+        store,
+        pod_name,
+        pod_ns,
+        pod_value,
+        spec,
+        &volume_paths,
+    )
+    .await
+    {
+        Ok(ids) => ids,
+        Err(ids) => {
+            for cid in &ids {
+                let _ = runtime.stop_container(cid, Duration::from_secs(5)).await;
+                let _ = runtime.remove_container(cid).await;
+            }
+            state.ip_pool.release(ip_num);
+            cleanup_pod_volumes(data_dir, &pod_uid);
+            tracing::warn!("pod '{pod_name}': rolled back {} containers", ids.len());
+            return;
+        }
+    };
+
+    if !container_ids.is_empty() {
+        match runtime.container_pid(&container_ids[0]).await {
+            Ok(pid) => {
+                let pod_ip = format!("10.244.0.{ip_num}");
+                if let Err(e) = r8s_network::bridge::setup_pod_network(pid, &pod_ip, pod_name) {
+                    tracing::error!("pod '{pod_name}': network setup failed: {e}");
+                }
+            }
+            Err(e) => tracing::warn!("pod '{pod_name}': network setup failed: {e}"),
+        }
+    }
+
+    let has_liveness = spec.containers.iter().any(|c| c.liveness_probe.is_some());
+    let has_readiness = spec.containers.iter().any(|c| c.readiness_probe.is_some());
+
+    let tracked = TrackedPod {
+        container_ids,
+        ip_num,
+        name: pod_name.to_string(),
+        namespace: pod_ns.map(String::from),
+        restart_count: 0,
+        last_restart: None,
+        liveness: if has_liveness {
+            Some(ProbeState {
+                last_check: Instant::now(),
+                consecutive_failures: 0,
+            })
+        } else {
+            None
+        },
+        readiness: if has_readiness {
+            Some(ProbeState {
+                last_check: Instant::now(),
+                consecutive_failures: 0,
+            })
+        } else {
+            None
+        },
+        ready: !has_readiness, // ready immediately if no readiness probe
+    };
+    update_pod_status(store, &tracked);
+    state.pods.insert(pod_uid, tracked);
+}
+
+/// Start all containers for a pod. Returns Ok(ids) on success, Err(partial_ids) on failure.
+async fn start_containers<R: ContainerRuntime>(
+    runtime: &R,
+    store: &Store,
+    pod_name: &str,
+    pod_ns: Option<&str>,
+    pod_value: &serde_json::Value,
+    spec: &PodSpec,
+    volume_paths: &FxHashMap<String, String>,
+) -> Result<Vec<ContainerId>, Vec<ContainerId>> {
     let mut container_ids: Vec<ContainerId> = Vec::new();
-    let mut failed = false;
 
     for container_spec in &spec.containers {
         let container_name = &container_spec.name;
@@ -247,14 +349,13 @@ async fn reconcile_pod<R: ContainerRuntime>(
             let auth = resolve_image_auth(store, pod_ns, pod_value, image);
             if let Err(e) = runtime.pull_image(image, auth.as_ref()).await {
                 tracing::error!("pod '{pod_name}': failed to pull image '{image}': {e}");
-                failed = true;
-                break;
+                return Err(container_ids);
             }
         }
 
         let mounts = resolve_mounts(
             container_spec.volume_mounts.as_deref().unwrap_or_default(),
-            &volume_paths,
+            volume_paths,
         );
 
         let mut env: Vec<(String, String)> = container_spec
@@ -287,8 +388,7 @@ async fn reconcile_pod<R: ContainerRuntime>(
                 tracing::error!(
                     "pod '{pod_name}': failed to create container '{container_name}': {e}"
                 );
-                failed = true;
-                break;
+                return Err(container_ids);
             }
         };
 
@@ -296,8 +396,7 @@ async fn reconcile_pod<R: ContainerRuntime>(
 
         if let Err(e) = runtime.start_container(&container_id).await {
             tracing::error!("pod '{pod_name}': failed to start container '{container_name}': {e}");
-            failed = true;
-            break;
+            return Err(container_ids);
         }
 
         tracing::info!(
@@ -306,40 +405,7 @@ async fn reconcile_pod<R: ContainerRuntime>(
         );
     }
 
-    if failed {
-        for cid in &container_ids {
-            let _ = runtime.stop_container(cid, Duration::from_secs(5)).await;
-            let _ = runtime.remove_container(cid).await;
-        }
-        state.ip_pool.release(ip_num);
-        cleanup_pod_volumes(data_dir, &pod_uid);
-        tracing::warn!(
-            "pod '{pod_name}': rolled back {} containers",
-            container_ids.len()
-        );
-        return;
-    }
-
-    if !container_ids.is_empty() {
-        match runtime.container_pid(&container_ids[0]).await {
-            Ok(pid) => {
-                let pod_ip = format!("10.244.0.{ip_num}");
-                if let Err(e) = r8s_network::bridge::setup_pod_network(pid, &pod_ip, pod_name) {
-                    tracing::error!("pod '{pod_name}': network setup failed: {e}");
-                }
-            }
-            Err(e) => tracing::warn!("pod '{pod_name}': network setup failed: {e}"),
-        }
-    }
-
-    let tracked = TrackedPod {
-        container_ids,
-        ip_num,
-        name: pod_name.to_string(),
-        namespace: pod_ns.map(String::from),
-    };
-    update_pod_status(store, &tracked);
-    state.pods.insert(pod_uid, tracked);
+    Ok(container_ids)
 }
 
 fn update_pod_status(store: &Store, tracked: &TrackedPod) {
@@ -379,9 +445,9 @@ fn update_pod_status(store: &Store, tracked: &TrackedPod) {
                 image: image.clone(),
                 image_id: image,
                 container_id: Some(cid.0.clone()),
-                ready: true,
+                ready: tracked.ready,
                 started: Some(true),
-                restart_count: 0,
+                restart_count: tracked.restart_count,
                 state: Some(ContainerState {
                     running: Some(ContainerStateRunning {
                         started_at: Some(now.clone()),
@@ -399,11 +465,22 @@ fn update_pod_status(store: &Store, tracked: &TrackedPod) {
         .and_then(|s| s.conditions.clone())
         .unwrap_or_default();
 
-    for type_name in ["Ready", "Initialized", "ContainersReady"] {
-        if !conditions.iter().any(|c| c.type_ == type_name) {
+    let ready_status = if tracked.ready { "True" } else { "False" };
+    for type_name in ["Initialized", "ContainersReady", "Ready"] {
+        let status_val = if type_name == "Initialized" {
+            "True"
+        } else {
+            ready_status
+        };
+        if let Some(cond) = conditions.iter_mut().find(|c| c.type_ == type_name) {
+            if cond.status != status_val {
+                cond.status = status_val.into();
+                cond.last_transition_time = Some(now.clone());
+            }
+        } else {
             conditions.push(PodCondition {
                 type_: type_name.into(),
-                status: "True".into(),
+                status: status_val.into(),
                 last_transition_time: Some(now.clone()),
                 ..Default::default()
             });
@@ -482,6 +559,7 @@ async fn check_health<R: ContainerRuntime>(
     state: &mut PodState,
     data_dir: &Path,
 ) {
+    // Phase 1: detect crashed containers
     let mut crashed: Vec<(String, Option<i32>)> = Vec::new();
 
     for (pod_uid, tracked) in &state.pods {
@@ -511,28 +589,36 @@ async fn check_health<R: ContainerRuntime>(
         }
     }
 
+    // Phase 2: handle crashes
     for (pod_uid, exit_code) in crashed {
-        let tracked = match state.pods.remove(&pod_uid) {
+        handle_crash(store, runtime, state, data_dir, &pod_uid, exit_code).await;
+    }
+
+    // Phase 3: run probes for remaining tracked pods
+    run_probes(store, runtime, state).await;
+}
+
+async fn handle_crash<R: ContainerRuntime>(
+    store: &Store,
+    runtime: &R,
+    state: &mut PodState,
+    data_dir: &Path,
+    pod_uid: &str,
+    exit_code: Option<i32>,
+) {
+    let gvr = GroupVersionResource::pods();
+
+    let restart_policy = {
+        let tracked = match state.pods.get(pod_uid) {
             Some(t) => t,
-            None => continue,
+            None => return,
         };
-
-        for cid in &tracked.container_ids {
-            let _ = runtime.stop_container(cid, Duration::from_secs(5)).await;
-            let _ = runtime.remove_container(cid).await;
-        }
-        state.ip_pool.release(tracked.ip_num);
-        r8s_network::bridge::teardown_pod_network(&tracked.name);
-        cleanup_pod_volumes(data_dir, &pod_uid);
-
-        let gvr = GroupVersionResource::pods();
         let resource_ref = ResourceRef {
             gvr: &gvr,
             namespace: tracked.namespace.as_deref(),
             name: &tracked.name,
         };
-
-        let restart_policy = store
+        store
             .get(&resource_ref)
             .ok()
             .flatten()
@@ -542,54 +628,263 @@ async fn check_health<R: ContainerRuntime>(
                     .and_then(|v| v.as_str())
                     .map(String::from)
             })
-            .unwrap_or_else(|| "Always".to_string());
+            .unwrap_or_else(|| "Always".to_string())
+    };
 
-        let succeeded = exit_code == Some(0);
+    let succeeded = exit_code == Some(0);
+    let should_restart = match restart_policy.as_str() {
+        "Never" => false,
+        "OnFailure" => !succeeded,
+        _ => true, // "Always"
+    };
 
-        match restart_policy.as_str() {
-            // Keep in store for Job controller to observe completion
-            "Never" => {
-                let phase = if succeeded { "Succeeded" } else { "Failed" };
-                if let Ok(Some(mut pod)) = store.get(&resource_ref) {
-                    if let Some(status) = pod.get_mut("status").and_then(|v| v.as_object_mut()) {
-                        status.insert("phase".to_string(), serde_json::json!(phase));
-                    }
-                    let _ = store.update(&resource_ref, &pod);
-                }
-                tracing::info!(
-                    "pod '{}': exited (code={:?}), phase={phase}, kept in store (restartPolicy=Never)",
-                    tracked.name,
-                    exit_code,
-                );
+    if should_restart {
+        restart_in_place(store, runtime, state, data_dir, pod_uid).await;
+    } else {
+        terminate_pod(store, runtime, state, data_dir, pod_uid, exit_code).await;
+    }
+}
+
+async fn restart_in_place<R: ContainerRuntime>(
+    store: &Store,
+    runtime: &R,
+    state: &mut PodState,
+    data_dir: &Path,
+    pod_uid: &str,
+) {
+    let tracked = match state.pods.get(pod_uid) {
+        Some(t) => t,
+        None => return,
+    };
+
+    // Check backoff
+    let backoff = restart_backoff(tracked.restart_count);
+    if let Some(last) = tracked.last_restart
+        && last.elapsed() < backoff
+    {
+        return; // Not enough time elapsed, retry next tick
+    }
+
+    let pod_name = tracked.name.clone();
+    let pod_ns = tracked.namespace.clone();
+
+    // Stop & remove old containers
+    for cid in &tracked.container_ids {
+        let _ = runtime.stop_container(cid, Duration::from_secs(5)).await;
+        let _ = runtime.remove_container(cid).await;
+    }
+
+    // Re-read pod spec from store
+    let gvr = GroupVersionResource::pods();
+    let resource_ref = ResourceRef {
+        gvr: &gvr,
+        namespace: pod_ns.as_deref(),
+        name: &pod_name,
+    };
+    let pod_value = match store.get(&resource_ref) {
+        Ok(Some(v)) => v,
+        _ => return,
+    };
+    let pod: Pod = match serde_json::from_value(pod_value.clone()) {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+    let spec = match pod.spec.as_ref() {
+        Some(s) => s,
+        None => return,
+    };
+
+    let volumes = spec.volumes.as_deref().unwrap_or_default();
+    let volume_paths = match prepare_volumes(store, data_dir, pod_uid, pod_ns.as_deref(), volumes) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::error!("pod '{pod_name}': volume prep failed on restart: {e}");
+            return;
+        }
+    };
+
+    let new_ids = match start_containers(
+        runtime,
+        store,
+        &pod_name,
+        pod_ns.as_deref(),
+        &pod_value,
+        spec,
+        &volume_paths,
+    )
+    .await
+    {
+        Ok(ids) => ids,
+        Err(partial) => {
+            for cid in &partial {
+                let _ = runtime.stop_container(cid, Duration::from_secs(5)).await;
+                let _ = runtime.remove_container(cid).await;
             }
-            "OnFailure" if succeeded => {
-                if let Ok(Some(mut pod)) = store.get(&resource_ref) {
-                    if let Some(status) = pod.get_mut("status").and_then(|v| v.as_object_mut()) {
-                        status.insert("phase".to_string(), serde_json::json!("Succeeded"));
+            tracing::error!("pod '{pod_name}': restart failed, will retry next tick");
+            return;
+        }
+    };
+
+    let tracked = state.pods.get_mut(pod_uid).unwrap();
+    tracked.container_ids = new_ids;
+    tracked.restart_count += 1;
+    tracked.last_restart = Some(Instant::now());
+
+    tracing::info!(
+        "pod '{pod_name}': restarted in-place (restart_count={})",
+        tracked.restart_count
+    );
+    update_pod_status(store, tracked);
+}
+
+async fn terminate_pod<R: ContainerRuntime>(
+    store: &Store,
+    runtime: &R,
+    state: &mut PodState,
+    data_dir: &Path,
+    pod_uid: &str,
+    exit_code: Option<i32>,
+) {
+    let tracked = match state.pods.remove(pod_uid) {
+        Some(t) => t,
+        None => return,
+    };
+
+    // Containers are already stopped (they crashed), but clean up
+    for cid in &tracked.container_ids {
+        let _ = runtime.stop_container(cid, Duration::from_secs(1)).await;
+        let _ = runtime.remove_container(cid).await;
+    }
+    state.ip_pool.release(tracked.ip_num);
+    r8s_network::bridge::teardown_pod_network(&tracked.name);
+    cleanup_pod_volumes(data_dir, pod_uid);
+
+    let gvr = GroupVersionResource::pods();
+    let resource_ref = ResourceRef {
+        gvr: &gvr,
+        namespace: tracked.namespace.as_deref(),
+        name: &tracked.name,
+    };
+
+    let phase = if exit_code == Some(0) {
+        "Succeeded"
+    } else {
+        "Failed"
+    };
+    if let Ok(Some(mut pod)) = store.get(&resource_ref) {
+        if let Some(status) = pod.get_mut("status").and_then(|v| v.as_object_mut()) {
+            status.insert("phase".to_string(), serde_json::json!(phase));
+        }
+        let _ = store.update(&resource_ref, &pod);
+    }
+    tracing::info!(
+        "pod '{}': terminated (code={:?}, phase={phase})",
+        tracked.name,
+        exit_code,
+    );
+}
+
+async fn run_probes<R: ContainerRuntime>(store: &Store, runtime: &R, state: &mut PodState) {
+    let now = Instant::now();
+    let mut liveness_failures: Vec<String> = Vec::new();
+    let mut readiness_changes: Vec<(String, bool)> = Vec::new();
+
+    for (pod_uid, tracked) in &mut state.pods {
+        let gvr = GroupVersionResource::pods();
+        let resource_ref = ResourceRef {
+            gvr: &gvr,
+            namespace: tracked.namespace.as_deref(),
+            name: &tracked.name,
+        };
+        let pod_value = match store.get(&resource_ref) {
+            Ok(Some(v)) => v,
+            _ => continue,
+        };
+        let pod: Pod = match serde_json::from_value(pod_value) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        let spec = match pod.spec.as_ref() {
+            Some(s) => s,
+            None => continue,
+        };
+        let pod_ip = format!("10.244.0.{}", tracked.ip_num);
+
+        let pid = match tracked.container_ids.first() {
+            Some(cid) => match runtime.container_pid(cid).await {
+                Ok(p) => p,
+                Err(_) => continue,
+            },
+            None => continue,
+        };
+
+        // Liveness probe — first container's probe for simplicity
+        if let Some(ref mut probe_state) = tracked.liveness
+            && let Some(probe_spec) = spec
+                .containers
+                .first()
+                .and_then(|c| c.liveness_probe.as_ref())
+        {
+            let period = Duration::from_secs(probe_spec.period_seconds.unwrap_or(10) as u64);
+            let failure_threshold = probe_spec.failure_threshold.unwrap_or(3);
+            if now.duration_since(probe_state.last_check) >= period {
+                probe_state.last_check = now;
+                let ok = probe::exec_probe(probe_spec, &pod_ip, pid).await;
+                if ok {
+                    probe_state.consecutive_failures = 0;
+                } else {
+                    probe_state.consecutive_failures += 1;
+                    if probe_state.consecutive_failures >= failure_threshold {
+                        tracing::warn!(
+                            "pod '{}': liveness probe failed {} times, restarting",
+                            tracked.name,
+                            probe_state.consecutive_failures
+                        );
+                        probe_state.consecutive_failures = 0;
+                        liveness_failures.push(pod_uid.clone());
                     }
-                    let _ = store.update(&resource_ref, &pod);
                 }
-                tracing::info!(
-                    "pod '{}': succeeded, kept in store (restartPolicy=OnFailure)",
-                    tracked.name,
-                );
             }
-            // Delete so controller recreates
-            _ => {
-                if let Ok(Some(mut pod)) = store.get(&resource_ref) {
-                    if let Some(status) = pod.get_mut("status").and_then(|v| v.as_object_mut()) {
-                        status.insert("phase".to_string(), serde_json::json!("Failed"));
+        }
+
+        // Readiness probe
+        if let Some(ref mut probe_state) = tracked.readiness
+            && let Some(probe_spec) = spec
+                .containers
+                .first()
+                .and_then(|c| c.readiness_probe.as_ref())
+        {
+            let period = Duration::from_secs(probe_spec.period_seconds.unwrap_or(10) as u64);
+            let failure_threshold = probe_spec.failure_threshold.unwrap_or(3);
+            if now.duration_since(probe_state.last_check) >= period {
+                probe_state.last_check = now;
+                let ok = probe::exec_probe(probe_spec, &pod_ip, pid).await;
+                if ok {
+                    probe_state.consecutive_failures = 0;
+                    if !tracked.ready {
+                        readiness_changes.push((pod_uid.clone(), true));
                     }
-                    let _ = store.update(&resource_ref, &pod);
+                } else {
+                    probe_state.consecutive_failures += 1;
+                    if tracked.ready && probe_state.consecutive_failures >= failure_threshold {
+                        readiness_changes.push((pod_uid.clone(), false));
+                    }
                 }
-                let _ = store.delete(&resource_ref);
-                tracing::info!(
-                    "pod '{}': crashed (code={:?}), cleaned up and deleted (ip=10.244.0.{})",
-                    tracked.name,
-                    exit_code,
-                    tracked.ip_num
-                );
             }
+        }
+    }
+
+    // Handle liveness failures — restart those pods
+    for pod_uid in liveness_failures {
+        restart_in_place(store, runtime, state, &PathBuf::new(), &pod_uid).await;
+    }
+
+    // Handle readiness changes
+    for (pod_uid, ready) in readiness_changes {
+        if let Some(tracked) = state.pods.get_mut(&pod_uid) {
+            tracked.ready = ready;
+            tracing::info!("pod '{}': readiness changed to {ready}", tracked.name);
+            update_pod_status(store, tracked);
         }
     }
 }
