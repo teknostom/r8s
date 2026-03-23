@@ -36,7 +36,10 @@ pub async fn run(store: Store, shutdown: CancellationToken) -> anyhow::Result<()
             }
             event = pod_rx.recv() => {
                 match event {
-                    Ok(event) if matches!(event.event_type, WatchEventType::Deleted) => {
+                    Ok(event) if !matches!(event.event_type, WatchEventType::Added) => {
+                        // Handle pod deletions (maintain replica count) and updates
+                        // (readiness changes affect ready_replicas). Ignore pod adds
+                        // since those are initiated by this controller.
                         let pod: Pod = match serde_json::from_value(event.object) {
                             Ok(p) => p,
                             Err(_) => continue,
@@ -138,12 +141,23 @@ fn reconcile_rs(store: &Store, rs_value: &serde_json::Value) -> anyhow::Result<(
         tracing::info!("rs '{rs_name}': deleted {to_delete} pods ({current_count} -> {desired})");
     }
 
-    let final_count = store
+    let final_pods: Vec<Pod> = store
         .list_as::<Pod>(&pod_gvr, rs_ns)?
         .into_iter()
         .filter(|p| is_owned_by(&p.metadata, current_uid))
+        .collect();
+    let final_count = final_pods.len() as i32;
+    let ready_count = final_pods
+        .iter()
+        .filter(|pod| {
+            pod.status
+                .as_ref()
+                .and_then(|s| s.conditions.as_ref())
+                .and_then(|c| c.iter().find(|c| c.type_ == "Ready"))
+                .is_some_and(|c| c.status == "True")
+        })
         .count() as i32;
-    update_rs_status(store, rs_name, rs_ns, final_count)?;
+    update_rs_status(store, rs_name, rs_ns, final_count, ready_count)?;
 
     Ok(())
 }
@@ -191,6 +205,7 @@ fn update_rs_status(
     rs_name: &str,
     rs_ns: Option<&str>,
     replica_count: i32,
+    ready_count: i32,
 ) -> anyhow::Result<()> {
     let gvr = GroupVersionResource::replica_sets();
     let resource_ref = ResourceRef {
@@ -206,8 +221,8 @@ fn update_rs_status(
 
     let status = ReplicaSetStatus {
         replicas: replica_count,
-        ready_replicas: Some(replica_count),
-        available_replicas: Some(replica_count),
+        ready_replicas: Some(ready_count),
+        available_replicas: Some(ready_count),
         ..Default::default()
     };
     let new_status_val = serde_json::to_value(&status)?;

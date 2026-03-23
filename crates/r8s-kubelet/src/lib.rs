@@ -36,6 +36,8 @@ struct TrackedPod {
     last_restart: Option<Instant>,
     liveness: Option<ProbeState>,
     readiness: Option<ProbeState>,
+    startup: Option<ProbeState>,
+    started: bool, // true once startup probe succeeds (or immediately if no startup probe)
     ready: bool,
 }
 
@@ -285,6 +287,7 @@ async fn reconcile_pod<R: ContainerRuntime>(
 
     let has_liveness = spec.containers.iter().any(|c| c.liveness_probe.is_some());
     let has_readiness = spec.containers.iter().any(|c| c.readiness_probe.is_some());
+    let has_startup = spec.containers.iter().any(|c| c.startup_probe.is_some());
 
     let tracked = TrackedPod {
         container_ids,
@@ -309,7 +312,16 @@ async fn reconcile_pod<R: ContainerRuntime>(
         } else {
             None
         },
-        ready: !has_readiness, // ready immediately if no readiness probe
+        startup: if has_startup {
+            Some(ProbeState {
+                last_check: Instant::now(),
+                consecutive_failures: 0,
+            })
+        } else {
+            None
+        },
+        started: !has_startup,
+        ready: !has_readiness && !has_startup,
     };
     update_pod_status(store, &tracked);
     state.pods.insert(pod_uid, tracked);
@@ -435,10 +447,22 @@ fn update_pod_status(store: &Store, tracked: &TrackedPod) {
         .map(|s| s.containers.as_slice())
         .unwrap_or_default();
 
+    let existing_statuses = current_pod
+        .status
+        .as_ref()
+        .and_then(|s| s.container_statuses.as_ref());
+
     let container_statuses: Vec<ContainerStatus> = containers
         .iter()
         .zip(tracked.container_ids.iter())
         .map(|(spec, cid)| {
+            // Preserve the original startedAt so it doesn't reset on every status update
+            let started_at = existing_statuses
+                .and_then(|cs| cs.iter().find(|c| c.name == spec.name))
+                .and_then(|c| c.state.as_ref())
+                .and_then(|s| s.running.as_ref())
+                .and_then(|r| r.started_at.clone())
+                .unwrap_or_else(|| now.clone());
             let image = spec.image.clone().unwrap_or_default();
             ContainerStatus {
                 name: spec.name.clone(),
@@ -450,7 +474,7 @@ fn update_pod_status(store: &Store, tracked: &TrackedPod) {
                 restart_count: tracked.restart_count,
                 state: Some(ContainerState {
                     running: Some(ContainerStateRunning {
-                        started_at: Some(now.clone()),
+                        started_at: Some(started_at),
                     }),
                     ..Default::default()
                 }),
@@ -487,12 +511,18 @@ fn update_pod_status(store: &Store, tracked: &TrackedPod) {
         }
     }
 
+    let start_time = current_pod
+        .status
+        .as_ref()
+        .and_then(|s| s.start_time.clone())
+        .unwrap_or_else(|| now.clone());
+
     let status = PodStatus {
         phase: Some("Running".into()),
         host_ip: Some("127.0.0.1".into()),
         pod_ip: Some(pod_ip.clone()),
         pod_ips: Some(vec![PodIP { ip: pod_ip.clone() }]),
-        start_time: Some(now),
+        start_time: Some(start_time),
         conditions: Some(conditions),
         container_statuses: Some(container_statuses),
         ..Default::default()
@@ -788,6 +818,7 @@ async fn run_probes<R: ContainerRuntime>(store: &Store, runtime: &R, state: &mut
     let now = Instant::now();
     let mut liveness_failures: Vec<String> = Vec::new();
     let mut readiness_changes: Vec<(String, bool)> = Vec::new();
+    let mut startup_successes: Vec<String> = Vec::new();
 
     for (pod_uid, tracked) in &mut state.pods {
         let gvr = GroupVersionResource::pods();
@@ -817,6 +848,38 @@ async fn run_probes<R: ContainerRuntime>(store: &Store, runtime: &R, state: &mut
             },
             None => continue,
         };
+
+        // Startup probe — must succeed before liveness/readiness are enabled
+        if let Some(ref mut probe_state) = tracked.startup
+            && !tracked.started
+            && let Some(probe_spec) = spec
+                .containers
+                .first()
+                .and_then(|c| c.startup_probe.as_ref())
+        {
+            let period = Duration::from_secs(probe_spec.period_seconds.unwrap_or(10) as u64);
+            let failure_threshold = probe_spec.failure_threshold.unwrap_or(3);
+            if now.duration_since(probe_state.last_check) >= period {
+                probe_state.last_check = now;
+                let ok = probe::exec_probe(probe_spec, &pod_ip, pid).await;
+                if ok {
+                    tracing::info!("pod '{}': startup probe succeeded", tracked.name);
+                    startup_successes.push(pod_uid.clone());
+                } else {
+                    probe_state.consecutive_failures += 1;
+                    if probe_state.consecutive_failures >= failure_threshold {
+                        tracing::warn!(
+                            "pod '{}': startup probe failed {} times, restarting",
+                            tracked.name,
+                            probe_state.consecutive_failures
+                        );
+                        probe_state.consecutive_failures = 0;
+                        liveness_failures.push(pod_uid.clone());
+                    }
+                }
+            }
+            continue; // Don't run liveness/readiness until startup probe succeeds
+        }
 
         // Liveness probe — first container's probe for simplicity
         if let Some(ref mut probe_state) = tracked.liveness
@@ -870,6 +933,18 @@ async fn run_probes<R: ContainerRuntime>(store: &Store, runtime: &R, state: &mut
                         readiness_changes.push((pod_uid.clone(), false));
                     }
                 }
+            }
+        }
+    }
+
+    // Handle startup probe successes — mark pod as started, enable liveness/readiness
+    for pod_uid in startup_successes {
+        if let Some(tracked) = state.pods.get_mut(&pod_uid) {
+            tracked.started = true;
+            tracked.startup = None;
+            if tracked.readiness.is_none() {
+                tracked.ready = true;
+                update_pod_status(store, tracked);
             }
         }
     }
