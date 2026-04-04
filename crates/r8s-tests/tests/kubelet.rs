@@ -282,3 +282,124 @@ async fn kubelet_restart_backoff() {
 
     cluster.shutdown().await;
 }
+
+// ---------------------------------------------------------------
+// CrashLoopBackOff status reporting
+// ---------------------------------------------------------------
+
+#[tokio::test]
+async fn kubelet_crashloopbackoff_status() {
+    let cluster = TestCluster::start().await;
+    let pod_gvr = GroupVersionResource::pods();
+
+    let pod = make_pod("clb-pod", "busybox:latest");
+    cluster.create(&pod_gvr, "default", "clb-pod", &pod);
+
+    let running = wait_for(
+        &cluster.store, &pod_gvr, Some("default"), "clb-pod",
+        |v| has_phase(v, "Running"), TIMEOUT,
+    ).await;
+    assert!(running, "pod should reach Running");
+
+    // First crash → immediate restart (no backoff for first crash)
+    cluster.runtime.stop_matching("clb-pod");
+
+    let first_restart = wait_for(
+        &cluster.store, &pod_gvr, Some("default"), "clb-pod",
+        |v| {
+            let count = v["status"]["containerStatuses"]
+                .as_array()
+                .and_then(|a| a.first())
+                .and_then(|c| c["restartCount"].as_i64())
+                .unwrap_or(0);
+            has_phase(v, "Running") && count >= 1
+        },
+        TIMEOUT,
+    ).await;
+    assert!(first_restart, "first restart should complete");
+
+    // Second crash — this triggers the 10s backoff window
+    cluster.runtime.stop_matching("clb-pod");
+
+    // During backoff, container state should show CrashLoopBackOff
+    let crashloop = wait_for(
+        &cluster.store, &pod_gvr, Some("default"), "clb-pod",
+        |v| {
+            let cs = &v["status"]["containerStatuses"];
+            let reason = cs[0]["state"]["waiting"]["reason"].as_str();
+            reason == Some("CrashLoopBackOff")
+        },
+        TIMEOUT,
+    ).await;
+    assert!(crashloop, "container should show CrashLoopBackOff during backoff");
+
+    // Verify last_state shows Terminated
+    let val = cluster.get(&pod_gvr, "default", "clb-pod");
+    let cs = &val["status"]["containerStatuses"][0];
+
+    let last_terminated = cs["lastState"]["terminated"]["exitCode"].as_i64();
+    assert_eq!(last_terminated, Some(0), "lastState should show Terminated with exit code");
+
+    let reason = cs["lastState"]["terminated"]["reason"].as_str();
+    assert_eq!(reason, Some("Completed"), "lastState reason should be Completed for exit code 0");
+
+    // Container should be not ready during CrashLoopBackOff
+    assert_eq!(cs["ready"].as_bool(), Some(false), "container should not be ready during CrashLoopBackOff");
+    assert_eq!(cs["started"].as_bool(), Some(false), "container should not be started during CrashLoopBackOff");
+
+    cluster.shutdown().await;
+}
+
+#[tokio::test]
+async fn kubelet_crashloopbackoff_error_exit() {
+    let cluster = TestCluster::start().await;
+    let pod_gvr = GroupVersionResource::pods();
+
+    let mut pod = make_pod("clb-err", "busybox:latest");
+    pod.spec.as_mut().unwrap().restart_policy = Some("OnFailure".into());
+    cluster.create(&pod_gvr, "default", "clb-err", &pod);
+
+    let running = wait_for(
+        &cluster.store, &pod_gvr, Some("default"), "clb-err",
+        |v| has_phase(v, "Running"), TIMEOUT,
+    ).await;
+    assert!(running, "pod should reach Running");
+
+    // Crash with non-zero exit code
+    cluster.runtime.stop_matching_with_code("clb-err", 137);
+
+    let first_restart = wait_for(
+        &cluster.store, &pod_gvr, Some("default"), "clb-err",
+        |v| {
+            let count = v["status"]["containerStatuses"]
+                .as_array()
+                .and_then(|a| a.first())
+                .and_then(|c| c["restartCount"].as_i64())
+                .unwrap_or(0);
+            has_phase(v, "Running") && count >= 1
+        },
+        TIMEOUT,
+    ).await;
+    assert!(first_restart, "first restart should complete");
+
+    // Second crash with error code
+    cluster.runtime.stop_matching_with_code("clb-err", 1);
+
+    // During backoff, last_state should show the error exit code
+    let crashloop = wait_for(
+        &cluster.store, &pod_gvr, Some("default"), "clb-err",
+        |v| {
+            let cs = &v["status"]["containerStatuses"][0];
+            let waiting_reason = cs["state"]["waiting"]["reason"].as_str();
+            let last_exit = cs["lastState"]["terminated"]["exitCode"].as_i64();
+            let last_reason = cs["lastState"]["terminated"]["reason"].as_str();
+            waiting_reason == Some("CrashLoopBackOff")
+                && last_exit == Some(1)
+                && last_reason == Some("Error")
+        },
+        TIMEOUT,
+    ).await;
+    assert!(crashloop, "should show CrashLoopBackOff with Error terminated state");
+
+    cluster.shutdown().await;
+}

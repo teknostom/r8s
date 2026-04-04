@@ -10,8 +10,9 @@ use base64::Engine;
 use r8s_runtime::{ContainerConfig, ContainerId, ContainerRuntime, Mount, RegistryAuth};
 use r8s_store::{Store, backend::ResourceRef, watch::WatchEventType};
 use r8s_types::{
-    ContainerState, ContainerStateRunning, ContainerStatus, GroupVersionResource, Pod,
-    PodCondition, PodIP, PodSpec, PodStatus, Time, Volume, VolumeMount,
+    ContainerState, ContainerStateRunning, ContainerStateTerminated, ContainerStateWaiting,
+    ContainerStatus, GroupVersionResource, Pod, PodCondition, PodIP, PodSpec, PodStatus, Time,
+    Volume, VolumeMount,
 };
 use rustc_hash::FxHashMap;
 use tokio::sync::{Mutex, broadcast};
@@ -34,6 +35,10 @@ struct TrackedPod {
     namespace: Option<String>,
     restart_count: i32,
     last_restart: Option<Instant>,
+    /// True when containers have crashed and we're waiting for backoff before restart.
+    waiting_restart: bool,
+    /// Exit code from the most recent crash (used for Terminated last_state).
+    last_exit_code: Option<i32>,
     liveness: Option<ProbeState>,
     readiness: Option<ProbeState>,
     startup: Option<ProbeState>,
@@ -296,6 +301,8 @@ async fn reconcile_pod<R: ContainerRuntime>(
         namespace: pod_ns.map(String::from),
         restart_count: 0,
         last_restart: None,
+        waiting_restart: false,
+        last_exit_code: None,
         liveness: if has_liveness {
             Some(ProbeState {
                 last_check: Instant::now(),
@@ -456,29 +463,76 @@ fn update_pod_status(store: &Store, tracked: &TrackedPod) {
         .iter()
         .zip(tracked.container_ids.iter())
         .map(|(spec, cid)| {
-            // Preserve the original startedAt so it doesn't reset on every status update
-            let started_at = existing_statuses
-                .and_then(|cs| cs.iter().find(|c| c.name == spec.name))
-                .and_then(|c| c.state.as_ref())
-                .and_then(|s| s.running.as_ref())
-                .and_then(|r| r.started_at.clone())
-                .unwrap_or_else(|| now.clone());
             let image = spec.image.clone().unwrap_or_default();
-            ContainerStatus {
-                name: spec.name.clone(),
-                image: image.clone(),
-                image_id: image,
-                container_id: Some(cid.0.clone()),
-                ready: tracked.ready,
-                started: Some(true),
-                restart_count: tracked.restart_count,
-                state: Some(ContainerState {
-                    running: Some(ContainerStateRunning {
-                        started_at: Some(started_at),
+            let existing = existing_statuses
+                .and_then(|cs| cs.iter().find(|c| c.name == spec.name));
+
+            if tracked.waiting_restart {
+                // Container has crashed — show Waiting/CrashLoopBackOff state
+                let terminated_state = ContainerState {
+                    terminated: Some(ContainerStateTerminated {
+                        exit_code: tracked.last_exit_code.unwrap_or(1),
+                        reason: Some(
+                            if tracked.last_exit_code == Some(0) {
+                                "Completed"
+                            } else {
+                                "Error"
+                            }
+                            .into(),
+                        ),
+                        finished_at: Some(now.clone()),
+                        ..Default::default()
                     }),
                     ..Default::default()
-                }),
-                ..Default::default()
+                };
+                let waiting_state = ContainerState {
+                    waiting: Some(ContainerStateWaiting {
+                        reason: Some("CrashLoopBackOff".into()),
+                        message: Some(format!(
+                            "back-off {}s restarting failed container",
+                            restart_backoff(tracked.restart_count).as_secs()
+                        )),
+                    }),
+                    ..Default::default()
+                };
+                ContainerStatus {
+                    name: spec.name.clone(),
+                    image: image.clone(),
+                    image_id: image,
+                    container_id: Some(cid.0.clone()),
+                    ready: false,
+                    started: Some(false),
+                    restart_count: tracked.restart_count,
+                    state: Some(waiting_state),
+                    last_state: Some(terminated_state),
+                    ..Default::default()
+                }
+            } else {
+                // Container is running normally
+                let started_at = existing
+                    .and_then(|c| c.state.as_ref())
+                    .and_then(|s| s.running.as_ref())
+                    .and_then(|r| r.started_at.clone())
+                    .unwrap_or_else(|| now.clone());
+                // Preserve last_state from previous crash if any
+                let last_state = existing.and_then(|c| c.last_state.clone());
+                ContainerStatus {
+                    name: spec.name.clone(),
+                    image: image.clone(),
+                    image_id: image,
+                    container_id: Some(cid.0.clone()),
+                    ready: tracked.ready,
+                    started: Some(true),
+                    restart_count: tracked.restart_count,
+                    state: Some(ContainerState {
+                        running: Some(ContainerStateRunning {
+                            started_at: Some(started_at),
+                        }),
+                        ..Default::default()
+                    }),
+                    last_state,
+                    ..Default::default()
+                }
             }
         })
         .collect();
@@ -669,6 +723,13 @@ async fn handle_crash<R: ContainerRuntime>(
     };
 
     if should_restart {
+        // Mark as crashed/waiting so status reflects CrashLoopBackOff during backoff
+        if let Some(tracked) = state.pods.get_mut(pod_uid) {
+            tracked.waiting_restart = true;
+            tracked.last_exit_code = exit_code;
+            tracked.ready = false;
+            update_pod_status(store, tracked);
+        }
         restart_in_place(store, runtime, state, data_dir, pod_uid).await;
     } else {
         terminate_pod(store, runtime, state, data_dir, pod_uid, exit_code).await;
@@ -759,6 +820,7 @@ async fn restart_in_place<R: ContainerRuntime>(
     tracked.container_ids = new_ids;
     tracked.restart_count += 1;
     tracked.last_restart = Some(Instant::now());
+    tracked.waiting_restart = false;
 
     tracing::info!(
         "pod '{pod_name}': restarted in-place (restart_count={})",
@@ -802,8 +864,41 @@ async fn terminate_pod<R: ContainerRuntime>(
         "Failed"
     };
     if let Ok(Some(mut pod)) = store.get(&resource_ref) {
+        let now = Time(chrono::Utc::now());
+        let terminated_state = ContainerState {
+            terminated: Some(ContainerStateTerminated {
+                exit_code: exit_code.unwrap_or(1),
+                reason: Some(
+                    if exit_code == Some(0) {
+                        "Completed"
+                    } else {
+                        "Error"
+                    }
+                    .into(),
+                ),
+                finished_at: Some(now),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
         if let Some(status) = pod.get_mut("status").and_then(|v| v.as_object_mut()) {
             status.insert("phase".to_string(), serde_json::json!(phase));
+            // Update each container status to show Terminated state
+            if let Some(cs) = status
+                .get_mut("containerStatuses")
+                .and_then(|v| v.as_array_mut())
+            {
+                for c in cs.iter_mut() {
+                    if let Some(obj) = c.as_object_mut() {
+                        obj.insert("ready".into(), serde_json::json!(false));
+                        obj.insert("started".into(), serde_json::json!(false));
+                        obj.insert(
+                            "state".into(),
+                            serde_json::to_value(&terminated_state).unwrap_or_default(),
+                        );
+                    }
+                }
+            }
         }
         let _ = store.update(&resource_ref, &pod);
     }
