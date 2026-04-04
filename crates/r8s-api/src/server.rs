@@ -161,7 +161,8 @@ impl ApiServer {
         }
     }
 
-    pub async fn serve(self, addr: SocketAddr, shutdown: CancellationToken) -> anyhow::Result<()> {
+    /// Build the full API router (useful for testing without binding to a port).
+    pub fn into_router(self) -> Router {
         let mut router = Router::new()
             .route("/version", get(get_version))
             .route("/api", get(get_api_versions))
@@ -230,11 +231,15 @@ impl ApiServer {
             }
         }
 
-        let router = router
+        router
             .fallback(dynamic_dispatch)
             .with_state(self.state)
             .layer(DefaultBodyLimit::max(1024 * 1024))
-            .layer(axum::middleware::from_fn(log_requests));
+            .layer(axum::middleware::from_fn(log_requests))
+    }
+
+    pub async fn serve(self, addr: SocketAddr, shutdown: CancellationToken) -> anyhow::Result<()> {
+        let router = self.into_router();
         let listener = tokio::net::TcpListener::bind(addr).await?;
         tracing::info!("API server listening on {addr}");
         axum::serve(listener, router)

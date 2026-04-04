@@ -1358,6 +1358,8 @@ name = "r8s-tests"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum 0.8.8",
+ "http-body-util",
  "r8s-api",
  "r8s-controllers",
  "r8s-kubelet",
@@ -1365,10 +1367,12 @@ dependencies = [
  "r8s-scheduler",
  "r8s-store",
  "r8s-types",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",
  "tokio-util",
+ "tower 0.5.3",
  "tracing",
 ]
 
