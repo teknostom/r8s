@@ -1,4 +1,4 @@
-use std::{path::Path, sync::Arc, time::Duration};
+use std::{path::Path, sync::{Arc, RwLock}, time::Duration};
 
 use base64::prelude::*;
 use r8s_types::{GroupVersionResource, ObjectMeta};
@@ -21,6 +21,7 @@ pub struct Store {
     revision: RevisionCounter,
     watches: WatchHub,
     index: LabelIndex,
+    view_lock: Arc<RwLock<()>>,
 }
 
 pub struct ListResult {
@@ -64,6 +65,7 @@ impl Store {
             revision: RevisionCounter::new(max_revision),
             watches: WatchHub::default(),
             index: LabelIndex::default(),
+            view_lock: Arc::new(RwLock::new(()))
         };
 
         store.start_compaction(1000, 300);
@@ -77,6 +79,7 @@ impl Store {
         object: &serde_json::Value,
     ) -> anyhow::Result<serde_json::Value> {
         let key = resource.key();
+        let _view_guard = self.view_lock.write().expect("view_lock poisoned");
         let w_transaction = self.db.begin_write()?;
         let mut obj = object.clone();
         let rev = self.revision.next();
@@ -156,8 +159,9 @@ impl Store {
         resource: &ResourceRef,
         object: &serde_json::Value,
     ) -> anyhow::Result<serde_json::Value> {
-        let w_transaction = self.db.begin_write()?;
         let key = resource.key();
+        let _view_guard = self.view_lock.write().expect("view_lock poisoned");
+        let w_transaction = self.db.begin_write()?;
         let existing: serde_json::Value = {
             let table = w_transaction.open_table(RESOURCES)?;
 
@@ -242,6 +246,7 @@ impl Store {
 
     pub fn delete(&self, resource: &ResourceRef) -> anyhow::Result<Option<serde_json::Value>> {
         let key = resource.key();
+        let _view_guard = self.view_lock.write().expect("view_lock poisoned");
         let w_transaction = self.db.begin_write()?;
 
         let obj: serde_json::Value = {
@@ -294,6 +299,7 @@ impl Store {
             None => format!("{}/", gvr.key_prefix()),
         };
 
+        let _view_guard = self.view_lock.write().expect("view_lock poisoned");
         let resource_version = self.revision.current();
 
         let r_transaction = self.db.begin_read()?;
@@ -304,6 +310,7 @@ impl Store {
         let mut last_key: Option<String> = None;
 
         let candidates = label_selector.and_then(|s| self.index.matches(&gvr.key_prefix(), s));
+        drop(_view_guard);
 
         let range_start = match continue_token {
             Some(token) => String::from_utf8(
