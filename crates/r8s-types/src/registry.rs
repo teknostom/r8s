@@ -256,6 +256,28 @@ impl ResourceRegistry {
                 "clusterrolebinding",
                 &[],
             ),
+            // admissionregistration: resources are accepted and stored so
+            // installs that ship webhook configurations (cert-manager, most
+            // operators) can proceed. r8s does not actually dial admission
+            // webhooks yet — these objects are inert until that lands.
+            (
+                "admissionregistration.k8s.io",
+                "v1",
+                "validatingwebhookconfigurations",
+                "ValidatingWebhookConfiguration",
+                false,
+                "validatingwebhookconfiguration",
+                &[],
+            ),
+            (
+                "admissionregistration.k8s.io",
+                "v1",
+                "mutatingwebhookconfigurations",
+                "MutatingWebhookConfiguration",
+                false,
+                "mutatingwebhookconfiguration",
+                &[],
+            ),
         ];
 
         for &(group, version, resource, kind, namespaced, singular, short_names) in types {

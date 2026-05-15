@@ -26,9 +26,20 @@ use serde_json::Value;
 use crate::discovery::AppState;
 use crate::response::{json_response, status_error};
 
-/// Media type gnostic uses for OpenAPI v2 protobuf. This is what client-go
-/// sends in its default Accept header.
-const PROTO_OPENAPI_V2: &str = "application/com.github.proto-openapi.spec.v2@v1.0+protobuf";
+/// Media type clients send in their Accept header to request the proto-encoded
+/// OpenAPI v2 document. This is the canonical k8s string.
+const PROTO_OPENAPI_V2_ACCEPT: &str = "application/com.github.proto-openapi.spec.v2@v1.0+protobuf";
+
+/// Content-Type advertised on the response. The canonical k8s string contains
+/// '@', which Go's `mime.ParseMediaType` rejects as an invalid token character.
+/// Older client-go paths (helm's OpenAPI fetcher, kubectl validators) run the
+/// response Content-Type through that parser before handing the bytes back to
+/// the caller, so advertising the canonical value causes those clients to
+/// abort with "mime: unexpected content after media subtype" even though the
+/// body is fine. Substituting '.' for '@' keeps the rest of the string
+/// recognizable while making the value RFC 2045-compliant.
+const PROTO_OPENAPI_V2_CONTENT_TYPE: &str =
+    "application/com.github.proto-openapi.spec.v2.v1.0+protobuf";
 
 static BASE_V2: OnceLock<Value> = OnceLock::new();
 
@@ -76,7 +87,7 @@ pub async fn get_openapi_v2(headers: http::HeaderMap, State(state): State<AppSta
         }
         return Response::builder()
             .status(200)
-            .header("content-type", PROTO_OPENAPI_V2)
+            .header("content-type", PROTO_OPENAPI_V2_CONTENT_TYPE)
             .body(Body::from(buf))
             .expect("valid response");
     }
@@ -110,11 +121,11 @@ fn definition_key(rt: &std::sync::Arc<r8s_types::ResourceType>) -> String {
 }
 
 fn wants_proto(headers: &http::HeaderMap) -> bool {
-    accept_has_mime(headers, |mime| mime == PROTO_OPENAPI_V2)
+    accept_has_mime(headers, |mime| mime == PROTO_OPENAPI_V2_ACCEPT)
 }
 
 fn accepts_json(headers: &http::HeaderMap) -> bool {
-    if headers.get(http::header::ACCEPT).is_none() {
+    if headers.get_all(http::header::ACCEPT).iter().next().is_none() {
         return true;
     }
     accept_has_mime(headers, |mime| {
@@ -124,13 +135,12 @@ fn accepts_json(headers: &http::HeaderMap) -> bool {
 
 fn accept_has_mime<F: Fn(&str) -> bool>(headers: &http::HeaderMap, f: F) -> bool {
     headers
-        .get(http::header::ACCEPT)
-        .and_then(|v| v.to_str().ok())
-        .map(|s| {
-            s.split(',').any(|part| {
-                let mime = part.split(';').next().unwrap_or("").trim();
-                f(mime)
-            })
+        .get_all(http::header::ACCEPT)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|s| s.split(','))
+        .any(|part| {
+            let mime = part.split(';').next().unwrap_or("").trim();
+            f(mime)
         })
-        .unwrap_or(false)
 }
