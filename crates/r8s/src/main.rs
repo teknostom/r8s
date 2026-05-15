@@ -158,12 +158,14 @@ fn create_cluster_dir(dir: &Path) -> anyhow::Result<()> {
 }
 
 fn write_kubeconfig(dir: &Path, name: &str) -> anyhow::Result<()> {
+    let ca_path = dir.join("certs").join("ca.crt");
     let content = format!(
         r#"apiVersion: v1
 kind: Config
 clusters:
 - cluster:
-    server: http://127.0.0.1:6443
+    server: https://127.0.0.1:6443
+    certificate-authority: {ca}
   name: r8s-{name}
 contexts:
 - context:
@@ -174,7 +176,8 @@ current-context: r8s-{name}
 users:
 - name: r8s-admin
   user: {{}}
-"#
+"#,
+        ca = ca_path.display()
     );
     std::fs::write(dir.join("kubeconfig"), content)?;
     Ok(())

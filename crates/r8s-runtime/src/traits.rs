@@ -52,6 +52,14 @@ pub trait ContainerRuntime: Send + Sync {
         config: &ContainerConfig,
     ) -> impl Future<Output = anyhow::Result<ContainerId>> + Send;
 
+    /// Prepare a container's task — fork the runc init process so namespaces
+    /// (incl. the network namespace) exist and have a stable PID, but do NOT
+    /// exec the user command yet. Letting the caller set up pod networking
+    /// against the init PID before `start_container` closes the race where a
+    /// fast-failing user process would tear down its netns before
+    /// `setup_pod_network` could nsenter into it.
+    fn prepare_task(&self, id: &ContainerId) -> impl Future<Output = anyhow::Result<()>> + Send;
+
     fn start_container(&self, id: &ContainerId) -> impl Future<Output = anyhow::Result<()>> + Send;
 
     fn stop_container(

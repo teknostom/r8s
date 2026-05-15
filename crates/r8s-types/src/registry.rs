@@ -256,6 +256,33 @@ impl ResourceRegistry {
                 "clusterrolebinding",
                 &[],
             ),
+            // coordination: Leases back the leader-election mechanism every
+            // operator uses (cert-manager, controller-runtime, etc.). The
+            // store treats Lease as opaque; correctness comes from the
+            // first-writer-wins semantics of create/update.
+            (
+                "coordination.k8s.io",
+                "v1",
+                "leases",
+                "Lease",
+                true,
+                "lease",
+                &[],
+            ),
+            // apiregistration: cert-manager's cainjector watches APIService
+            // objects (and other "injectables") to inject CA bundles. The
+            // resource is cluster-scoped and inert from r8s's perspective —
+            // we just need a place to store them so client watches don't
+            // bail at controller registration.
+            (
+                "apiregistration.k8s.io",
+                "v1",
+                "apiservices",
+                "APIService",
+                false,
+                "apiservice",
+                &[],
+            ),
             // admissionregistration: resources are accepted and stored so
             // installs that ship webhook configurations (cert-manager, most
             // operators) can proceed. r8s does not actually dial admission

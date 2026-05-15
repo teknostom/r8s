@@ -294,6 +294,7 @@ async fn reconcile_pod<R: ContainerRuntime>(
             return;
         }
     };
+    let pod_ip = format!("10.244.0.{ip_num}");
 
     let container_ids = match start_containers(
         runtime,
@@ -303,6 +304,7 @@ async fn reconcile_pod<R: ContainerRuntime>(
         pod_value,
         spec,
         &volume_paths,
+        &pod_ip,
     )
     .await
     {
@@ -318,18 +320,6 @@ async fn reconcile_pod<R: ContainerRuntime>(
             return;
         }
     };
-
-    if !container_ids.is_empty() {
-        match runtime.container_pid(&container_ids[0]).await {
-            Ok(pid) => {
-                let pod_ip = format!("10.244.0.{ip_num}");
-                if let Err(e) = r8s_network::bridge::setup_pod_network(pid, &pod_ip, pod_name) {
-                    tracing::error!("pod '{pod_name}': network setup failed: {e}");
-                }
-            }
-            Err(e) => tracing::warn!("pod '{pod_name}': network setup failed: {e}"),
-        }
-    }
 
     let has_liveness = spec.containers.iter().any(|c| c.liveness_probe.is_some());
     let has_readiness = spec.containers.iter().any(|c| c.readiness_probe.is_some());
@@ -376,6 +366,7 @@ async fn reconcile_pod<R: ContainerRuntime>(
 }
 
 /// Start all containers for a pod. Returns Ok(ids) on success, Err(partial_ids) on failure.
+#[allow(clippy::too_many_arguments)]
 async fn start_containers<R: ContainerRuntime>(
     runtime: &R,
     store: &Store,
@@ -384,8 +375,10 @@ async fn start_containers<R: ContainerRuntime>(
     pod_value: &serde_json::Value,
     spec: &PodSpec,
     volume_paths: &FxHashMap<String, String>,
+    pod_ip: &str,
 ) -> Result<Vec<ContainerId>, Vec<ContainerId>> {
     let mut container_ids: Vec<ContainerId> = Vec::new();
+    let mut network_ready = false;
 
     for container_spec in &spec.containers {
         let container_name = &container_spec.name;
@@ -429,7 +422,11 @@ async fn start_containers<R: ContainerRuntime>(
                     .collect()
             })
             .unwrap_or_default();
-        env.push(("KUBERNETES_SERVICE_HOST".into(), "10.244.0.1".into()));
+        // Point pods at the bootstrapped `kubernetes` Service ClusterIP, not
+        // the bridge gateway. nftables DNAT (synced by r8s-network from the
+        // Service's Endpoints) rewrites 10.96.0.1:443 → 10.244.0.1:6443,
+        // where the API server listens on 0.0.0.0:6443.
+        env.push(("KUBERNETES_SERVICE_HOST".into(), "10.96.0.1".into()));
         env.push(("KUBERNETES_SERVICE_PORT".into(), "443".into()));
         env.push(("KUBERNETES_SERVICE_PORT_HTTPS".into(), "443".into()));
 
@@ -455,6 +452,28 @@ async fn start_containers<R: ContainerRuntime>(
         };
 
         container_ids.push(container_id.clone());
+
+        if let Err(e) = runtime.prepare_task(&container_id).await {
+            tracing::error!("pod '{pod_name}': failed to prepare task for '{container_name}': {e}");
+            return Err(container_ids);
+        }
+
+        // Set up the pod's netns against the init process *before* the user
+        // command runs. This eliminates the race where a fast-failing app
+        // tears down its netns before kubelet can `nsenter` into it. Best
+        // effort: failures here log a warning but don't abort startup, so
+        // mock-runtime tests (which have no real bridge) keep working.
+        if !network_ready {
+            match runtime.container_pid(&container_id).await {
+                Ok(pid) => {
+                    if let Err(e) = r8s_network::bridge::setup_pod_network(pid, pod_ip, pod_name) {
+                        tracing::warn!("pod '{pod_name}': network setup failed: {e}");
+                    }
+                }
+                Err(e) => tracing::warn!("pod '{pod_name}': failed to read init PID: {e}"),
+            }
+            network_ready = true;
+        }
 
         if let Err(e) = runtime.start_container(&container_id).await {
             tracing::error!("pod '{pod_name}': failed to start container '{container_name}': {e}");
@@ -855,6 +874,7 @@ async fn restart_in_place<R: ContainerRuntime>(
         }
     };
 
+    let pod_ip = format!("10.244.0.{ip_num}");
     let new_ids = match start_containers(
         runtime,
         store,
@@ -863,6 +883,7 @@ async fn restart_in_place<R: ContainerRuntime>(
         &pod_value,
         spec,
         &volume_paths,
+        &pod_ip,
     )
     .await
     {
@@ -876,18 +897,6 @@ async fn restart_in_place<R: ContainerRuntime>(
             return;
         }
     };
-
-    if !new_ids.is_empty() {
-        match runtime.container_pid(&new_ids[0]).await {
-            Ok(pid) => {
-                let pod_ip = format!("10.244.0.{ip_num}");
-                if let Err(e) = r8s_network::bridge::setup_pod_network(pid, &pod_ip, &pod_name) {
-                    tracing::error!("pod '{pod_name}': network setup failed on restart: {e}");
-                }
-            }
-            Err(e) => tracing::warn!("pod '{pod_name}': network setup failed on restart: {e}"),
-        }
-    }
 
     let mut tracked = pod_arc.lock().await;
     tracked.container_ids = new_ids;

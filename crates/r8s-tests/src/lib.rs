@@ -39,8 +39,12 @@ impl TestCluster {
         let shutdown = CancellationToken::new();
         let registry = ResourceRegistry::default_mvp();
 
-        let mut controller_manager =
-            ControllerManager::new(store.clone(), shutdown.clone(), registry.clone());
+        let mut controller_manager = ControllerManager::new(
+            store.clone(),
+            shutdown.clone(),
+            registry.clone(),
+            String::new(),
+        );
         controller_manager.start();
 
         let scheduler_handle = {

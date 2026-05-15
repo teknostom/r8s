@@ -1,3 +1,4 @@
+pub mod certs;
 pub mod crd;
 pub mod cronjob;
 pub mod daemonset;

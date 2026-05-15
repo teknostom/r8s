@@ -561,7 +561,7 @@ impl ContainerRuntime for ContainerdRuntime {
         Ok(ContainerId(config.name.clone()))
     }
 
-    async fn start_container(&self, id: &ContainerId) -> anyhow::Result<()> {
+    async fn prepare_task(&self, id: &ContainerId) -> anyhow::Result<()> {
         let mut snapshots = SnapshotsClient::new(self.channel.clone());
         let mut mounts = Vec::new();
         for i in 0..50 {
@@ -600,7 +600,10 @@ impl ContainerRuntime for ContainerdRuntime {
         TasksClient::new(self.channel.clone())
             .create(with_namespace!(req, NAMESPACE))
             .await?;
+        Ok(())
+    }
 
+    async fn start_container(&self, id: &ContainerId) -> anyhow::Result<()> {
         let req = StartRequest {
             container_id: id.0.clone(),
             ..Default::default()

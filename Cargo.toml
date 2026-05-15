@@ -78,6 +78,12 @@ chrono = { version = "0.4", features = ["serde"] }
 rand = "0.9"
 tempfile = "3"
 
+# TLS
+rcgen = "0.13"
+rustls = "0.23"
+rustls-pemfile = "2"
+axum-server = { version = "0.7", features = ["tls-rustls-no-provider"] }
+
 # Internal crates
 r8s-types = { path = "crates/r8s-types" }
 r8s-store = { path = "crates/r8s-store" }

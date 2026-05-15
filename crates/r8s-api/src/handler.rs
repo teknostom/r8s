@@ -67,6 +67,15 @@ pub(crate) fn require_json(
     })
 }
 
+fn random_name_suffix() -> String {
+    use rand::Rng;
+    const CHARSET: &[u8] = b"bcdfghjklmnpqrstvwxz2456789";
+    let mut rng = rand::rng();
+    (0..5)
+        .map(|_| CHARSET[rng.random_range(0..CHARSET.len())] as char)
+        .collect()
+}
+
 fn wants_table(headers: &HeaderMap) -> bool {
     headers
         .get("accept")
@@ -163,13 +172,31 @@ pub(crate) fn create_impl(
         .and_then(|m| m.get("name"))
         .and_then(|n| n.as_str())
     {
-        Some(n) => n.to_string(),
-        None => {
-            return status_error(
-                StatusCode::BAD_REQUEST,
-                "Invalid",
-                "metadata.name is required",
-            );
+        Some(n) if !n.is_empty() => n.to_string(),
+        _ => {
+            // No explicit name — synthesize one from metadata.generateName if
+            // present, matching the k8s convention of `<prefix><5-rand>`.
+            let prefix = body
+                .get("metadata")
+                .and_then(|m| m.get("generateName"))
+                .and_then(|n| n.as_str())
+                .filter(|p| !p.is_empty());
+            match prefix {
+                Some(prefix) => {
+                    let generated = format!("{prefix}{}", random_name_suffix());
+                    if let Some(meta) = body.get_mut("metadata").and_then(|v| v.as_object_mut()) {
+                        meta.insert("name".to_string(), serde_json::json!(generated));
+                    }
+                    generated
+                }
+                None => {
+                    return status_error(
+                        StatusCode::BAD_REQUEST,
+                        "Invalid",
+                        "metadata.name or metadata.generateName is required",
+                    );
+                }
+            }
         }
     };
     if let Some(ns) = namespace

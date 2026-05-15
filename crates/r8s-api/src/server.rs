@@ -261,4 +261,33 @@ impl ApiServer {
             .await?;
         Ok(())
     }
+
+    pub async fn serve_tls(
+        self,
+        addr: SocketAddr,
+        cert_pem: &[u8],
+        key_pem: &[u8],
+        shutdown: CancellationToken,
+    ) -> anyhow::Result<()> {
+        // rustls needs a crypto provider installed at process scope. Picking
+        // aws-lc-rs / ring at runtime is best-effort here so test harnesses
+        // that already installed one don't blow up.
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let router = self.into_router();
+        let config =
+            axum_server::tls_rustls::RustlsConfig::from_pem(cert_pem.to_vec(), key_pem.to_vec())
+                .await?;
+        let handle = axum_server::Handle::new();
+        let shutdown_handle = handle.clone();
+        tokio::spawn(async move {
+            shutdown.cancelled().await;
+            shutdown_handle.graceful_shutdown(Some(std::time::Duration::from_secs(5)));
+        });
+        tracing::info!("API server listening (TLS) on {addr}");
+        axum_server::bind_rustls(addr, config)
+            .handle(handle)
+            .serve(router.into_make_service())
+            .await?;
+        Ok(())
+    }
 }

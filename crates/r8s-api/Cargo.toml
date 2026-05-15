@@ -21,3 +21,7 @@ prost.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 chrono.workspace = true
+rustls.workspace = true
+rustls-pemfile.workspace = true
+axum-server.workspace = true
+rand.workspace = true

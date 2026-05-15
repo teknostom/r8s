@@ -76,6 +76,10 @@ impl ContainerRuntime for MockRuntime {
         Ok(ContainerId(id))
     }
 
+    async fn prepare_task(&self, _id: &ContainerId) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     async fn start_container(&self, id: &ContainerId) -> anyhow::Result<()> {
         let mut containers = self.containers.lock().expect("mock lock poisoned");
         if let Some(c) = containers.get_mut(&id.0) {

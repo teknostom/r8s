@@ -7,15 +7,22 @@ pub struct ControllerManager {
     store: Store,
     shutdown: CancellationToken,
     registry: ResourceRegistry,
+    ca_pem: String,
     handles: Vec<JoinHandle<()>>,
 }
 
 impl ControllerManager {
-    pub fn new(store: Store, shutdown: CancellationToken, registry: ResourceRegistry) -> Self {
+    pub fn new(
+        store: Store,
+        shutdown: CancellationToken,
+        registry: ResourceRegistry,
+        ca_pem: String,
+    ) -> Self {
         Self {
             store,
             shutdown,
             registry,
+            ca_pem,
             handles: Vec::new(),
         }
     }
@@ -34,7 +41,16 @@ impl ControllerManager {
         }
 
         spawn_controller!("namespace", super::namespace::run);
-        spawn_controller!("serviceaccount", super::serviceaccount::run);
+        {
+            let store = self.store.clone();
+            let token = self.shutdown.clone();
+            let ca_pem = self.ca_pem.clone();
+            self.handles.push(tokio::spawn(async move {
+                if let Err(e) = super::serviceaccount::run(store, token, ca_pem).await {
+                    tracing::error!("serviceaccount controller error: {e}");
+                }
+            }));
+        }
         spawn_controller!("replicaset", super::replicaset::run);
         spawn_controller!("deployment", super::deployment::run);
         spawn_controller!("gc", super::gc::run);

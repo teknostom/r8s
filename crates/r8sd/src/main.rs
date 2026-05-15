@@ -37,13 +37,19 @@ async fn main() -> anyhow::Result<()> {
     bootstrap_namespaces(&store)?;
     bootstrap_ingress_class(&store)?;
 
+    let certs = r8s_controllers::certs::ensure_cluster_certs(&data_dir)?;
+
     let shutdown = CancellationToken::new();
     let registry = ResourceRegistry::default_mvp();
 
     // Controllers must subscribe to watches before the API server
     // accepts mutations, so start them first.
-    let mut controller_manager =
-        ControllerManager::new(store.clone(), shutdown.clone(), registry.clone());
+    let mut controller_manager = ControllerManager::new(
+        store.clone(),
+        shutdown.clone(),
+        registry.clone(),
+        certs.ca_pem.clone(),
+    );
     controller_manager.start();
 
     r8s_network::bridge::setup_bridge(&data_dir)?;
@@ -104,11 +110,17 @@ async fn main() -> anyhow::Result<()> {
 
     let api_server = ApiServer::new(store, registry, data_dir);
     let addr: SocketAddr = "0.0.0.0:6443".parse()?;
-    spawn(
-        &mut tasks,
-        "api-server",
-        api_server.serve(addr, shutdown.clone()),
-    );
+    let cert_pem = certs.server_cert_pem.clone().into_bytes();
+    let key_pem = certs.server_key_pem.clone().into_bytes();
+    let shutdown_for_api = shutdown.clone();
+    tasks.push(tokio::spawn(async move {
+        if let Err(e) = api_server
+            .serve_tls(addr, &cert_pem, &key_pem, shutdown_for_api)
+            .await
+        {
+            tracing::error!("api-server error: {e}");
+        }
+    }));
 
     tracing::info!("r8sd ready");
 

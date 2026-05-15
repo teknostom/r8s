@@ -18,3 +18,4 @@ rustc-hash.workspace = true
 rand.workspace = true
 chrono.workspace = true
 base64.workspace = true
+rcgen.workspace = true
