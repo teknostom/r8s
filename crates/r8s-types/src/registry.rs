@@ -259,13 +259,19 @@ impl ResourceRegistry {
         ];
 
         for &(group, version, resource, kind, namespaced, singular, short_names) in types {
+            let subresources = match (group, version, resource) {
+                ("apps", "v1", "deployments")
+                | ("apps", "v1", "replicasets")
+                | ("apps", "v1", "statefulsets") => vec!["scale".to_string()],
+                _ => Vec::new(),
+            };
             r.register(ResourceType {
                 gvr: GroupVersionResource::new(group, version, resource),
                 kind: kind.to_string(),
                 namespaced,
                 singular: singular.to_string(),
                 short_names: short_names.iter().map(|s| s.to_string()).collect(),
-                subresources: vec![],
+                subresources,
                 schema: crate::openapi::schema_for(group, version, kind),
             });
         }

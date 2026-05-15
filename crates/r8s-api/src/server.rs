@@ -28,6 +28,7 @@ use crate::{
     openapi_v3::{get_openapi_v3_core, get_openapi_v3_discovery, get_openapi_v3_group},
     params::ListParams,
     response::status_error,
+    scale::{get_scale, patch_scale, put_scale},
 };
 
 async fn log_requests(req: Request, next: axum::middleware::Next) -> axum::response::Response {
@@ -185,6 +186,10 @@ impl ApiServer {
             .route(
                 "/apis/authorization.k8s.io/v1/selfsubjectrulesreviews",
                 post(self_subject_rules_review),
+            )
+            .route(
+                "/apis/apps/v1/namespaces/{ns}/{resource}/{name}/scale",
+                get(get_scale).put(put_scale).patch(patch_scale),
             );
         for rt in self.state.registry.iter() {
             let ctx = RouteContext {

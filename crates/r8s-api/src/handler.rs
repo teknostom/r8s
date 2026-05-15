@@ -125,6 +125,33 @@ pub async fn get_cluster(
     get_impl(&state, &ctx, None, &name, &headers)
 }
 
+/// Real k8s allocates a ClusterIP for every `Service` with a real (non-`None`)
+/// `clusterIP` that doesn't already have one — including `LoadBalancer` and
+/// `NodePort` types. Called from both POST and server-side-apply create paths.
+fn maybe_allocate_cluster_ip(state: &AppState, ctx: &RouteContext, body: &mut serde_json::Value) {
+    if ctx.resource_type.gvr.resource != "services" {
+        return;
+    }
+    let svc_type = body
+        .get("spec")
+        .and_then(|s| s.get("type"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("ClusterIP");
+    let has_cluster_ip = body
+        .get("spec")
+        .and_then(|s| s.get("clusterIP"))
+        .and_then(|v| v.as_str())
+        .is_some_and(|ip| !ip.is_empty() && ip != "None");
+    if !matches!(svc_type, "ClusterIP" | "LoadBalancer" | "NodePort") || has_cluster_ip {
+        return;
+    }
+    let ip = state.allocate_cluster_ip();
+    if let Some(spec) = body.get_mut("spec").and_then(|v| v.as_object_mut()) {
+        spec.insert("clusterIP".to_string(), serde_json::json!(ip));
+        spec.insert("clusterIPs".to_string(), serde_json::json!([ip]));
+    }
+}
+
 pub(crate) fn create_impl(
     state: &AppState,
     ctx: &RouteContext,
@@ -151,27 +178,7 @@ pub(crate) fn create_impl(
         meta.insert("namespace".to_string(), serde_json::json!(ns));
     }
 
-    if ctx.resource_type.gvr.resource == "services" {
-        let svc_type = body
-            .get("spec")
-            .and_then(|s| s.get("type"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("ClusterIP");
-        let has_cluster_ip = body
-            .get("spec")
-            .and_then(|s| s.get("clusterIP"))
-            .and_then(|v| v.as_str())
-            .is_some_and(|ip| !ip.is_empty() && ip != "None");
-        if (svc_type == "ClusterIP" || svc_type == "LoadBalancer" || svc_type == "NodePort")
-            && !has_cluster_ip
-        {
-            let ip = state.allocate_cluster_ip();
-            if let Some(spec) = body.get_mut("spec").and_then(|v| v.as_object_mut()) {
-                spec.insert("clusterIP".to_string(), serde_json::json!(ip));
-                spec.insert("clusterIPs".to_string(), serde_json::json!([ip]));
-            }
-        }
-    }
+    maybe_allocate_cluster_ip(state, ctx, &mut body);
 
     let resource_ref = ResourceRef {
         gvr: &ctx.resource_type.gvr,
@@ -340,6 +347,7 @@ pub(crate) fn patch_impl(
                 }
                 obj.insert("metadata".to_string(), serde_json::Value::Object(meta));
             }
+            maybe_allocate_cluster_ip(state, ctx, &mut body);
             match state.store.create(rref, &body) {
                 Ok(obj) => response::created_response(&obj),
                 Err(err) => response::anyhow_error_response(err),

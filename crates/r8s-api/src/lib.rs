@@ -8,6 +8,7 @@ pub mod params;
 pub mod patch;
 pub mod protobuf;
 pub mod response;
+pub mod scale;
 pub mod server;
 pub mod table;
 

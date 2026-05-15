@@ -124,21 +124,33 @@ fn api_resource_list(state: &ApiState, group: &str, version: &str) -> Response {
         format!("{group}/{version}")
     };
 
-    let resources: Vec<serde_json::Value> = state
-        .registry
-        .resources_for_group_version(group, version)
-        .into_iter()
-        .map(|rt| {
-            serde_json::json!({
-                "name": rt.gvr.resource,
-                "singularName": rt.singular,
-                "namespaced": rt.namespaced,
-                "kind": rt.kind,
-                "verbs": ["create","delete","get","list","patch","update","watch"],
-                "shortNames": rt.short_names,
-            })
-        })
-        .collect();
+    let mut resources: Vec<serde_json::Value> = Vec::new();
+    for rt in state.registry.resources_for_group_version(group, version) {
+        resources.push(serde_json::json!({
+            "name": rt.gvr.resource,
+            "singularName": rt.singular,
+            "namespaced": rt.namespaced,
+            "kind": rt.kind,
+            "verbs": ["create","delete","get","list","patch","update","watch"],
+            "shortNames": rt.short_names,
+        }));
+        for sub in &rt.subresources {
+            // The `scale` subresource is special: it's defined as a Scale kind
+            // in the autoscaling/v1 group, but advertised under the parent's
+            // group/version so kubectl can route to it.
+            if sub == "scale" {
+                resources.push(serde_json::json!({
+                    "name": format!("{}/scale", rt.gvr.resource),
+                    "singularName": "",
+                    "namespaced": rt.namespaced,
+                    "group": "autoscaling",
+                    "version": "v1",
+                    "kind": "Scale",
+                    "verbs": ["get", "patch", "update"],
+                }));
+            }
+        }
+    }
 
     object_response(&serde_json::json!({
         "kind": "APIResourceList",
