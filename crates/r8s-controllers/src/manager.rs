@@ -34,6 +34,7 @@ impl ControllerManager {
         }
 
         spawn_controller!("namespace", super::namespace::run);
+        spawn_controller!("serviceaccount", super::serviceaccount::run);
         spawn_controller!("replicaset", super::replicaset::run);
         spawn_controller!("deployment", super::deployment::run);
         spawn_controller!("gc", super::gc::run);

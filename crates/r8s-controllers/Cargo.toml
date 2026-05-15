@@ -17,3 +17,4 @@ serde_json.workspace = true
 rustc-hash.workspace = true
 rand.workspace = true
 chrono.workspace = true
+base64.workspace = true

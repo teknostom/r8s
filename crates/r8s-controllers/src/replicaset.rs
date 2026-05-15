@@ -196,7 +196,9 @@ fn create_pod(
         namespace,
         name: &pod_name,
     };
-    store.create(resource_ref, &serde_json::to_value(&pod)?)?;
+    let mut pod_value = serde_json::to_value(&pod)?;
+    crate::pod_admission::inject_sa_token(store, &mut pod_value);
+    store.create(resource_ref, &pod_value)?;
     Ok(())
 }
 

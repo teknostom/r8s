@@ -1240,6 +1240,7 @@ dependencies = [
  "chrono",
  "hyper",
  "prost",
+ "r8s-controllers",
  "r8s-store",
  "r8s-types",
  "rustc-hash",
@@ -1257,6 +1258,7 @@ name = "r8s-controllers"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "chrono",
  "k8s-openapi",
  "r8s-store",

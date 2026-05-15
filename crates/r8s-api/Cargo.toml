@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 r8s-types.workspace = true
 r8s-store.workspace = true
+r8s-controllers.workspace = true
 
 axum.workspace = true
 rustc-hash.workspace = true

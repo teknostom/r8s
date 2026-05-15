@@ -125,7 +125,12 @@ fn wants_proto(headers: &http::HeaderMap) -> bool {
 }
 
 fn accepts_json(headers: &http::HeaderMap) -> bool {
-    if headers.get_all(http::header::ACCEPT).iter().next().is_none() {
+    if headers
+        .get_all(http::header::ACCEPT)
+        .iter()
+        .next()
+        .is_none()
+    {
         return true;
     }
     accept_has_mime(headers, |mime| {

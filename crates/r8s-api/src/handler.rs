@@ -179,6 +179,9 @@ pub(crate) fn create_impl(
     }
 
     maybe_allocate_cluster_ip(state, ctx, &mut body);
+    if ctx.resource_type.gvr.resource == "pods" {
+        r8s_controllers::pod_admission::inject_sa_token(&state.store, &mut body);
+    }
 
     let resource_ref = ResourceRef {
         gvr: &ctx.resource_type.gvr,
