@@ -394,7 +394,14 @@ pub(crate) fn list_impl(
     headers: &HeaderMap,
 ) -> Response {
     if params.is_watch() {
-        return watch_impl(state, ctx, namespace);
+        return watch_impl(
+            state,
+            ctx,
+            namespace,
+            headers,
+            params.resource_version.as_deref(),
+            params.wants_initial_events(),
+        );
     }
 
     let label_sel = params
@@ -455,31 +462,82 @@ pub(crate) fn list_impl(
     }
 }
 
-fn watch_impl(state: &AppState, ctx: &RouteContext, namespace: Option<&str>) -> Response {
+fn watch_impl(
+    state: &AppState,
+    ctx: &RouteContext,
+    namespace: Option<&str>,
+    headers: &HeaderMap,
+    resource_version: Option<&str>,
+    send_initial_events: bool,
+) -> Response {
     // Subscribe before listing so we don't miss events between the list and the watch.
     let rx = state.store.watch(&ctx.resource_type.gvr);
 
-    let (items, rv) = state
-        .store
-        .list(&ctx.resource_type.gvr, namespace, None, None, None, None)
-        .map(|r| (r.items, r.resource_version))
-        .unwrap_or_default();
+    // When `sendInitialEvents=true` (k9s and the WatchList protocol), the
+    // client expects the current state streamed as ADDED events followed by
+    // a sentinel BOOKMARK before live events resume — even if a resource
+    // version was supplied. Otherwise, a client that has already done a list
+    // (or passed an explicit rv) does NOT want the initial state replayed
+    // (that's what gives `kubectl get -w` duplicate rows).
+    let replay_initial =
+        send_initial_events || matches!(resource_version, None | Some("") | Some("0"));
 
-    let initial = items
-        .into_iter()
-        .map(|obj| Ok::<_, std::io::Error>(response::watch_event_line("ADDED", &obj)));
+    let (items, rv) = if replay_initial {
+        state
+            .store
+            .list(&ctx.resource_type.gvr, namespace, None, None, None, None)
+            .map(|r| (r.items, r.resource_version))
+            .unwrap_or_default()
+    } else {
+        let parsed = resource_version
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+        (Vec::new(), parsed)
+    };
+
+    let as_table = wants_table(headers);
+    let resource = ctx.resource_type.gvr.resource.clone();
+    let columns = if as_table {
+        Some(std::sync::Arc::new(table::columns_for(&resource)))
+    } else {
+        None
+    };
+    let format_object = {
+        let columns = columns.clone();
+        let resource = resource.clone();
+        move |obj: &serde_json::Value| -> serde_json::Value {
+            match columns.as_ref() {
+                Some(cols) => table::watch_table_object(cols, obj, &resource),
+                None => obj.clone(),
+            }
+        }
+    };
+
+    let format_initial = format_object.clone();
+    let initial = items.into_iter().map(move |obj| {
+        Ok::<_, std::io::Error>(response::watch_event_line("ADDED", &format_initial(&obj)))
+    });
     let initial_stream = tokio_stream::iter(initial);
 
     let av = api_version(ctx);
+    let mut bookmark_meta = serde_json::json!({"resourceVersion": rv.to_string()});
+    if send_initial_events && let Some(obj) = bookmark_meta.as_object_mut() {
+        // KEP-3157: signals end of the initial replay so clients (k9s, the
+        // WatchList reflector) know they have a consistent snapshot and can
+        // start rendering.
+        obj.insert(
+            "annotations".to_string(),
+            serde_json::json!({"k8s.io/initial-events-end": "true"}),
+        );
+    }
+    let bookmark_obj = serde_json::json!({
+        "apiVersion": av,
+        "kind": ctx.resource_type.kind,
+        "metadata": bookmark_meta,
+    });
+    let bookmark_formatted = format_object(&bookmark_obj);
     let bookmark = tokio_stream::iter(std::iter::once(Ok::<_, std::io::Error>(
-        response::watch_event_line(
-            "BOOKMARK",
-            &serde_json::json!({
-                "apiVersion": av,
-                "kind": ctx.resource_type.kind,
-                "metadata": {"resourceVersion": rv.to_string()}
-            }),
-        ),
+        response::watch_event_line("BOOKMARK", &bookmark_formatted),
     )));
 
     let ns_filter: Option<String> = namespace.map(|s| s.to_string());
@@ -503,9 +561,9 @@ fn watch_impl(state: &AppState, ctx: &RouteContext, namespace: Option<&str>) -> 
                 WatchEventType::Modified => "MODIFIED",
                 WatchEventType::Deleted => "DELETED",
             };
+            let payload = format_object(&event.object);
             Some(Ok::<_, std::io::Error>(response::watch_event_line(
-                type_str,
-                &event.object,
+                type_str, &payload,
             )))
         });
 

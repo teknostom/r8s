@@ -464,3 +464,49 @@ pub fn single_object_table_response(
 ) -> Response {
     table_response(columns, std::slice::from_ref(obj), resource, None)
 }
+
+/// Build the JSON `object` for a watch event in Table format. Either a
+/// single-row Table (for ADDED/MODIFIED/DELETED), or an empty-rows Table
+/// (for BOOKMARK frames that carry only a resourceVersion).
+pub fn watch_table_object(columns: &[ColumnDef], obj: &Value, resource: &str) -> Value {
+    let column_defs: Vec<Value> = columns
+        .iter()
+        .map(|c| {
+            json!({
+                "name": c.name,
+                "type": c.col_type,
+                "format": c.format,
+                "description": c.description,
+                "priority": c.priority,
+            })
+        })
+        .collect();
+
+    let rows = if obj.get("metadata").and_then(|m| m.get("name")).is_some() {
+        let cells = extract_cells(resource, obj);
+        vec![json!({
+            "cells": cells,
+            "object": {
+                "apiVersion": "meta.k8s.io/v1",
+                "kind": "PartialObjectMetadata",
+                "metadata": obj.get("metadata").cloned().unwrap_or(Value::Null),
+            }
+        })]
+    } else {
+        Vec::new()
+    };
+
+    let metadata = obj
+        .get("metadata")
+        .and_then(|m| m.get("resourceVersion"))
+        .map(|rv| json!({"resourceVersion": rv}))
+        .unwrap_or_else(|| json!({}));
+
+    json!({
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "Table",
+        "metadata": metadata,
+        "columnDefinitions": column_defs,
+        "rows": rows,
+    })
+}

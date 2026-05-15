@@ -21,8 +21,8 @@ pub use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
 
 pub use k8s_openapi::api::apps::v1::{
     DaemonSet, DaemonSetSpec, DaemonSetStatus, Deployment, DeploymentCondition, DeploymentSpec,
-    DeploymentStatus, ReplicaSet, ReplicaSetSpec, ReplicaSetStatus, StatefulSet, StatefulSetSpec,
-    StatefulSetStatus,
+    DeploymentStatus, DeploymentStrategy, ReplicaSet, ReplicaSetSpec, ReplicaSetStatus,
+    RollingUpdateDeployment, StatefulSet, StatefulSetSpec, StatefulSetStatus,
 };
 
 pub use k8s_openapi::api::batch::v1::{

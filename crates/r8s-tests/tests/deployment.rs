@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use r8s_store::watch::WatchEventType;
 use r8s_tests::*;
 use r8s_types::GroupVersionResource;
 
@@ -200,6 +201,179 @@ async fn deployment_rolling_update() {
         .filter(|v| is_owned_by(v, &deploy_uid))
         .any(|v| v["spec"]["replicas"].as_i64() == Some(0));
     assert!(old_rs_scaled_down, "old ReplicaSet should be scaled to 0");
+
+    cluster.shutdown().await;
+}
+
+#[tokio::test]
+async fn deployment_rolling_update_respects_surge() {
+    let cluster = TestCluster::start().await;
+    let gvr = GroupVersionResource::deployments();
+    let rs_gvr = GroupVersionResource::replica_sets();
+    let pod_gvr = GroupVersionResource::pods();
+
+    cluster.create(
+        &gvr,
+        "default",
+        "surge",
+        &make_deployment("surge", 4, "surge"),
+    );
+    let deploy_uid = cluster.uid(&gvr, "default", "surge");
+
+    let ready = wait_for_count(
+        &cluster.store,
+        &pod_gvr,
+        Some("default"),
+        |v| has_label(v, "app", "surge") && has_phase(v, "Running"),
+        4,
+        TIMEOUT,
+    )
+    .await;
+    assert!(ready, "all 4 pods should be Running before rollout");
+
+    // Give one extra reconcile cycle so RS status.availableReplicas reflects readiness.
+    tokio::time::sleep(Duration::from_millis(700)).await;
+
+    let initial_rs_name = cluster
+        .list(&rs_gvr, "default")
+        .into_iter()
+        .find(|v| is_owned_by(v, &deploy_uid))
+        .and_then(|v| v["metadata"]["name"].as_str().map(String::from))
+        .expect("initial RS exists");
+
+    // Subscribe to RS watch events BEFORE triggering the update so we can
+    // capture the new RS's state at the moment of creation. The rollout
+    // can otherwise complete faster than a polling loop can sample.
+    let mut rs_watch = cluster.store.watch(&rs_gvr);
+
+    let mut val = cluster.get(&gvr, "default", "surge");
+    val["spec"]["template"]["spec"]["containers"][0]["image"] = serde_json::json!("nginx:1.25");
+    cluster.update(&gvr, "default", "surge", &val);
+
+    // Capture the Added event for the new RS — that gives us its creation-time
+    // replica count, which must be <= maxSurge (1 = ceil(4 * 25%)).
+    let new_rs_initial = tokio::time::timeout(TIMEOUT, async {
+        loop {
+            let event = rs_watch.recv().await.expect("watch channel closed");
+            if !matches!(event.event_type, WatchEventType::Added) {
+                continue;
+            }
+            if event.object["metadata"]["name"].as_str() == Some(&initial_rs_name) {
+                continue;
+            }
+            if !is_owned_by(&event.object, &deploy_uid) {
+                continue;
+            }
+            break event.object;
+        }
+    })
+    .await
+    .expect("timed out waiting for new RS Added event");
+
+    let new_rs_name = new_rs_initial["metadata"]["name"]
+        .as_str()
+        .expect("new RS has name")
+        .to_string();
+    let initial_new_replicas = new_rs_initial["spec"]["replicas"].as_i64().unwrap_or(-1);
+    assert!(
+        (0..=1).contains(&initial_new_replicas),
+        "new RS must start at <= maxSurge (1), got {initial_new_replicas}"
+    );
+
+    let converged = wait_for(
+        &cluster.store,
+        &rs_gvr,
+        Some("default"),
+        &new_rs_name,
+        |v| v["spec"]["replicas"].as_i64() == Some(4),
+        TIMEOUT,
+    )
+    .await;
+    assert!(converged, "new RS should reach desired replicas (4)");
+
+    let old_drained = wait_for(
+        &cluster.store,
+        &rs_gvr,
+        Some("default"),
+        &initial_rs_name,
+        |v| v["spec"]["replicas"].as_i64() == Some(0),
+        TIMEOUT,
+    )
+    .await;
+    assert!(old_drained, "old RS should drain to 0");
+
+    cluster.shutdown().await;
+}
+
+#[tokio::test]
+async fn deployment_recreate_strategy_is_immediate() {
+    use r8s_types::DeploymentStrategy;
+
+    let cluster = TestCluster::start().await;
+    let gvr = GroupVersionResource::deployments();
+    let rs_gvr = GroupVersionResource::replica_sets();
+    let pod_gvr = GroupVersionResource::pods();
+
+    let mut deploy = make_deployment("recreate", 3, "recreate");
+    deploy.spec.as_mut().unwrap().strategy = Some(DeploymentStrategy {
+        type_: Some("Recreate".into()),
+        rolling_update: None,
+    });
+    cluster.create(&gvr, "default", "recreate", &deploy);
+    let deploy_uid = cluster.uid(&gvr, "default", "recreate");
+
+    let ready = wait_for_count(
+        &cluster.store,
+        &pod_gvr,
+        Some("default"),
+        |v| has_label(v, "app", "recreate") && has_phase(v, "Running"),
+        3,
+        TIMEOUT,
+    )
+    .await;
+    assert!(ready, "all 3 pods should be Running");
+
+    let initial_rs_name = cluster
+        .list(&rs_gvr, "default")
+        .into_iter()
+        .find(|v| is_owned_by(v, &deploy_uid))
+        .and_then(|v| v["metadata"]["name"].as_str().map(String::from))
+        .expect("initial RS exists");
+
+    let mut val = cluster.get(&gvr, "default", "recreate");
+    val["spec"]["template"]["spec"]["containers"][0]["image"] = serde_json::json!("nginx:1.25");
+    cluster.update(&gvr, "default", "recreate", &val);
+
+    let uid_for_filter = deploy_uid.clone();
+    let initial_rs_name_for_filter = initial_rs_name.clone();
+    let new_rs_full = wait_for_count(
+        &cluster.store,
+        &rs_gvr,
+        Some("default"),
+        move |v| {
+            is_owned_by(v, &uid_for_filter)
+                && v["metadata"]["name"].as_str() != Some(&initial_rs_name_for_filter)
+                && v["spec"]["replicas"].as_i64() == Some(3)
+        },
+        1,
+        TIMEOUT,
+    )
+    .await;
+    assert!(
+        new_rs_full,
+        "Recreate: new RS should be created at full replicas"
+    );
+
+    let old_zero = wait_for(
+        &cluster.store,
+        &rs_gvr,
+        Some("default"),
+        &initial_rs_name,
+        |v| v["spec"]["replicas"].as_i64() == Some(0),
+        TIMEOUT,
+    )
+    .await;
+    assert!(old_zero, "Recreate: old RS should be scaled to 0");
 
     cluster.shutdown().await;
 }
