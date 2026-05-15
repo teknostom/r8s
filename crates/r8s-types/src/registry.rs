@@ -220,6 +220,42 @@ impl ResourceRegistry {
                 "customresourcedefinition",
                 &["crd", "crds"],
             ),
+            (
+                "rbac.authorization.k8s.io",
+                "v1",
+                "roles",
+                "Role",
+                true,
+                "role",
+                &[],
+            ),
+            (
+                "rbac.authorization.k8s.io",
+                "v1",
+                "rolebindings",
+                "RoleBinding",
+                true,
+                "rolebinding",
+                &[],
+            ),
+            (
+                "rbac.authorization.k8s.io",
+                "v1",
+                "clusterroles",
+                "ClusterRole",
+                false,
+                "clusterrole",
+                &[],
+            ),
+            (
+                "rbac.authorization.k8s.io",
+                "v1",
+                "clusterrolebindings",
+                "ClusterRoleBinding",
+                false,
+                "clusterrolebinding",
+                &[],
+            ),
         ];
 
         for &(group, version, resource, kind, namespaced, singular, short_names) in types {
@@ -230,6 +266,7 @@ impl ResourceRegistry {
                 singular: singular.to_string(),
                 short_names: short_names.iter().map(|s| s.to_string()).collect(),
                 subresources: vec![],
+                schema: crate::openapi::schema_for(group, version, kind),
             });
         }
 

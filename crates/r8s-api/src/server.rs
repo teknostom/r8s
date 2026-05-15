@@ -24,6 +24,8 @@ use crate::{
         patch_cluster, patch_impl, patch_ns, pod_logs_ns, require_json, update_cluster,
         update_impl, update_ns,
     },
+    openapi_v2::get_openapi_v2,
+    openapi_v3::{get_openapi_v3_core, get_openapi_v3_discovery, get_openapi_v3_group},
     params::ListParams,
     response::status_error,
 };
@@ -165,6 +167,13 @@ impl ApiServer {
     pub fn into_router(self) -> Router {
         let mut router = Router::new()
             .route("/version", get(get_version))
+            .route("/openapi/v2", get(get_openapi_v2))
+            .route("/openapi/v3", get(get_openapi_v3_discovery))
+            .route("/openapi/v3/api/v1", get(get_openapi_v3_core))
+            .route(
+                "/openapi/v3/apis/{group}/{version}",
+                get(get_openapi_v3_group),
+            )
             .route("/api", get(get_api_versions))
             .route("/api/v1", get(get_core_v1_resources))
             .route("/apis", get(get_api_groups))

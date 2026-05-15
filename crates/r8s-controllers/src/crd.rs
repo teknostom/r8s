@@ -71,6 +71,11 @@ fn register_crd(registry: &ResourceRegistry, crd: &CustomResourceDefinition) {
             continue;
         }
         let gvr = GroupVersionResource::new(&spec.group, &ver.name, &spec.names.plural);
+        let schema = ver
+            .schema
+            .as_ref()
+            .and_then(|v| v.open_api_v3_schema.as_ref())
+            .and_then(|s| serde_json::to_value(s).ok());
         let rt = ResourceType {
             gvr,
             kind: spec.names.kind.clone(),
@@ -78,6 +83,7 @@ fn register_crd(registry: &ResourceRegistry, crd: &CustomResourceDefinition) {
             singular: spec.names.singular.clone().unwrap_or_default(),
             short_names: spec.names.short_names.clone().unwrap_or_default(),
             subresources: vec![],
+            schema,
         };
         tracing::info!(
             "registered CRD resource {}/{}/{}",

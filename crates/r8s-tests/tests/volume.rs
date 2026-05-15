@@ -26,9 +26,14 @@ async fn emptydir_volume_mounted() {
     cluster.create(&pod_gvr, "default", "emptydir-pod", &pod);
 
     let running = wait_for(
-        &cluster.store, &pod_gvr, Some("default"), "emptydir-pod",
-        |v| has_phase(v, "Running"), TIMEOUT,
-    ).await;
+        &cluster.store,
+        &pod_gvr,
+        Some("default"),
+        "emptydir-pod",
+        |v| has_phase(v, "Running"),
+        TIMEOUT,
+    )
+    .await;
     assert!(running, "pod with emptyDir volume should reach Running");
 
     cluster.shutdown().await;
@@ -47,9 +52,10 @@ async fn configmap_volume_mounted() {
             namespace: Some("default".into()),
             ..Default::default()
         },
-        data: Some(std::collections::BTreeMap::from([
-            ("app.conf".into(), "key=value".into()),
-        ])),
+        data: Some(std::collections::BTreeMap::from([(
+            "app.conf".into(),
+            "key=value".into(),
+        )])),
         ..Default::default()
     };
     cluster.create(&cm_gvr, "default", "test-cm", &cm);
@@ -75,9 +81,14 @@ async fn configmap_volume_mounted() {
     cluster.create(&pod_gvr, "default", "cm-pod", &pod);
 
     let running = wait_for(
-        &cluster.store, &pod_gvr, Some("default"), "cm-pod",
-        |v| has_phase(v, "Running"), TIMEOUT,
-    ).await;
+        &cluster.store,
+        &pod_gvr,
+        Some("default"),
+        "cm-pod",
+        |v| has_phase(v, "Running"),
+        TIMEOUT,
+    )
+    .await;
     assert!(running, "pod with configMap volume should reach Running");
 
     cluster.shutdown().await;
@@ -119,9 +130,14 @@ async fn secret_volume_mounted() {
     cluster.create(&pod_gvr, "default", "secret-pod", &pod);
 
     let running = wait_for(
-        &cluster.store, &pod_gvr, Some("default"), "secret-pod",
-        |v| has_phase(v, "Running"), TIMEOUT,
-    ).await;
+        &cluster.store,
+        &pod_gvr,
+        Some("default"),
+        "secret-pod",
+        |v| has_phase(v, "Running"),
+        TIMEOUT,
+    )
+    .await;
     assert!(running, "pod with secret volume should reach Running");
 
     cluster.shutdown().await;

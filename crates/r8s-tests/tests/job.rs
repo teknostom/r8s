@@ -16,9 +16,14 @@ async fn job_runs_to_completion() {
 
     // Wait for pod to reach Running
     let pod_running = wait_for_count(
-        &cluster.store, &pod_gvr, Some("default"),
-        |v| is_owned_by(v, &job_uid) && has_phase(v, "Running"), 1, TIMEOUT,
-    ).await;
+        &cluster.store,
+        &pod_gvr,
+        Some("default"),
+        |v| is_owned_by(v, &job_uid) && has_phase(v, "Running"),
+        1,
+        TIMEOUT,
+    )
+    .await;
     assert!(pod_running, "Job pod should reach Running phase");
 
     // Simulate container exit (exit code 0)
@@ -26,16 +31,26 @@ async fn job_runs_to_completion() {
 
     // Wait for pod to transition to Succeeded
     let pod_succeeded = wait_for_count(
-        &cluster.store, &pod_gvr, Some("default"),
-        |v| is_owned_by(v, &job_uid) && has_phase(v, "Succeeded"), 1, TIMEOUT,
-    ).await;
+        &cluster.store,
+        &pod_gvr,
+        Some("default"),
+        |v| is_owned_by(v, &job_uid) && has_phase(v, "Succeeded"),
+        1,
+        TIMEOUT,
+    )
+    .await;
     assert!(pod_succeeded, "Job pod should transition to Succeeded");
 
     // Wait for Job to be marked Complete
     let job_complete = wait_for(
-        &cluster.store, &gvr, Some("default"), "test-job",
-        |v| has_condition(v, "Complete", "True"), TIMEOUT,
-    ).await;
+        &cluster.store,
+        &gvr,
+        Some("default"),
+        "test-job",
+        |v| has_condition(v, "Complete", "True"),
+        TIMEOUT,
+    )
+    .await;
     assert!(job_complete, "Job should be marked Complete");
 
     cluster.shutdown().await;
@@ -55,9 +70,14 @@ async fn job_backoff_limit() {
     // Simulate repeated failures
     for _round in 0..3 {
         let pod_running = wait_for_count(
-            &cluster.store, &pod_gvr, Some("default"),
-            |v| is_owned_by(v, &job_uid) && has_phase(v, "Running"), 1, TIMEOUT,
-        ).await;
+            &cluster.store,
+            &pod_gvr,
+            Some("default"),
+            |v| is_owned_by(v, &job_uid) && has_phase(v, "Running"),
+            1,
+            TIMEOUT,
+        )
+        .await;
         if !pod_running {
             break; // Job may already be failed
         }
@@ -67,10 +87,18 @@ async fn job_backoff_limit() {
 
     // Wait for Job to be marked Failed
     let job_failed = wait_for(
-        &cluster.store, &gvr, Some("default"), "fail-job",
-        |v| has_condition(v, "Failed", "True"), TIMEOUT,
-    ).await;
-    assert!(job_failed, "Job should be marked Failed after exceeding backoff limit");
+        &cluster.store,
+        &gvr,
+        Some("default"),
+        "fail-job",
+        |v| has_condition(v, "Failed", "True"),
+        TIMEOUT,
+    )
+    .await;
+    assert!(
+        job_failed,
+        "Job should be marked Failed after exceeding backoff limit"
+    );
 
     cluster.shutdown().await;
 }
@@ -89,17 +117,27 @@ async fn job_parallelism() {
 
     // Wait for 2 pods (parallelism=2)
     let found = wait_for_count(
-        &cluster.store, &pod_gvr, Some("default"),
-        |v| is_owned_by(v, &job_uid) && has_phase(v, "Running"), 2, TIMEOUT,
-    ).await;
+        &cluster.store,
+        &pod_gvr,
+        Some("default"),
+        |v| is_owned_by(v, &job_uid) && has_phase(v, "Running"),
+        2,
+        TIMEOUT,
+    )
+    .await;
     assert!(found, "should create 2 pods (parallelism=2)");
 
     // Verify no more than 2 active pods
-    let active = cluster.list(&pod_gvr, "default").iter()
+    let active = cluster
+        .list(&pod_gvr, "default")
+        .iter()
         .filter(|v| is_owned_by(v, &job_uid))
         .filter(|v| !has_phase(v, "Succeeded") && !has_phase(v, "Failed"))
         .count();
-    assert!(active <= 2, "max 2 pods should be active at once, got {active}");
+    assert!(
+        active <= 2,
+        "max 2 pods should be active at once, got {active}"
+    );
 
     cluster.shutdown().await;
 }
@@ -115,21 +153,33 @@ async fn job_already_complete_no_reconcile() {
 
     // Wait for pod to be running, then complete it
     let running = wait_for_count(
-        &cluster.store, &pod_gvr, Some("default"),
-        |v| is_owned_by(v, &job_uid) && has_phase(v, "Running"), 1, TIMEOUT,
-    ).await;
+        &cluster.store,
+        &pod_gvr,
+        Some("default"),
+        |v| is_owned_by(v, &job_uid) && has_phase(v, "Running"),
+        1,
+        TIMEOUT,
+    )
+    .await;
     assert!(running, "job pod should reach Running");
 
     cluster.runtime.stop_matching("done-job");
 
     let complete = wait_for(
-        &cluster.store, &gvr, Some("default"), "done-job",
-        |v| has_condition(v, "Complete", "True"), TIMEOUT,
-    ).await;
+        &cluster.store,
+        &gvr,
+        Some("default"),
+        "done-job",
+        |v| has_condition(v, "Complete", "True"),
+        TIMEOUT,
+    )
+    .await;
     assert!(complete, "job should be Complete");
 
     // Count pods owned by this job
-    let pods_before = cluster.list(&pod_gvr, "default").iter()
+    let pods_before = cluster
+        .list(&pod_gvr, "default")
+        .iter()
         .filter(|v| is_owned_by(v, &job_uid))
         .count();
 
@@ -140,10 +190,15 @@ async fn job_already_complete_no_reconcile() {
 
     tokio::time::sleep(Duration::from_secs(1)).await;
 
-    let pods_after = cluster.list(&pod_gvr, "default").iter()
+    let pods_after = cluster
+        .list(&pod_gvr, "default")
+        .iter()
         .filter(|v| is_owned_by(v, &job_uid))
         .count();
-    assert_eq!(pods_before, pods_after, "complete Job should not create more pods on re-reconcile");
+    assert_eq!(
+        pods_before, pods_after,
+        "complete Job should not create more pods on re-reconcile"
+    );
 
     cluster.shutdown().await;
 }

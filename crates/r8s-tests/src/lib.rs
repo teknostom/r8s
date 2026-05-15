@@ -144,7 +144,13 @@ impl TestCluster {
     }
 
     /// Update a namespaced resource.
-    pub fn update(&self, gvr: &GroupVersionResource, ns: &str, name: &str, val: &serde_json::Value) {
+    pub fn update(
+        &self,
+        gvr: &GroupVersionResource,
+        ns: &str,
+        name: &str,
+        val: &serde_json::Value,
+    ) {
         let rref = ResourceRef {
             gvr,
             namespace: Some(ns),
@@ -174,11 +180,7 @@ impl TestCluster {
     }
 
     /// List all resources of a GVR in a namespace.
-    pub fn list(
-        &self,
-        gvr: &GroupVersionResource,
-        ns: &str,
-    ) -> Vec<serde_json::Value> {
+    pub fn list(&self, gvr: &GroupVersionResource, ns: &str) -> Vec<serde_json::Value> {
         self.store
             .list(gvr, Some(ns), None, None, None, None)
             .unwrap()
@@ -255,14 +257,22 @@ where
     let result = poll_until(
         timeout,
         || {
-            let rref = ResourceRef { gvr, namespace: ns, name };
+            let rref = ResourceRef {
+                gvr,
+                namespace: ns,
+                name,
+            };
             match store.get(&rref) {
                 Ok(Some(val)) if condition(&val) => Some(val),
                 _ => None,
             }
         },
         || {
-            let rref = ResourceRef { gvr, namespace: ns, name };
+            let rref = ResourceRef {
+                gvr,
+                namespace: ns,
+                name,
+            };
             match store.get(&rref) {
                 Ok(Some(val)) => format!(
                     "timed out waiting for {}/{} to match condition; current value: {}",
@@ -404,7 +414,11 @@ pub async fn wait_for_deletion(
     let result = poll_until(
         timeout,
         || {
-            let rref = ResourceRef { gvr, namespace: ns, name };
+            let rref = ResourceRef {
+                gvr,
+                namespace: ns,
+                name,
+            };
             match store.get(&rref) {
                 Ok(None) => Some(()),
                 _ => None,

@@ -35,14 +35,24 @@ async fn crd_registration() {
         status: None,
     };
 
-    let rref = ResourceRef { gvr: &crd_gvr, namespace: None, name: "foos.example.com" };
-    cluster.store.create(rref, &serde_json::to_value(&crd).unwrap()).unwrap();
+    let rref = ResourceRef {
+        gvr: &crd_gvr,
+        namespace: None,
+        name: "foos.example.com",
+    };
+    cluster
+        .store
+        .create(rref, &serde_json::to_value(&crd).unwrap())
+        .unwrap();
 
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     let foo_gvr = GroupVersionResource::new("example.com", "v1", "foos");
     let registered = cluster.registry.get_by_gvr(&foo_gvr);
-    assert!(registered.is_some(), "CRD should register resource type in registry");
+    assert!(
+        registered.is_some(),
+        "CRD should register resource type in registry"
+    );
     assert_eq!(registered.unwrap().kind, "Foo");
 
     cluster.shutdown().await;
@@ -79,19 +89,36 @@ async fn crd_unregistration() {
         status: None,
     };
 
-    let rref = ResourceRef { gvr: &crd_gvr, namespace: None, name: "bars.example.com" };
-    cluster.store.create(rref, &serde_json::to_value(&crd).unwrap()).unwrap();
+    let rref = ResourceRef {
+        gvr: &crd_gvr,
+        namespace: None,
+        name: "bars.example.com",
+    };
+    cluster
+        .store
+        .create(rref, &serde_json::to_value(&crd).unwrap())
+        .unwrap();
 
     tokio::time::sleep(Duration::from_millis(500)).await;
     let bar_gvr = GroupVersionResource::new("example.com", "v1alpha1", "bars");
-    assert!(cluster.registry.get_by_gvr(&bar_gvr).is_some(), "CRD should be registered");
+    assert!(
+        cluster.registry.get_by_gvr(&bar_gvr).is_some(),
+        "CRD should be registered"
+    );
 
     // Delete the CRD
-    let del_ref = ResourceRef { gvr: &crd_gvr, namespace: None, name: "bars.example.com" };
+    let del_ref = ResourceRef {
+        gvr: &crd_gvr,
+        namespace: None,
+        name: "bars.example.com",
+    };
     cluster.store.delete(&del_ref).unwrap();
 
     tokio::time::sleep(Duration::from_millis(500)).await;
-    assert!(cluster.registry.get_by_gvr(&bar_gvr).is_none(), "CRD should be unregistered after deletion");
+    assert!(
+        cluster.registry.get_by_gvr(&bar_gvr).is_none(),
+        "CRD should be unregistered after deletion"
+    );
 
     cluster.shutdown().await;
 }

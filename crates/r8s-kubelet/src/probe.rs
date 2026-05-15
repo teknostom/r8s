@@ -1,28 +1,37 @@
-use r8s_types::{IntOrString, Probe};
+use r8s_types::{ContainerPort, IntOrString, Probe};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-fn int_or_string_to_port(ios: &IntOrString) -> i32 {
+fn resolve_port(ios: &IntOrString, ports: &[ContainerPort]) -> i32 {
     match ios {
         IntOrString::Int(i) => *i,
-        IntOrString::String(s) => s.parse().unwrap_or(0),
+        IntOrString::String(s) => {
+            if let Ok(n) = s.parse() {
+                return n;
+            }
+            ports
+                .iter()
+                .find(|p| p.name.as_deref() == Some(s.as_str()))
+                .map(|p| p.container_port)
+                .unwrap_or(0)
+        }
     }
 }
 
 /// Execute a probe against a container. Returns true if the probe succeeds.
-pub async fn exec_probe(probe: &Probe, pod_ip: &str, _pid: u32) -> bool {
+pub async fn exec_probe(probe: &Probe, pod_ip: &str, _pid: u32, ports: &[ContainerPort]) -> bool {
     let timeout = Duration::from_secs(probe.timeout_seconds.unwrap_or(1) as u64);
 
     if let Some(http) = &probe.http_get {
-        let port = int_or_string_to_port(&http.port);
+        let port = resolve_port(&http.port, ports);
         let path = http.path.as_deref().unwrap_or("/");
         let host = http.host.as_deref().unwrap_or(pod_ip);
         return http_get_probe(host, port, path, timeout).await;
     }
 
     if let Some(tcp) = &probe.tcp_socket {
-        let port = int_or_string_to_port(&tcp.port);
+        let port = resolve_port(&tcp.port, ports);
         return tcp_probe(pod_ip, port, timeout).await;
     }
 

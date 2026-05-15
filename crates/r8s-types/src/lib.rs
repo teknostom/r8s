@@ -1,3 +1,5 @@
+pub mod openapi;
+pub mod openapi_proto;
 pub mod registry;
 pub mod resource;
 

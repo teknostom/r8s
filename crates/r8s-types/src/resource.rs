@@ -89,4 +89,9 @@ pub struct ResourceType {
     pub short_names: Vec<String>,
     pub singular: String,
     pub subresources: Vec<String>,
+    /// OpenAPI v3 schema for this resource's objects. Populated for CRDs from
+    /// their definition, and for built-in types from vendored upstream specs.
+    /// `None` means the API server admits objects of this kind without schema
+    /// validation and doesn't expose a schema in /openapi/v3.
+    pub schema: Option<serde_json::Value>,
 }

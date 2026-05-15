@@ -20,14 +20,29 @@ async fn namespace_creates_default_sa() {
         spec: None,
         status: None,
     };
-    let rref = ResourceRef { gvr: &ns_gvr, namespace: None, name: "test-ns" };
-    cluster.store.create(rref, &serde_json::to_value(&ns).unwrap()).unwrap();
+    let rref = ResourceRef {
+        gvr: &ns_gvr,
+        namespace: None,
+        name: "test-ns",
+    };
+    cluster
+        .store
+        .create(rref, &serde_json::to_value(&ns).unwrap())
+        .unwrap();
 
     let sa_found = wait_for(
-        &cluster.store, &sa_gvr, Some("test-ns"), "default",
-        |_| true, TIMEOUT,
-    ).await;
-    assert!(sa_found, "namespace controller should create 'default' ServiceAccount");
+        &cluster.store,
+        &sa_gvr,
+        Some("test-ns"),
+        "default",
+        |_| true,
+        TIMEOUT,
+    )
+    .await;
+    assert!(
+        sa_found,
+        "namespace controller should create 'default' ServiceAccount"
+    );
 
     cluster.shutdown().await;
 }
@@ -59,15 +74,25 @@ async fn namespace_sa_idempotent() {
         spec: None,
         status: None,
     };
-    let rref = ResourceRef { gvr: &ns_gvr, namespace: None, name: "idem-ns" };
-    cluster.store.create(rref, &serde_json::to_value(&ns).unwrap()).unwrap();
+    let rref = ResourceRef {
+        gvr: &ns_gvr,
+        namespace: None,
+        name: "idem-ns",
+    };
+    cluster
+        .store
+        .create(rref, &serde_json::to_value(&ns).unwrap())
+        .unwrap();
 
     // Give controller time to process
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // SA should still exist with the same UID (not recreated)
     let current_uid = cluster.uid(&sa_gvr, "idem-ns", "default");
-    assert_eq!(old_uid, current_uid, "SA should not be recreated (idempotent)");
+    assert_eq!(
+        old_uid, current_uid,
+        "SA should not be recreated (idempotent)"
+    );
 
     cluster.shutdown().await;
 }

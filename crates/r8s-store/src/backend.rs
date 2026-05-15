@@ -1,4 +1,8 @@
-use std::{path::Path, sync::{Arc, RwLock}, time::Duration};
+use std::{
+    path::Path,
+    sync::{Arc, RwLock},
+    time::Duration,
+};
 
 use base64::prelude::*;
 use r8s_types::{GroupVersionResource, ObjectMeta};
@@ -65,7 +69,7 @@ impl Store {
             revision: RevisionCounter::new(max_revision),
             watches: WatchHub::default(),
             index: LabelIndex::default(),
-            view_lock: Arc::new(RwLock::new(()))
+            view_lock: Arc::new(RwLock::new(())),
         };
 
         store.start_compaction(1000, 300);
@@ -185,7 +189,10 @@ impl Store {
                 .unwrap_or_default();
         let incoming_rv = incoming_meta.resource_version.as_deref().unwrap_or("");
         let stored_rv = stored_meta.resource_version.as_deref().unwrap_or("");
-        if incoming_rv != stored_rv {
+        // An empty incoming resourceVersion means "blind update" — accept the
+        // current stored version. K8s semantics: only enforce the version check
+        // when the client explicitly sent one.
+        if !incoming_rv.is_empty() && incoming_rv != stored_rv {
             return Err(StoreError::Conflict {
                 gvr: resource.gvr.key_prefix(),
                 name: resource.name.to_string(),

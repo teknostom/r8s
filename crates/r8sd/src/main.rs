@@ -112,7 +112,7 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("r8sd ready");
 
-    tokio::signal::ctrl_c().await?;
+    wait_for_shutdown().await?;
     tracing::info!("r8sd shutting down");
     shutdown.cancel();
     r8s_network::bridge::cleanup();
@@ -123,6 +123,19 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// Wait for either SIGINT or SIGTERM. `r8s delete` sends SIGTERM via libc::kill,
+/// so SIGINT-only handling (the default for `tokio::signal::ctrl_c`) would let
+/// the cleanup block run only on Ctrl-C and leak state on every CLI-driven stop.
+async fn wait_for_shutdown() -> anyhow::Result<()> {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut sigterm = signal(SignalKind::terminate())?;
+    let mut sigint = signal(SignalKind::interrupt())?;
+    tokio::select! {
+        _ = sigterm.recv() => Ok(()),
+        _ = sigint.recv() => Ok(()),
+    }
 }
 
 fn spawn(

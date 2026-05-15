@@ -31,6 +31,9 @@ const SNAPSHOTTER: &str = "overlayfs";
 pub struct ContainerdRuntime {
     channel: Channel,
     data_dir: std::path::PathBuf,
+    // Serializes image pulls across all callers (matches kubelet's
+    // --serialize-image-pulls=true default).
+    pull_lock: tokio::sync::Mutex<()>,
 }
 
 impl ContainerdRuntime {
@@ -38,6 +41,7 @@ impl ContainerdRuntime {
         Ok(Self {
             channel: connect(socket_path).await?,
             data_dir,
+            pull_lock: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -190,7 +194,17 @@ fn json_string_array(value: &serde_json::Value) -> Vec<String> {
 }
 
 fn normalize_image_ref(image: &str) -> String {
-    let with_registry = if image.contains('/') {
+    // Docker Hub's official images live under `library/`; the Docker CLI inserts
+    // it automatically for bare names, but containerd's resolver doesn't.
+    // Match that behavior here so charts that say `docker.io/traefik:v3.7.1`
+    // (or just `traefik:v3.7.1`) resolve to `docker.io/library/traefik:v3.7.1`.
+    let with_registry = if let Some(rest) = image.strip_prefix("docker.io/") {
+        if rest.contains('/') {
+            image.to_string()
+        } else {
+            format!("docker.io/library/{rest}")
+        }
+    } else if image.contains('/') {
         image.to_string()
     } else {
         format!("docker.io/library/{image}")
@@ -440,6 +454,7 @@ impl ContainerRuntime for ContainerdRuntime {
         image: &str,
         auth: Option<&RegistryAuth>,
     ) -> anyhow::Result<ImageId> {
+        let _pull_guard = self.pull_lock.lock().await;
         let full_image_ref = normalize_image_ref(image);
         let resolver = auth.map(|a| {
             use base64::Engine;

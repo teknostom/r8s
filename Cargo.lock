@@ -1239,11 +1239,13 @@ dependencies = [
  "axum 0.8.8",
  "chrono",
  "hyper",
+ "prost",
  "r8s-store",
  "r8s-types",
  "rustc-hash",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
  "tokio-stream",
  "tokio-util",
@@ -1381,8 +1383,12 @@ name = "r8s-types"
 version = "0.1.0"
 dependencies = [
  "k8s-openapi",
+ "prost",
+ "prost-build",
+ "prost-types",
  "rustc-hash",
  "serde",
+ "serde_json",
 ]
 
 [[package]]

@@ -107,15 +107,26 @@ fn resolve_service(store: &Store, query: &[u8], name: &str) -> Option<Vec<u8>> {
 }
 
 fn build_a_response(query: &[u8], ip: Ipv4Addr) -> Vec<u8> {
-    let mut resp = Vec::with_capacity(query.len() + 16);
-    resp.extend_from_slice(query);
+    // Only copy up to the end of the question section. Anything after (e.g. an
+    // EDNS OPT record in the additional section) must not appear before the answer.
+    let q_end = match question_end(query) {
+        Some(p) => p,
+        None => return build_nxdomain(query),
+    };
+
+    let mut resp = Vec::with_capacity(q_end + 16);
+    resp.extend_from_slice(&query[..q_end]);
 
     // QR=1, AA=1, RCODE=0
     resp[2] = 0x84;
     resp[3] = 0x00;
-    // ANCOUNT=1
+    // ANCOUNT=1, NSCOUNT=0, ARCOUNT=0
     resp[6] = 0x00;
     resp[7] = 0x01;
+    resp[8] = 0x00;
+    resp[9] = 0x00;
+    resp[10] = 0x00;
+    resp[11] = 0x00;
 
     // Answer: pointer to QNAME, TYPE=A, CLASS=IN, TTL=5s
     resp.extend_from_slice(&[0xC0, 0x0C]);
@@ -126,6 +137,33 @@ fn build_a_response(query: &[u8], ip: Ipv4Addr) -> Vec<u8> {
     resp.extend_from_slice(&ip.octets());
 
     resp
+}
+
+fn question_end(packet: &[u8]) -> Option<usize> {
+    if packet.len() < 12 {
+        return None;
+    }
+    let mut pos = 12;
+    loop {
+        if pos >= packet.len() {
+            return None;
+        }
+        let label_len = packet[pos] as usize;
+        if label_len == 0 {
+            pos += 1;
+            break;
+        }
+        if label_len & 0xC0 == 0xC0 {
+            return None;
+        }
+        pos += 1 + label_len;
+    }
+    // QTYPE (2) + QCLASS (2)
+    let end = pos + 4;
+    if end > packet.len() {
+        return None;
+    }
+    Some(end)
 }
 
 fn build_nxdomain(query: &[u8]) -> Vec<u8> {

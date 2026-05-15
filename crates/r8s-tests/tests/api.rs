@@ -3,13 +3,19 @@ use http_body_util::BodyExt;
 use r8s_tests::*;
 use tower::ServiceExt;
 
-fn json_request(method: &str, uri: &str, body: Option<serde_json::Value>) -> axum::http::Request<Body> {
+fn json_request(
+    method: &str,
+    uri: &str,
+    body: Option<serde_json::Value>,
+) -> axum::http::Request<Body> {
     let builder = axum::http::Request::builder()
         .method(method)
         .uri(uri)
         .header("content-type", "application/json");
     if let Some(b) = body {
-        builder.body(Body::from(serde_json::to_vec(&b).unwrap())).unwrap()
+        builder
+            .body(Body::from(serde_json::to_vec(&b).unwrap()))
+            .unwrap()
     } else {
         builder.body(Body::empty()).unwrap()
     }
@@ -33,19 +39,34 @@ async fn api_create_and_get() {
     });
 
     // POST to create
-    let resp = app.clone()
-        .oneshot(json_request("POST", "/api/v1/namespaces/default/pods", Some(pod)))
-        .await.unwrap();
+    let resp = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/api/v1/namespaces/default/pods",
+            Some(pod),
+        ))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 201, "POST should return 201 Created");
 
     let created = response_json(resp).await;
     assert_eq!(created["metadata"]["name"].as_str(), Some("test-pod"));
-    assert!(created["metadata"]["uid"].as_str().is_some(), "should have uid");
+    assert!(
+        created["metadata"]["uid"].as_str().is_some(),
+        "should have uid"
+    );
 
     // GET it back
-    let resp = app.clone()
-        .oneshot(json_request("GET", "/api/v1/namespaces/default/pods/test-pod", None))
-        .await.unwrap();
+    let resp = app
+        .clone()
+        .oneshot(json_request(
+            "GET",
+            "/api/v1/namespaces/default/pods/test-pod",
+            None,
+        ))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 200);
 
     let fetched = response_json(resp).await;
@@ -71,13 +92,33 @@ async fn api_list_with_label_selector() {
         "spec": {"containers": [{"name": "app", "image": "nginx"}]}
     });
 
-    app.clone().oneshot(json_request("POST", "/api/v1/namespaces/default/pods", Some(pod_a))).await.unwrap();
-    app.clone().oneshot(json_request("POST", "/api/v1/namespaces/default/pods", Some(pod_b))).await.unwrap();
+    app.clone()
+        .oneshot(json_request(
+            "POST",
+            "/api/v1/namespaces/default/pods",
+            Some(pod_a),
+        ))
+        .await
+        .unwrap();
+    app.clone()
+        .oneshot(json_request(
+            "POST",
+            "/api/v1/namespaces/default/pods",
+            Some(pod_b),
+        ))
+        .await
+        .unwrap();
 
     // List with label selector
-    let resp = app.clone()
-        .oneshot(json_request("GET", "/api/v1/namespaces/default/pods?labelSelector=env%3Dprod", None))
-        .await.unwrap();
+    let resp = app
+        .clone()
+        .oneshot(json_request(
+            "GET",
+            "/api/v1/namespaces/default/pods?labelSelector=env%3Dprod",
+            None,
+        ))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 200);
 
     let list = response_json(resp).await;
@@ -99,9 +140,15 @@ async fn api_update_resource() {
         "spec": {"containers": [{"name": "app", "image": "nginx:1.24"}]}
     });
 
-    let resp = app.clone()
-        .oneshot(json_request("POST", "/api/v1/namespaces/default/pods", Some(pod)))
-        .await.unwrap();
+    let resp = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/api/v1/namespaces/default/pods",
+            Some(pod),
+        ))
+        .await
+        .unwrap();
     let created = response_json(resp).await;
     let rv = created["metadata"]["resourceVersion"].as_str().unwrap();
 
@@ -112,13 +159,22 @@ async fn api_update_resource() {
         "spec": {"containers": [{"name": "app", "image": "nginx:1.25"}]}
     });
 
-    let resp = app.clone()
-        .oneshot(json_request("PUT", "/api/v1/namespaces/default/pods/upd-pod", Some(updated)))
-        .await.unwrap();
+    let resp = app
+        .clone()
+        .oneshot(json_request(
+            "PUT",
+            "/api/v1/namespaces/default/pods/upd-pod",
+            Some(updated),
+        ))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 200, "PUT should return 200");
 
     let result = response_json(resp).await;
-    assert_eq!(result["spec"]["containers"][0]["image"].as_str(), Some("nginx:1.25"));
+    assert_eq!(
+        result["spec"]["containers"][0]["image"].as_str(),
+        Some("nginx:1.25")
+    );
 
     cluster.shutdown().await;
 }
@@ -133,7 +189,14 @@ async fn api_patch_resource() {
         "metadata": {"name": "patch-pod", "namespace": "default", "labels": {"app": "web"}},
         "spec": {"containers": [{"name": "app", "image": "nginx"}]}
     });
-    app.clone().oneshot(json_request("POST", "/api/v1/namespaces/default/pods", Some(pod))).await.unwrap();
+    app.clone()
+        .oneshot(json_request(
+            "POST",
+            "/api/v1/namespaces/default/pods",
+            Some(pod),
+        ))
+        .await
+        .unwrap();
 
     // PATCH to add an annotation
     let patch = serde_json::json!({
@@ -151,7 +214,10 @@ async fn api_patch_resource() {
     assert_eq!(resp.status(), 200);
 
     let result = response_json(resp).await;
-    assert_eq!(result["metadata"]["annotations"]["note"].as_str(), Some("patched"));
+    assert_eq!(
+        result["metadata"]["annotations"]["note"].as_str(),
+        Some("patched")
+    );
     // Original label should still be present
     assert_eq!(result["metadata"]["labels"]["app"].as_str(), Some("web"));
 
@@ -168,18 +234,37 @@ async fn api_delete_resource() {
         "metadata": {"name": "del-pod", "namespace": "default"},
         "spec": {"containers": [{"name": "app", "image": "nginx"}]}
     });
-    app.clone().oneshot(json_request("POST", "/api/v1/namespaces/default/pods", Some(pod))).await.unwrap();
+    app.clone()
+        .oneshot(json_request(
+            "POST",
+            "/api/v1/namespaces/default/pods",
+            Some(pod),
+        ))
+        .await
+        .unwrap();
 
     // DELETE
-    let resp = app.clone()
-        .oneshot(json_request("DELETE", "/api/v1/namespaces/default/pods/del-pod", None))
-        .await.unwrap();
+    let resp = app
+        .clone()
+        .oneshot(json_request(
+            "DELETE",
+            "/api/v1/namespaces/default/pods/del-pod",
+            None,
+        ))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 200, "DELETE should return 200");
 
     // GET should return 404
-    let resp = app.clone()
-        .oneshot(json_request("GET", "/api/v1/namespaces/default/pods/del-pod", None))
-        .await.unwrap();
+    let resp = app
+        .clone()
+        .oneshot(json_request(
+            "GET",
+            "/api/v1/namespaces/default/pods/del-pod",
+            None,
+        ))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 404, "GET after DELETE should return 404");
 
     cluster.shutdown().await;
@@ -190,9 +275,15 @@ async fn api_404_not_found() {
     let cluster = TestCluster::start().await;
     let app = cluster.api_router();
 
-    let resp = app.clone()
-        .oneshot(json_request("GET", "/api/v1/namespaces/default/pods/does-not-exist", None))
-        .await.unwrap();
+    let resp = app
+        .clone()
+        .oneshot(json_request(
+            "GET",
+            "/api/v1/namespaces/default/pods/does-not-exist",
+            None,
+        ))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 404);
 
     cluster.shutdown().await;
@@ -208,7 +299,14 @@ async fn api_409_conflict() {
         "metadata": {"name": "conflict-pod", "namespace": "default"},
         "spec": {"containers": [{"name": "app", "image": "nginx"}]}
     });
-    app.clone().oneshot(json_request("POST", "/api/v1/namespaces/default/pods", Some(pod))).await.unwrap();
+    app.clone()
+        .oneshot(json_request(
+            "POST",
+            "/api/v1/namespaces/default/pods",
+            Some(pod),
+        ))
+        .await
+        .unwrap();
 
     // PUT with stale resourceVersion
     let stale_update = serde_json::json!({
@@ -217,10 +315,20 @@ async fn api_409_conflict() {
         "spec": {"containers": [{"name": "app", "image": "nginx:1.25"}]}
     });
 
-    let resp = app.clone()
-        .oneshot(json_request("PUT", "/api/v1/namespaces/default/pods/conflict-pod", Some(stale_update)))
-        .await.unwrap();
-    assert_eq!(resp.status(), 409, "PUT with stale resourceVersion should return 409 Conflict");
+    let resp = app
+        .clone()
+        .oneshot(json_request(
+            "PUT",
+            "/api/v1/namespaces/default/pods/conflict-pod",
+            Some(stale_update),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        409,
+        "PUT with stale resourceVersion should return 409 Conflict"
+    );
 
     cluster.shutdown().await;
 }
@@ -236,14 +344,26 @@ async fn api_duplicate_create_returns_409() {
         "spec": {"containers": [{"name": "app", "image": "nginx"}]}
     });
 
-    let resp = app.clone()
-        .oneshot(json_request("POST", "/api/v1/namespaces/default/pods", Some(pod.clone())))
-        .await.unwrap();
+    let resp = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/api/v1/namespaces/default/pods",
+            Some(pod.clone()),
+        ))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 201);
 
-    let resp = app.clone()
-        .oneshot(json_request("POST", "/api/v1/namespaces/default/pods", Some(pod)))
-        .await.unwrap();
+    let resp = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/api/v1/namespaces/default/pods",
+            Some(pod),
+        ))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 409, "duplicate POST should return 409");
 
     cluster.shutdown().await;
