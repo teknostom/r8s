@@ -175,7 +175,8 @@ contexts:
 current-context: r8s-{name}
 users:
 - name: r8s-admin
-  user: {{}}
+  user:
+    token: r8s-admin
 "#,
         ca = ca_path.display()
     );
