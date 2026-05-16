@@ -14,3 +14,5 @@ containerd-client.workspace = true
 oci-spec.workspace = true
 prost-types.workspace = true
 sha2.workspace = true
+chrono.workspace = true
+libc.workspace = true

@@ -183,6 +183,11 @@ impl TestCluster {
         .into_router()
     }
 
+    /// Cluster's data directory (where logs/, certs/, etc. live).
+    pub fn data_dir(&self) -> &std::path::Path {
+        self._temp_dir.path()
+    }
+
     /// List all resources of a GVR in a namespace.
     pub fn list(&self, gvr: &GroupVersionResource, ns: &str) -> Vec<serde_json::Value> {
         self.store

@@ -585,16 +585,19 @@ impl ContainerRuntime for ContainerdRuntime {
 
         let log_dir = self.data_dir.join("logs");
         std::fs::create_dir_all(&log_dir)?;
-        let stdout_path = log_dir.join(format!("{}.stdout", id.0));
-        let stderr_path = log_dir.join(format!("{}.stderr", id.0));
-        std::fs::File::create(&stdout_path)?;
-        std::fs::File::create(&stderr_path)?;
+
+        // CRI-style logging: containerd writes to two named pipes, our pump
+        // threads merge them into <id>.log with per-line timestamp + stream tag.
+        // Threads must be started *before* tasks.create() so the fifo opens
+        // unblock simultaneously on both ends.
+        let log_paths = crate::log_pump::LogPaths::for_container(&log_dir, &id.0);
+        crate::log_pump::start(&log_paths)?;
 
         let req = CreateTaskRequest {
             container_id: id.0.clone(),
             rootfs: mounts,
-            stdout: stdout_path.to_string_lossy().to_string(),
-            stderr: stderr_path.to_string_lossy().to_string(),
+            stdout: log_paths.stdout_fifo.to_string_lossy().to_string(),
+            stderr: log_paths.stderr_fifo.to_string_lossy().to_string(),
             ..Default::default()
         };
         TasksClient::new(self.channel.clone())
@@ -690,6 +693,14 @@ impl ContainerRuntime for ContainerdRuntime {
         let _ = SnapshotsClient::new(self.channel.clone())
             .remove(with_namespace!(req, NAMESPACE))
             .await;
+
+        // The task delete above already closed the shim's writer fds, so the
+        // pump threads have hit EOF and exited. Unlink the fifo paths so they
+        // don't accumulate. Leave <id>.log for post-mortem `kubectl logs`.
+        let log_paths =
+            crate::log_pump::LogPaths::for_container(&self.data_dir.join("logs"), &id.0);
+        let _ = std::fs::remove_file(&log_paths.stdout_fifo);
+        let _ = std::fs::remove_file(&log_paths.stderr_fifo);
 
         tracing::info!(id = id.0, "removed container");
         Ok(())

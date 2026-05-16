@@ -1,4 +1,5 @@
 pub mod containerd;
+pub mod log_pump;
 pub mod mock;
 pub mod traits;
 

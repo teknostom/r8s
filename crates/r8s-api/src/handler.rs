@@ -38,6 +38,168 @@ pub struct LogParams {
     pub container: Option<String>,
     #[serde(rename = "tailLines")]
     pub tail_lines: Option<u64>,
+    #[serde(default, deserialize_with = "deserialize_bool_flag")]
+    pub timestamps: bool,
+    #[serde(default, deserialize_with = "deserialize_bool_flag")]
+    pub follow: bool,
+}
+
+/// kubectl sends booleans as "true"/"false" strings in query params.
+fn deserialize_bool_flag<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let s = String::deserialize(deserializer)?;
+    Ok(matches!(s.as_str(), "true" | "1"))
+}
+
+/// Render CRI-format log file content into the bytes `kubectl logs` returns.
+///
+/// Each line is `<RFC3339Nano> <stream> <P|F> <content>`. Strip the prefix
+/// (unless `timestamps` is set), re-add a newline at every `F` entry. Partial
+/// (`P`) entries on the same stream are concatenated until an `F` closes them.
+///
+/// `tail_lines` counts logical lines (i.e. `F` entries) from the end.
+pub(crate) fn render_cri_log(raw: &str, timestamps: bool, tail_lines: Option<u64>) -> String {
+    let mut entries: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut current_ts: Option<&str> = None;
+
+    for line in raw.split_inclusive('\n') {
+        let line = line.strip_suffix('\n').unwrap_or(line);
+        if line.is_empty() {
+            continue;
+        }
+        let mut parts = line.splitn(4, ' ');
+        let ts = parts.next();
+        let _stream = parts.next();
+        let tag = parts.next();
+        let content = parts.next().unwrap_or("");
+        let (Some(ts), Some(tag)) = (ts, tag) else {
+            // Not a CRI line; emit as-is so we don't silently swallow output
+            // from an older log file that pre-dates this format.
+            entries.push(line.to_string());
+            continue;
+        };
+        if current.is_empty() {
+            current_ts = Some(ts);
+        }
+        current.push_str(content);
+        if tag == "F" {
+            let mut out = String::new();
+            if timestamps {
+                if let Some(t) = current_ts {
+                    out.push_str(t);
+                    out.push(' ');
+                }
+            }
+            out.push_str(&current);
+            entries.push(out);
+            current.clear();
+            current_ts = None;
+        }
+    }
+    // Trailing partial fragment (container hasn't flushed a newline yet).
+    if !current.is_empty() {
+        let mut out = String::new();
+        if timestamps {
+            if let Some(t) = current_ts {
+                out.push_str(t);
+                out.push(' ');
+            }
+        }
+        out.push_str(&current);
+        entries.push(out);
+    }
+
+    let start = match tail_lines {
+        Some(n) => entries.len().saturating_sub(n as usize),
+        None => 0,
+    };
+
+    let mut output = String::new();
+    for entry in &entries[start..] {
+        output.push_str(entry);
+        output.push('\n');
+    }
+    output
+}
+
+/// Stream `<id>.log` for a `?follow=true` request: emit current content (with
+/// `tailLines` applied), then poll for new bytes every 200ms and emit them.
+/// Exits when the client disconnects (channel send fails).
+fn follow_log_stream(
+    log_path: std::path::PathBuf,
+    timestamps: bool,
+    tail_lines: Option<u64>,
+) -> tokio_stream::wrappers::ReceiverStream<Result<axum::body::Bytes, std::io::Error>> {
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<axum::body::Bytes, std::io::Error>>(8);
+    tokio::spawn(async move {
+        let initial = tokio::fs::read_to_string(&log_path)
+            .await
+            .unwrap_or_default();
+        let mut offset = initial.len() as u64;
+        let rendered = render_cri_log(&initial, timestamps, tail_lines);
+        if !rendered.is_empty()
+            && tx
+                .send(Ok(axum::body::Bytes::from(rendered)))
+                .await
+                .is_err()
+        {
+            return;
+        }
+
+        use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            let len = match tokio::fs::metadata(&log_path).await {
+                Ok(m) => m.len(),
+                Err(_) => continue,
+            };
+            // Truncation (e.g. container restart re-prepared the log file)
+            // would underflow; rewind to the new shorter file.
+            if len < offset {
+                offset = 0;
+            }
+            if len == offset {
+                continue;
+            }
+            let mut file = match tokio::fs::File::open(&log_path).await {
+                Ok(f) => f,
+                Err(_) => continue,
+            };
+            if file.seek(SeekFrom::Start(offset)).await.is_err() {
+                continue;
+            }
+            let mut buf = Vec::with_capacity((len - offset) as usize);
+            if file.take(len - offset).read_to_end(&mut buf).await.is_err() {
+                continue;
+            }
+            // Keep only the run that ends in '\n' so we never emit a partial
+            // CRI record. Any trailing bytes wait for the next poll.
+            let trim_to = match buf.iter().rposition(|&b| b == b'\n') {
+                Some(p) => p + 1,
+                None => continue,
+            };
+            let usable = match std::str::from_utf8(&buf[..trim_to]) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            // tailLines was already applied to the initial read; live tail
+            // emits everything new.
+            let rendered = render_cri_log(usable, timestamps, None);
+            offset += trim_to as u64;
+            if !rendered.is_empty()
+                && tx
+                    .send(Ok(axum::body::Bytes::from(rendered)))
+                    .await
+                    .is_err()
+            {
+                return;
+            }
+        }
+    });
+    tokio_stream::wrappers::ReceiverStream::new(rx)
 }
 
 #[allow(clippy::result_large_err)]
@@ -689,18 +851,23 @@ pub async fn pod_logs_ns(
     let log_path = state
         .data_dir
         .join("logs")
-        .join(format!("{container_id}.stdout"));
-    let content = tokio::fs::read_to_string(&log_path)
+        .join(format!("{container_id}.log"));
+
+    if params.follow {
+        let stream = follow_log_stream(log_path, params.timestamps, params.tail_lines);
+        return Response::builder()
+            .status(200)
+            .header("content-type", "text/plain")
+            .header("transfer-encoding", "chunked")
+            .body(Body::from_stream(stream))
+            .expect("valid response");
+    }
+
+    let raw = tokio::fs::read_to_string(&log_path)
         .await
         .unwrap_or_default();
 
-    let output = if let Some(tail) = params.tail_lines {
-        let lines: Vec<&str> = content.lines().collect();
-        let start = lines.len().saturating_sub(tail as usize);
-        lines[start..].join("\n")
-    } else {
-        content
-    };
+    let output = render_cri_log(&raw, params.timestamps, params.tail_lines);
 
     Response::builder()
         .status(200)

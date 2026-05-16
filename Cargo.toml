@@ -68,6 +68,9 @@ base64 = "0.22"
 rustc-hash = "2"
 sha2 = "0.10"
 
+# System
+libc = "0.2"
+
 # Utilities
 anyhow = "1"
 thiserror = "2"
