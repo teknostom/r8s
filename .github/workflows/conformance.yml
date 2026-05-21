@@ -32,7 +32,11 @@ jobs:
       - name: Install protoc
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends protobuf-compiler
+          # libprotobuf-dev ships the well-known types
+          # (google/protobuf/any.proto etc.); the compiler package alone
+          # is just the protoc binary.
+          sudo apt-get install -y --no-install-recommends \
+            protobuf-compiler libprotobuf-dev
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
