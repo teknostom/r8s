@@ -16,7 +16,7 @@ use crate::{
     auth::{self_subject_access_review, self_subject_rules_review},
     discovery::{
         ApiState, AppState, get_api_groups, get_api_versions, get_core_v1_resources,
-        get_group_version_resources, get_version,
+        get_group_version_resources, get_single_api_group, get_version,
     },
     handler::{
         RouteContext, create_cluster, create_impl, create_ns, delete_cluster, delete_impl,
@@ -175,9 +175,16 @@ impl ApiServer {
                 "/openapi/v3/apis/{group}/{version}",
                 get(get_openapi_v3_group),
             )
+            // Both with and without trailing slash — axum treats `/apis` and
+            // `/apis/` as distinct routes, and the e2e Discovery test fetches
+            // `/apis/` explicitly.
             .route("/api", get(get_api_versions))
+            .route("/api/", get(get_api_versions))
             .route("/api/v1", get(get_core_v1_resources))
             .route("/apis", get(get_api_groups))
+            .route("/apis/", get(get_api_groups))
+            .route("/apis/{group}", get(get_single_api_group))
+            .route("/apis/{group}/", get(get_single_api_group))
             .route("/apis/{group}/{version}", get(get_group_version_resources))
             .route(
                 "/apis/authorization.k8s.io/v1/selfsubjectaccessreviews",

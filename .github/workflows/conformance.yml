@@ -29,6 +29,7 @@ jobs:
       # ranges, e.g. `[sig-api-machinery]` becoming `[s-i-g-a...y]`).
       SUITES: |
         crd-publish-openapi|\[sig-api-machinery\] CustomResourcePublishOpenAPI.*\[Conformance\]|9|0
+        discovery|\[sig-api-machinery\] Discovery .*\[Conformance\]|2|0
 
     steps:
       - uses: actions/checkout@v4

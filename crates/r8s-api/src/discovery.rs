@@ -152,6 +152,47 @@ pub async fn get_core_v1_resources(State(state): State<AppState>) -> Response {
     api_resource_list(&state, "", "v1")
 }
 
+/// `GET /apis/{group}` — returns the single APIGroup object for `group`,
+/// listing every served version. The legacy core group is reached via
+/// `GET /api`; this handler does not serve `""`.
+pub async fn get_single_api_group(
+    State(state): State<AppState>,
+    Path(group): Path<String>,
+) -> Response {
+    let mut versions: Vec<String> = state
+        .registry
+        .iter()
+        .into_iter()
+        .filter(|rt| rt.gvr.group == group)
+        .map(|rt| rt.gvr.version.clone())
+        .collect();
+    if versions.is_empty() {
+        return crate::response::status_error(
+            axum::http::StatusCode::NOT_FOUND,
+            "NotFound",
+            &format!("no API group '{group}'"),
+        );
+    }
+    versions.sort();
+    versions.dedup();
+    let version_objs: Vec<serde_json::Value> = versions
+        .iter()
+        .map(|v| {
+            let gv = format!("{group}/{v}");
+            serde_json::json!({"groupVersion": gv, "version": v})
+        })
+        .collect();
+    let preferred = versions.last().cloned().unwrap_or_default();
+    let preferred_gv = format!("{group}/{preferred}");
+    object_response(&serde_json::json!({
+        "kind": "APIGroup",
+        "apiVersion": "v1",
+        "name": group,
+        "versions": version_objs,
+        "preferredVersion": {"groupVersion": preferred_gv, "version": preferred},
+    }))
+}
+
 pub async fn get_group_version_resources(
     State(state): State<AppState>,
     Path((group, version)): Path<(String, String)>,
