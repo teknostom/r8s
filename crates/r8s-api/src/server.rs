@@ -139,7 +139,7 @@ async fn dynamic_dispatch(
             update_impl(&state, &ctx, api_path.namespace.as_deref(), name, json)
         }
         (Method::PATCH, Some(ref name)) => {
-            patch_impl(&state, &ctx, api_path.namespace.as_deref(), name, body)
+            patch_impl(&state, &ctx, api_path.namespace.as_deref(), name, &headers, body)
         }
         (Method::DELETE, Some(ref name)) => {
             delete_impl(&state, &ctx, api_path.namespace.as_deref(), name)

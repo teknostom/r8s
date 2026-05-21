@@ -31,6 +31,11 @@ pub async fn run(
                         let Ok(crd) = crd else { continue };
                         match event.event_type {
                             WatchEventType::Added | WatchEventType::Modified => {
+                                // Unregister first so versions that flipped
+                                // to served=false (or were renamed) drop out
+                                // of the registry; register_crd only adds
+                                // served versions, never removes stale ones.
+                                unregister_crd(&registry, &crd);
                                 register_crd(&registry, &crd);
                             }
                             WatchEventType::Deleted => {
@@ -97,13 +102,21 @@ fn register_crd(registry: &ResourceRegistry, crd: &CustomResourceDefinition) {
 
 fn unregister_crd(registry: &ResourceRegistry, crd: &CustomResourceDefinition) {
     let spec = &crd.spec;
-    for ver in &spec.versions {
-        let gvr = GroupVersionResource::new(&spec.group, &ver.name, &spec.names.plural);
+    // Sweep every GVR matching this CRD's (group, plural) — not just the
+    // versions listed in the current spec — so renames and served-flips
+    // drop stale entries instead of leaving them in the registry.
+    let stale: Vec<GroupVersionResource> = registry
+        .iter()
+        .into_iter()
+        .filter(|rt| rt.gvr.group == spec.group && rt.gvr.resource == spec.names.plural)
+        .map(|rt| rt.gvr.clone())
+        .collect();
+    for gvr in stale {
         tracing::info!(
             "unregistered CRD resource {}/{}/{}",
-            spec.group,
-            ver.name,
-            spec.names.plural,
+            gvr.group,
+            gvr.version,
+            gvr.resource,
         );
         registry.unregister(&gvr);
     }

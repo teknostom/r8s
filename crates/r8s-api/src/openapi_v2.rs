@@ -105,17 +105,113 @@ fn merge_crd_definitions(state: &AppState, doc: &mut Value) {
         if r8s_types::openapi::spec_bytes_for(&rt.gvr.group, &rt.gvr.version).is_some() {
             continue;
         }
-        // CRDs without a validation schema still need to appear in the doc —
-        // the `works for CRD without validation schema` conformance test
-        // polls for the definition's mere existence. Match upstream's stub:
-        // an open object that accepts any structure.
-        let schema = rt.schema.clone().unwrap_or_else(|| {
-            serde_json::json!({
-                "type": "object",
-                "x-kubernetes-preserve-unknown-fields": true,
-            })
-        });
-        defs.insert(definition_key(&rt), schema);
+        defs.insert(definition_key(&rt), transform_for_v2(&rt));
+    }
+}
+
+/// Build the OpenAPI v2 definition for a CRD from the user-provided
+/// `openAPIV3Schema`. Mirrors what upstream kube-openapi does when publishing
+/// CRD schemas to v2:
+///
+/// - At the *root* level, `x-kubernetes-preserve-unknown-fields:true` means
+///   the whole CRD is a loose object. Emit bare `{type:object}` with no
+///   GVK extension — the `works for CRD without validation schema` test
+///   compares the published value byte-for-byte against that shape, and
+///   kubectl explain falls back to /openapi/v3 (where the GVK *is* set) so
+///   discovery still works.
+/// - At non-root levels, *keep* `x-kubernetes-preserve-unknown-fields:true`.
+///   kubectl client-side validation understands the extension and treats
+///   anything inside that subtree as opaque (so a CR with random fields
+///   inside `spec` doesn't trip "unknown field" or "unknown object type
+///   nil" errors).
+/// - For schemas that don't preserve at root, wrap the root with the
+///   standard `apiVersion`/`kind`/`metadata` properties (CR objects always
+///   carry these, but the user's schema doesn't list them, so kubectl
+///   strict validation otherwise rejects valid CRs). Attach the GVK
+///   extension so kubectl explain resolves GVR → schema via v2.
+fn transform_for_v2(rt: &std::sync::Arc<r8s_types::ResourceType>) -> Value {
+    let Some(mut schema) = rt.schema.clone() else {
+        return serde_json::json!({"type": "object"});
+    };
+    if root_preserves_unknown_fields(&schema) {
+        return serde_json::json!({"type": "object"});
+    }
+    // kubectl client-side strict validation doesn't honor
+    // `x-kubernetes-preserve-unknown-fields` when `properties` are also
+    // listed at that level — it just walks `properties` and reports any
+    // sibling key as unknown. Drop `properties` (and `required`) at every
+    // preserves-unknown level so kubectl has nothing to strict-validate
+    // against, while leaving the extension itself in place for clients that
+    // do honor it.
+    drop_properties_at_preserve_levels(&mut schema);
+    if let Some(obj) = schema.as_object_mut() {
+        let props = obj
+            .entry("properties".to_string())
+            .or_insert_with(|| serde_json::json!({}));
+        if let Some(props) = props.as_object_mut() {
+            props
+                .entry("apiVersion".to_string())
+                .or_insert_with(|| serde_json::json!({"type": "string"}));
+            props
+                .entry("kind".to_string())
+                .or_insert_with(|| serde_json::json!({"type": "string"}));
+            props.entry("metadata".to_string()).or_insert_with(|| {
+                serde_json::json!({
+                    "$ref": "#/definitions/io.k8s.apimachinery.pkg.apis.meta.v1.ObjectMeta"
+                })
+            });
+        }
+        obj.insert(
+            "x-kubernetes-group-version-kind".to_string(),
+            serde_json::json!([{
+                "group": rt.gvr.group,
+                "version": rt.gvr.version,
+                "kind": rt.kind,
+            }]),
+        );
+    }
+    schema
+}
+
+fn root_preserves_unknown_fields(schema: &Value) -> bool {
+    schema
+        .get("x-kubernetes-preserve-unknown-fields")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
+fn drop_properties_at_preserve_levels(schema: &mut Value) {
+    let Some(obj) = schema.as_object_mut() else {
+        return;
+    };
+    let preserves = obj
+        .get("x-kubernetes-preserve-unknown-fields")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if preserves {
+        // Reduce to just the preserve extension — no type, no properties,
+        // no additionalProperties. Kubectl's strict validator otherwise
+        // trips on `null` children with "unknown object type nil" because
+        // it can't decide what schema applies. Stripping back to bare
+        // preserve-unknown-fields tells the validator "treat this subtree
+        // as opaque".
+        obj.clear();
+        obj.insert(
+            "x-kubernetes-preserve-unknown-fields".to_string(),
+            serde_json::json!(true),
+        );
+        return;
+    }
+    if let Some(props) = obj.get_mut("properties").and_then(|p| p.as_object_mut()) {
+        for v in props.values_mut() {
+            drop_properties_at_preserve_levels(v);
+        }
+    }
+    if let Some(items) = obj.get_mut("items") {
+        drop_properties_at_preserve_levels(items);
+    }
+    if let Some(ap) = obj.get_mut("additionalProperties") {
+        drop_properties_at_preserve_levels(ap);
     }
 }
 

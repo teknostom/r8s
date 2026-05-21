@@ -1,0 +1,128 @@
+name: conformance
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+# Cancel in-flight runs of the same ref when a new commit arrives.
+concurrency:
+  group: conformance-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  conformance:
+    name: Kubernetes conformance
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CONFORMANCE_IMAGE: registry.k8s.io/conformance:v1.32.0
+      RESULTS_DIR: ${{ github.workspace }}/conformance-results
+      # Suites this job enforces. Each row is:
+      #   NAME | FOCUS_REGEX | EXPECTED_PASSED | EXPECTED_FAILED
+      # Add more rows here when a new SIG/test family goes green.
+      # The FOCUS regex is passed to the e2e.test binary's --ginkgo.focus.
+      SUITES: |
+        crd-publish-openapi | \[sig-api-machinery\] CustomResourcePublishOpenAPI.*\[Conformance\] | 9 | 0
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Cache conformance e2e.test binary
+        id: cache-e2e
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.RESULTS_DIR }}/e2e.test
+          key: e2e-test-${{ env.CONFORMANCE_IMAGE }}
+
+      - name: Extract e2e.test from conformance image
+        if: steps.cache-e2e.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p "$RESULTS_DIR"
+          container_id=$(docker create "$CONFORMANCE_IMAGE")
+          docker cp "$container_id:/usr/local/bin/e2e.test" "$RESULTS_DIR/e2e.test"
+          docker rm "$container_id" > /dev/null
+          chmod +x "$RESULTS_DIR/e2e.test"
+
+      - name: Build r8sd (release)
+        run: cargo build --release --bin r8sd
+
+      - name: Start r8sd
+        run: |
+          set -euo pipefail
+          sudo mkdir -p /var/lib/r8s/clusters/default
+          # Launch r8sd in the background; pin output to a file we can dump on failure.
+          sudo -E nohup ./target/release/r8sd \
+              --data-dir /var/lib/r8s/clusters/default \
+              > "$RESULTS_DIR/r8sd.log" 2>&1 &
+          # Wait for the API to start serving. Up to 30s of probing.
+          for i in $(seq 1 60); do
+            if curl -sk https://127.0.0.1:6443/readyz >/dev/null 2>&1; then
+              echo "r8sd up after ${i}/60 probes"
+              break
+            fi
+            sleep 0.5
+          done
+          # Verify the kubeconfig actually got written.
+          sudo test -f /var/lib/r8s/clusters/default/kubeconfig
+          sudo chmod a+r /var/lib/r8s/clusters/default/kubeconfig
+          echo "KUBECONFIG=/var/lib/r8s/clusters/default/kubeconfig" >> "$GITHUB_ENV"
+
+      - name: Run conformance suites
+        id: run
+        run: |
+          set -euo pipefail
+          mkdir -p "$RESULTS_DIR"
+          FAILED_SUITES=()
+          # Parse SUITES env: skip blank/comment lines, then split by `|`.
+          while IFS= read -r line; do
+            line="${line%%#*}"  # strip trailing comments
+            [[ -z "${line// }" ]] && continue
+            IFS='|' read -r NAME FOCUS EXP_PASS EXP_FAIL <<< "$line"
+            NAME="$(echo "$NAME" | xargs)"
+            FOCUS="$(echo "$FOCUS" | xargs)"
+            EXP_PASS="$(echo "$EXP_PASS" | xargs)"
+            EXP_FAIL="$(echo "$EXP_FAIL" | xargs)"
+            echo "::group::suite=$NAME focus=$FOCUS"
+            FOCUS="$FOCUS" ./scripts/conformance.sh custom \
+              | tee "$RESULTS_DIR/$NAME.log"
+            summary=$(grep -oP '\d+ Passed \| \d+ Failed \| \d+ Pending \| \d+ Skipped' \
+              "$RESULTS_DIR/$NAME.log" | tail -1 || true)
+            passed=$(echo "$summary" | grep -oP '^\d+' || echo 0)
+            failed=$(echo "$summary" | grep -oP '(\d+) Failed' | grep -oP '^\d+' || echo 0)
+            echo "::endgroup::"
+            if [[ "$passed" != "$EXP_PASS" || "$failed" != "$EXP_FAIL" ]]; then
+              echo "::error::suite=$NAME expected ${EXP_PASS}P/${EXP_FAIL}F, got ${passed}P/${failed}F"
+              FAILED_SUITES+=("$NAME")
+            else
+              echo "suite=$NAME OK (${passed}P/${failed}F)"
+            fi
+          done <<< "$SUITES"
+          if [[ ${#FAILED_SUITES[@]} -gt 0 ]]; then
+            echo "Failed suites: ${FAILED_SUITES[*]}"
+            exit 1
+          fi
+
+      - name: Dump r8sd log on failure
+        if: failure()
+        run: |
+          echo "===== r8sd.log ====="
+          sudo cat "$RESULTS_DIR/r8sd.log" 2>/dev/null || true
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: conformance-results
+          path: |
+            ${{ env.RESULTS_DIR }}/*.log
+          if-no-files-found: ignore
+          retention-days: 14

@@ -329,6 +329,28 @@ fn maybe_allocate_cluster_ip(state: &AppState, ctx: &RouteContext, body: &mut se
     }
 }
 
+/// For CRDs, validate the incoming object against the CRD's openAPIV3Schema.
+/// Skipped for built-in resources (their vendored schemas are very strict and
+/// we don't currently want to reject otherwise-valid input there).
+fn validate_cr(ctx: &RouteContext, body: &serde_json::Value) -> Option<Response> {
+    if r8s_types::openapi::spec_bytes_for(&ctx.resource_type.gvr.group, &ctx.resource_type.gvr.version)
+        .is_some()
+    {
+        return None;
+    }
+    let Some(schema) = ctx.resource_type.schema.as_ref() else {
+        return None;
+    };
+    match crate::schema_validate::validate(body, schema) {
+        Ok(()) => None,
+        Err(msg) => Some(status_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Invalid",
+            &msg,
+        )),
+    }
+}
+
 pub(crate) fn create_impl(
     state: &AppState,
     ctx: &RouteContext,
@@ -378,6 +400,10 @@ pub(crate) fn create_impl(
         r8s_controllers::pod_admission::inject_sa_token(&state.store, &mut body);
     }
 
+    if let Some(resp) = validate_cr(ctx, &body) {
+        return resp;
+    }
+
     let resource_ref = ResourceRef {
         gvr: &ctx.resource_type.gvr,
         namespace,
@@ -423,6 +449,9 @@ pub(crate) fn update_impl(
     name: &str,
     body: serde_json::Value,
 ) -> Response {
+    if let Some(resp) = validate_cr(ctx, &body) {
+        return resp;
+    }
     let resource_ref = ResourceRef {
         gvr: &ctx.resource_type.gvr,
         namespace,
@@ -504,6 +533,7 @@ pub(crate) fn patch_impl(
     ctx: &RouteContext,
     namespace: Option<&str>,
     name: &str,
+    headers: &HeaderMap,
     bytes: Bytes,
 ) -> Response {
     let rref = ResourceRef {
@@ -511,6 +541,16 @@ pub(crate) fn patch_impl(
         namespace,
         name,
     };
+    let content_type = headers
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    // RFC 6902 JSON Patch sends an array of ops; RFC 7396 JSON Merge Patch
+    // (and strategic-merge-patch, which we don't yet differentiate) sends an
+    // object. kubectl uses json-patch+json for CRD version renames and other
+    // structural edits — treating that body as a merge patch would replace
+    // the whole resource with the array.
+    let is_json_patch = content_type.contains("json-patch+json");
     let patch: serde_json::Value = match serde_json::from_slice(&bytes) {
         Ok(v) => v,
         Err(e) => {
@@ -523,13 +563,33 @@ pub(crate) fn patch_impl(
     };
     match state.store.get(&rref) {
         Ok(Some(mut current)) => {
-            json_merge_patch(&mut current, &patch);
+            if is_json_patch {
+                if let Err(e) = crate::jsonpatch::apply(&mut current, &patch) {
+                    return response::status_error(
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        "Invalid",
+                        &format!("json patch failed: {e}"),
+                    );
+                }
+            } else {
+                json_merge_patch(&mut current, &patch);
+            }
+            if let Some(resp) = validate_cr(ctx, &current) {
+                return resp;
+            }
             match state.store.update(&rref, &current) {
                 Ok(obj) => response::object_response(&obj),
                 Err(err) => response::anyhow_error_response(err),
             }
         }
         Ok(None) => {
+            if is_json_patch {
+                return response::status_error(
+                    StatusCode::NOT_FOUND,
+                    "NotFound",
+                    &format!("{} '{}' not found", ctx.resource_type.kind, name),
+                );
+            }
             // Server-side apply: create if not found
             let mut body = patch;
             if let Some(meta) = body.get_mut("metadata").and_then(|v| v.as_object_mut()) {
@@ -546,6 +606,9 @@ pub(crate) fn patch_impl(
                 obj.insert("metadata".to_string(), serde_json::Value::Object(meta));
             }
             maybe_allocate_cluster_ip(state, ctx, &mut body);
+            if let Some(resp) = validate_cr(ctx, &body) {
+                return resp;
+            }
             match state.store.create(rref, &body) {
                 Ok(obj) => response::created_response(&obj),
                 Err(err) => response::anyhow_error_response(err),
@@ -559,18 +622,20 @@ pub async fn patch_ns(
     State(state): State<AppState>,
     Extension(ctx): Extension<RouteContext>,
     Path((ns, name)): Path<(String, String)>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    patch_impl(&state, &ctx, Some(&ns), &name, body)
+    patch_impl(&state, &ctx, Some(&ns), &name, &headers, body)
 }
 
 pub async fn patch_cluster(
     State(state): State<AppState>,
     Extension(ctx): Extension<RouteContext>,
     Path(name): Path<String>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    patch_impl(&state, &ctx, None, &name, body)
+    patch_impl(&state, &ctx, None, &name, &headers, body)
 }
 
 fn api_version(ctx: &RouteContext) -> String {
