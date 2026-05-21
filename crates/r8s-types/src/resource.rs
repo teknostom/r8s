@@ -44,6 +44,12 @@ impl GroupVersionResource {
     pub fn service_accounts() -> Self {
         Self::new("", "v1", "serviceaccounts")
     }
+    pub fn resource_quotas() -> Self {
+        Self::new("", "v1", "resourcequotas")
+    }
+    pub fn pod_templates() -> Self {
+        Self::new("", "v1", "podtemplates")
+    }
 
     pub fn deployments() -> Self {
         Self::new("apps", "v1", "deployments")

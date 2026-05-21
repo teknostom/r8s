@@ -1,3 +1,5 @@
+pub mod k8s_pb;
+pub mod k8s_pb_serde;
 pub mod openapi;
 pub mod openapi_proto;
 pub mod registry;

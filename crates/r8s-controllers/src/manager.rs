@@ -40,17 +40,21 @@ impl ControllerManager {
             }};
         }
 
-        spawn_controller!("namespace", super::namespace::run);
-        {
-            let store = self.store.clone();
-            let token = self.shutdown.clone();
-            let ca_pem = self.ca_pem.clone();
-            self.handles.push(tokio::spawn(async move {
-                if let Err(e) = super::serviceaccount::run(store, token, ca_pem).await {
-                    tracing::error!("serviceaccount controller error: {e}");
-                }
-            }));
+        macro_rules! spawn_controller_with_ca {
+            ($name:expr, $func:path) => {{
+                let store = self.store.clone();
+                let token = self.shutdown.clone();
+                let ca_pem = self.ca_pem.clone();
+                self.handles.push(tokio::spawn(async move {
+                    if let Err(e) = $func(store, token, ca_pem).await {
+                        tracing::error!("{} controller error: {e}", $name);
+                    }
+                }));
+            }};
         }
+
+        spawn_controller_with_ca!("namespace", super::namespace::run);
+        spawn_controller_with_ca!("serviceaccount", super::serviceaccount::run);
         spawn_controller!("replicaset", super::replicaset::run);
         spawn_controller!("deployment", super::deployment::run);
         spawn_controller!("gc", super::gc::run);

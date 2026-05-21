@@ -21,7 +21,6 @@ use crate::{
     discovery::AppState,
     params::ListParams,
     patch::json_merge_patch,
-    protobuf::decode_k8s_protobuf,
     response::{self, status_error},
     table,
 };
@@ -212,11 +211,18 @@ pub(crate) fn require_json(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     if content_type.contains("protobuf") {
-        return decode_k8s_protobuf(body).ok_or_else(|| {
+        // We have hand-rolled protobuf-to-JSON converters for a small set of
+        // resource types (currently just CustomResourceDefinition — see
+        // `r8s_types::k8s_pb_serde::decode_k8s_protobuf_to_json`). For
+        // unsupported GVKs return 415 so the client falls back to JSON; a
+        // partial decode would silently drop `spec`/`status` and we'd rather
+        // be loud than wrong.
+        return r8s_types::k8s_pb_serde::decode_k8s_protobuf_to_json(body).ok_or_else(|| {
             status_error(
-                StatusCode::BAD_REQUEST,
-                "Invalid",
-                "failed to decode kubernetes protobuf body",
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "UnsupportedMediaType",
+                "r8s does not yet accept application/vnd.kubernetes.protobuf request bodies \
+                 for this resource type; retry with application/json",
             )
         });
     }

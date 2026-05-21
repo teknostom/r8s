@@ -1,7 +1,6 @@
 use std::{
     path::Path,
     sync::{Arc, RwLock},
-    time::Duration,
 };
 
 use base64::prelude::*;
@@ -18,6 +17,17 @@ use crate::{
 
 const RESOURCES: TableDefinition<&str, &[u8]> = TableDefinition::new("resources");
 const REVISIONS: TableDefinition<u64, &[u8]> = TableDefinition::new("revisions");
+
+// History window for the REVISIONS table. Each write prunes the entry
+// `KEEP_REVISIONS` behind the new one, so the table stays bounded without
+// a background task.
+//
+// TODO(410-gone): nothing reads REVISIONS yet. When watch-from-resourceVersion
+// and resourceVersionMatch=Exact list reads are wired up, requests referencing
+// any RV older than `current - KEEP_REVISIONS` must return HTTP 410 Gone
+// (status reason "Expired"). There is a single threshold — the oldest
+// retained RV — checked per request; clients respond by relisting.
+const KEEP_REVISIONS: u64 = 1000;
 
 #[derive(Clone)]
 pub struct Store {
@@ -72,8 +82,6 @@ impl Store {
             view_lock: Arc::new(RwLock::new(())),
         };
 
-        store.start_compaction(1000, 300);
-
         Ok(store)
     }
 
@@ -127,6 +135,7 @@ impl Store {
                 "object": obj,
             });
             table.insert(rev, serde_json::to_vec(&rev_entry)?.as_slice())?;
+            prune_revision(&mut table, rev)?;
         }
 
         w_transaction.commit()?;
@@ -229,6 +238,7 @@ impl Store {
                 "object": obj,
             });
             table.insert(rev, serde_json::to_vec(&rev_entry)?.as_slice())?;
+            prune_revision(&mut table, rev)?;
         }
 
         w_transaction.commit()?;
@@ -274,6 +284,7 @@ impl Store {
                 "object": obj,
             });
             table.insert(rev, serde_json::to_vec(&rev_entry)?.as_slice())?;
+            prune_revision(&mut table, rev)?;
         }
 
         w_transaction.commit()?;
@@ -354,7 +365,7 @@ impl Store {
                 continue;
             }
             if let Some(fs) = field_selector
-                && !fs.matches(&item)
+                && !fs.matches(&item, &gvr.key_prefix())
             {
                 continue;
             }
@@ -422,39 +433,19 @@ impl Store {
         self.watches.subscribe(&gvr.key_prefix())
     }
 
-    pub fn start_compaction(&self, keep: u64, interval_secs: u64) {
-        let db = self.db.clone();
-        let revision = self.revision.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
-            loop {
-                interval.tick().await;
-                if let Err(e) = compact(&db, &revision, keep) {
-                    tracing::warn!("compaction failed: {e}")
-                }
-            }
-        });
-    }
 }
 
-fn compact(db: &Database, revision: &RevisionCounter, keep: u64) -> anyhow::Result<()> {
-    let current = revision.current();
-    if current <= keep {
-        return Ok(());
-    }
-    let cutoff = current - keep;
-
-    let w_transaction = db.begin_write()?;
-    {
-        let mut table = w_transaction.open_table(REVISIONS)?;
-        let to_remove: Vec<u64> = table
-            .range(..=cutoff)?
-            .map(|entry| entry.map(|(k, _)| k.value()))
-            .collect::<Result<_, _>>()?;
-        for key in to_remove {
-            table.remove(key)?;
+/// Remove the revision entry that just fell out of the keep window. Called
+/// inside the same write transaction that inserts `new_rev`, so history stays
+/// bounded at `KEEP_REVISIONS` entries without a separate compaction pass.
+fn prune_revision(
+    table: &mut redb::Table<'_, u64, &[u8]>,
+    new_rev: u64,
+) -> anyhow::Result<()> {
+    if let Some(stale) = new_rev.checked_sub(KEEP_REVISIONS) {
+        if stale > 0 {
+            table.remove(stale)?;
         }
     }
-    w_transaction.commit()?;
     Ok(())
 }

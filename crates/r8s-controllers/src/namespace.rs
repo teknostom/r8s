@@ -1,14 +1,22 @@
+use std::collections::BTreeMap;
+
 use r8s_store::{Store, backend::ResourceRef, watch::WatchEventType};
 use r8s_types::{GroupVersionResource, ObjectMeta, ServiceAccount};
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
-pub async fn run(store: Store, shutdown: CancellationToken) -> anyhow::Result<()> {
+/// Name of the ConfigMap the upstream `root-ca-cert-publisher` controller
+/// writes into every namespace. The e2e framework blocks each test's
+/// BeforeEach on this object showing up (see `WaitForKubeRootCAInNamespace`).
+const KUBE_ROOT_CA_CONFIGMAP: &str = "kube-root-ca.crt";
+
+pub async fn run(store: Store, shutdown: CancellationToken, ca_pem: String) -> anyhow::Result<()> {
     tracing::info!("namespace controller started");
     let ns_gvr = GroupVersionResource::namespaces();
     let sa_gvr = GroupVersionResource::service_accounts();
+    let cm_gvr = GroupVersionResource::configmaps();
 
-    reconcile_all(&store, &ns_gvr, &sa_gvr);
+    reconcile_all(&store, &ns_gvr, &sa_gvr, &cm_gvr, &ca_pem);
 
     let mut rx = store.watch(&ns_gvr);
     loop {
@@ -25,11 +33,12 @@ pub async fn run(store: Store, shutdown: CancellationToken) -> anyhow::Result<()
                             && let Some(name) = ns.metadata.name.as_deref()
                         {
                             ensure_default_sa(&store, &sa_gvr, name);
+                            ensure_kube_root_ca(&store, &cm_gvr, name, &ca_pem);
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         tracing::warn!("namespace controller lagged {n} events, re-syncing");
-                        reconcile_all(&store, &ns_gvr, &sa_gvr);
+                        reconcile_all(&store, &ns_gvr, &sa_gvr, &cm_gvr, &ca_pem);
                     }
                     Err(broadcast::error::RecvError::Closed) => return Ok(()),
                     Ok(_) => {}
@@ -39,7 +48,13 @@ pub async fn run(store: Store, shutdown: CancellationToken) -> anyhow::Result<()
     }
 }
 
-fn reconcile_all(store: &Store, ns_gvr: &GroupVersionResource, sa_gvr: &GroupVersionResource) {
+fn reconcile_all(
+    store: &Store,
+    ns_gvr: &GroupVersionResource,
+    sa_gvr: &GroupVersionResource,
+    cm_gvr: &GroupVersionResource,
+    ca_pem: &str,
+) {
     let namespaces = match store.list_as::<r8s_types::Namespace>(ns_gvr, None) {
         Ok(r) => r,
         Err(e) => {
@@ -50,6 +65,7 @@ fn reconcile_all(store: &Store, ns_gvr: &GroupVersionResource, sa_gvr: &GroupVer
     for ns in &namespaces {
         if let Some(name) = ns.metadata.name.as_deref() {
             ensure_default_sa(store, sa_gvr, name);
+            ensure_kube_root_ca(store, cm_gvr, name, ca_pem);
         }
     }
 }
@@ -84,5 +100,46 @@ fn ensure_default_sa(store: &Store, sa_gvr: &GroupVersionResource, namespace: &s
             }
         }
         Err(e) => tracing::warn!("failed to check SA in '{namespace}': {e}"),
+    }
+}
+
+/// Publish the `kube-root-ca.crt` ConfigMap holding the API server's CA bundle
+/// into `namespace`, mirroring kube-controller-manager's `root-ca-cert-publisher`.
+/// Conformance BeforeEach polls for this; without it every spec stalls 2 min.
+fn ensure_kube_root_ca(
+    store: &Store,
+    cm_gvr: &GroupVersionResource,
+    namespace: &str,
+    ca_pem: &str,
+) {
+    let resource_ref = ResourceRef {
+        gvr: cm_gvr,
+        namespace: Some(namespace),
+        name: KUBE_ROOT_CA_CONFIGMAP,
+    };
+    match store.get(&resource_ref) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            let mut data = BTreeMap::new();
+            data.insert("ca.crt".to_string(), serde_json::Value::String(ca_pem.into()));
+            let cm = serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "ConfigMap",
+                "metadata": {
+                    "name": KUBE_ROOT_CA_CONFIGMAP,
+                    "namespace": namespace,
+                },
+                "data": data,
+            });
+            match store.create(resource_ref, &cm) {
+                Ok(_) => {
+                    tracing::info!("published {KUBE_ROOT_CA_CONFIGMAP} into namespace '{namespace}'");
+                }
+                Err(e) => tracing::warn!(
+                    "failed to publish {KUBE_ROOT_CA_CONFIGMAP} into '{namespace}': {e}"
+                ),
+            }
+        }
+        Err(e) => tracing::warn!("failed to check {KUBE_ROOT_CA_CONFIGMAP} in '{namespace}': {e}"),
     }
 }

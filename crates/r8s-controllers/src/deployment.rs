@@ -14,6 +14,21 @@ use crate::is_owned_by;
 const DEFAULT_MAX_SURGE_PERCENT: f64 = 25.0;
 const DEFAULT_MAX_UNAVAILABLE_PERCENT: f64 = 25.0;
 
+/// Annotation upstream's Deployment controller stamps on each ReplicaSet
+/// (its own revision) and on the Deployment (the newest RS's revision).
+/// The e2e framework's deployment helper logs
+/// "deployment X doesn't have the required revision set" while polling for it.
+const REVISION_ANNOTATION: &str = "deployment.kubernetes.io/revision";
+
+fn rs_revision(rs: &ReplicaSet) -> i64 {
+    rs.metadata
+        .annotations
+        .as_ref()
+        .and_then(|a| a.get(REVISION_ANNOTATION))
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(0)
+}
+
 fn template_hash(template: &serde_json::Value) -> String {
     let canonical = serde_json::to_string(template).unwrap_or_default();
     let mut hasher = FxHasher::default();
@@ -139,6 +154,17 @@ fn reconcile_deployment(store: &Store, deploy_value: &serde_json::Value) -> anyh
         .and_then(|s| s.type_.as_deref());
     let is_recreate = strategy_type == Some("Recreate");
 
+    // Revision for the new RS: reuse the existing RS's revision if it's
+    // already there (same pod-template-hash), otherwise pick the next number
+    // above any owned RS — that's how upstream avoids reordering revisions
+    // when a Deployment churns back to an older template.
+    let next_revision = owned_rs
+        .iter()
+        .find(|rs| rs.metadata.name.as_deref() == Some(&new_rs_name))
+        .map(rs_revision)
+        .filter(|r| *r > 0)
+        .unwrap_or_else(|| owned_rs.iter().map(rs_revision).max().unwrap_or(0) + 1);
+
     if is_recreate {
         reconcile_recreate(
             store,
@@ -150,6 +176,7 @@ fn reconcile_deployment(store: &Store, deploy_value: &serde_json::Value) -> anyh
             &new_rs_name,
             &hash,
             desired_replicas,
+            next_revision,
         )?;
     } else {
         reconcile_rolling(
@@ -162,6 +189,7 @@ fn reconcile_deployment(store: &Store, deploy_value: &serde_json::Value) -> anyh
             &new_rs_name,
             &hash,
             desired_replicas,
+            next_revision,
         )?;
     }
 
@@ -181,6 +209,7 @@ fn reconcile_recreate(
     new_rs_name: &str,
     hash: &str,
     desired_replicas: i32,
+    revision: i64,
 ) -> anyhow::Result<()> {
     if let Some(existing_rs) = owned_rs
         .iter()
@@ -207,6 +236,7 @@ fn reconcile_recreate(
             new_rs_name,
             hash,
             desired_replicas,
+            revision,
         )?;
         tracing::info!(
             "deployment '{deploy_name}': created RS '{new_rs_name}' with {desired_replicas} replicas"
@@ -236,6 +266,7 @@ fn reconcile_rolling(
     new_rs_name: &str,
     hash: &str,
     desired_replicas: i32,
+    revision: i64,
 ) -> anyhow::Result<()> {
     let (max_surge, max_unavailable) = rolling_params(spec, desired_replicas);
 
@@ -269,6 +300,7 @@ fn reconcile_rolling(
             new_rs_name,
             hash,
             new_target,
+            revision,
         )?;
         tracing::info!(
             "deployment '{deploy_name}': created RS '{new_rs_name}' with {new_target} replicas (rolling)"
@@ -371,15 +403,38 @@ fn create_new_rs(
     rs_name: &str,
     hash: &str,
     replicas: i32,
+    revision: i64,
 ) -> anyhow::Result<()> {
-    let mut labels = spec.selector.match_labels.clone().unwrap_or_default();
-    labels.insert("pod-template-hash".into(), hash.to_string());
+    use std::collections::BTreeMap;
+    // Upstream's Deployment controller injects `pod-template-hash` into the
+    // RS's selector, the RS's pod template labels, and the RS's own labels —
+    // that's how it owns one generation of pods without overlapping with
+    // older RSes. The e2e framework explicitly checks this on every Deployment
+    // ("new replica set ... doesn't have 'pod-template-hash' label selector").
+    let mut rs_labels = spec.selector.match_labels.clone().unwrap_or_default();
+    rs_labels.insert("pod-template-hash".into(), hash.to_string());
+
+    let mut rs_selector = spec.selector.clone();
+    let mut sel_match = rs_selector.match_labels.clone().unwrap_or_default();
+    sel_match.insert("pod-template-hash".into(), hash.to_string());
+    rs_selector.match_labels = Some(sel_match);
+
+    let mut rs_template = spec.template.clone();
+    let mut tmpl_meta = rs_template.metadata.unwrap_or_default();
+    let mut tmpl_labels = tmpl_meta.labels.unwrap_or_default();
+    tmpl_labels.insert("pod-template-hash".into(), hash.to_string());
+    tmpl_meta.labels = Some(tmpl_labels);
+    rs_template.metadata = Some(tmpl_meta);
+
+    let mut annotations: BTreeMap<String, String> = BTreeMap::new();
+    annotations.insert(REVISION_ANNOTATION.into(), revision.to_string());
 
     let rs = ReplicaSet {
         metadata: ObjectMeta {
             name: Some(rs_name.to_string()),
             namespace: deploy_ns.map(String::from),
-            labels: Some(labels),
+            labels: Some(rs_labels),
+            annotations: Some(annotations),
             owner_references: Some(vec![OwnerReference {
                 api_version: "apps/v1".into(),
                 kind: "Deployment".into(),
@@ -392,8 +447,8 @@ fn create_new_rs(
         },
         spec: Some(ReplicaSetSpec {
             replicas: Some(replicas),
-            selector: spec.selector.clone(),
-            template: Some(spec.template.clone()),
+            selector: rs_selector,
+            template: Some(rs_template),
             ..Default::default()
         }),
         status: None,
@@ -458,10 +513,12 @@ fn update_deploy_status(store: &Store, deploy_value: &serde_json::Value) -> anyh
         .collect();
     let mut total_replicas: i32 = 0;
     let mut ready_replicas: i32 = 0;
+    let mut max_revision: i64 = 0;
     for rs in &owned_rs {
         let status = rs.status.clone().unwrap_or_default();
         total_replicas += status.replicas;
         ready_replicas += status.ready_replicas.unwrap_or(0);
+        max_revision = max_revision.max(rs_revision(rs));
     }
 
     let status = DeploymentStatus {
@@ -481,12 +538,43 @@ fn update_deploy_status(store: &Store, deploy_value: &serde_json::Value) -> anyh
         ..Default::default()
     };
     let new_status_val = serde_json::to_value(&status)?;
-    if current.get("status") == Some(&new_status_val) {
+
+    let revision_str = if max_revision > 0 {
+        Some(max_revision.to_string())
+    } else {
+        None
+    };
+    let existing_revision = current
+        .get("metadata")
+        .and_then(|m| m.get("annotations"))
+        .and_then(|a| a.get(REVISION_ANNOTATION))
+        .and_then(|v| v.as_str())
+        .map(String::from);
+
+    let status_unchanged = current.get("status") == Some(&new_status_val);
+    let revision_unchanged = revision_str == existing_revision;
+    if status_unchanged && revision_unchanged {
         return Ok(());
     }
 
     if let Some(obj) = current.as_object_mut() {
         obj.insert("status".to_string(), new_status_val);
+        if let Some(rev) = revision_str {
+            let metadata = obj
+                .entry("metadata".to_string())
+                .or_insert_with(|| serde_json::json!({}));
+            if let Some(meta_obj) = metadata.as_object_mut() {
+                let annotations = meta_obj
+                    .entry("annotations".to_string())
+                    .or_insert_with(|| serde_json::json!({}));
+                if let Some(ann_obj) = annotations.as_object_mut() {
+                    ann_obj.insert(
+                        REVISION_ANNOTATION.to_string(),
+                        serde_json::Value::String(rev),
+                    );
+                }
+            }
+        }
     }
 
     match store.update(&resource_ref, &current) {

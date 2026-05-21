@@ -97,15 +97,34 @@ impl FieldSelector {
         Ok(Self { requirements })
     }
 
-    pub fn matches(&self, object: &serde_json::Value) -> bool {
+    /// Match a stored object against the selector. `gvr` is the resource's
+    /// key prefix (e.g. `"/v1/nodes"`) so we can apply the same per-resource
+    /// selectable-field conversion Kubernetes does — including supplying the
+    /// zero value for absent boolean defaults (e.g. `spec.unschedulable` on
+    /// Node, which the e2e suite filters on before any test runs).
+    pub fn matches(&self, object: &serde_json::Value, gvr: &str) -> bool {
         self.requirements.iter().all(|req| match req {
             FieldRequirement::Equals(field, expected) => {
-                extract_field(object, field).as_deref() == Some(expected.as_str())
+                selectable_field(gvr, object, field).as_deref() == Some(expected.as_str())
             }
             FieldRequirement::NotEquals(field, expected) => {
-                extract_field(object, field).as_deref() != Some(expected.as_str())
+                selectable_field(gvr, object, field).as_deref() != Some(expected.as_str())
             }
         })
+    }
+}
+
+/// Resolve a selectable field for a stored object, applying per-resource
+/// defaults for fields whose Go zero value is meaningful (mirrors
+/// `*ToSelectableFields` in upstream Kubernetes).
+fn selectable_field(gvr: &str, obj: &serde_json::Value, field: &str) -> Option<String> {
+    if let Some(v) = extract_field(obj, field) {
+        return Some(v);
+    }
+    match (gvr, field) {
+        ("/v1/nodes", "spec.unschedulable") => Some("false".into()),
+        ("/v1/pods", "spec.nodeName") => Some(String::new()),
+        _ => None,
     }
 }
 
@@ -114,7 +133,12 @@ fn extract_field(obj: &serde_json::Value, path: &str) -> Option<String> {
     for part in path.split('.') {
         current = current.get(part)?;
     }
-    current.as_str().map(|s| s.to_string())
+    match current {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Bool(b) => Some(b.to_string()),
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    }
 }
 
 impl LabelIndex {

@@ -514,11 +514,6 @@ async fn watch_receives_events() {
 // ── Store: resource version persists across reopens ──────────────────
 
 /// Revision counter must resume from where it left off after reopening.
-///
-/// NOTE: The compaction background task holds an Arc<Database>, which keeps
-/// the redb file lock alive even after the Store is dropped. We work around
-/// this by using two separate databases: write to one, then copy the file
-/// and reopen the copy to prove the revision was persisted.
 #[tokio::test]
 async fn revision_survives_reopen() {
     let dir = TempDir::new().unwrap();
@@ -611,18 +606,35 @@ fn field_selector_parse_invalid() {
 fn field_selector_matches_nested_field() {
     let sel = FieldSelector::parse("metadata.name=nginx").unwrap();
     let obj = serde_json::json!({"metadata": {"name": "nginx"}});
-    assert!(sel.matches(&obj));
+    assert!(sel.matches(&obj, "/v1/pods"));
 
     let obj2 = serde_json::json!({"metadata": {"name": "redis"}});
-    assert!(!sel.matches(&obj2));
+    assert!(!sel.matches(&obj2, "/v1/pods"));
 }
 
 #[test]
 fn field_selector_not_equals() {
     let sel = FieldSelector::parse("metadata.namespace!=kube-system").unwrap();
     let obj = serde_json::json!({"metadata": {"namespace": "default"}});
-    assert!(sel.matches(&obj));
+    assert!(sel.matches(&obj, "/v1/pods"));
 
     let obj2 = serde_json::json!({"metadata": {"namespace": "kube-system"}});
-    assert!(!sel.matches(&obj2));
+    assert!(!sel.matches(&obj2, "/v1/pods"));
+}
+
+#[test]
+fn field_selector_node_unschedulable_defaults_to_false() {
+    let sel = FieldSelector::parse("spec.unschedulable=false").unwrap();
+    let node = serde_json::json!({"metadata": {"name": "n1"}, "spec": {}});
+    assert!(
+        sel.matches(&node, "/v1/nodes"),
+        "absent spec.unschedulable on a Node must match `=false` (k8s default)"
+    );
+
+    let sel_true = FieldSelector::parse("spec.unschedulable=true").unwrap();
+    assert!(!sel_true.matches(&node, "/v1/nodes"));
+
+    let cordoned = serde_json::json!({"metadata": {"name": "n2"}, "spec": {"unschedulable": true}});
+    assert!(!sel.matches(&cordoned, "/v1/nodes"));
+    assert!(sel_true.matches(&cordoned, "/v1/nodes"));
 }

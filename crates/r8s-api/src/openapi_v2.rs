@@ -105,18 +105,67 @@ fn merge_crd_definitions(state: &AppState, doc: &mut Value) {
         if r8s_types::openapi::spec_bytes_for(&rt.gvr.group, &rt.gvr.version).is_some() {
             continue;
         }
-        let Some(schema) = rt.schema.clone() else {
-            continue;
-        };
+        // CRDs without a validation schema still need to appear in the doc —
+        // the `works for CRD without validation schema` conformance test
+        // polls for the definition's mere existence. Match upstream's stub:
+        // an open object that accepts any structure.
+        let schema = rt.schema.clone().unwrap_or_else(|| {
+            serde_json::json!({
+                "type": "object",
+                "x-kubernetes-preserve-unknown-fields": true,
+            })
+        });
         defs.insert(definition_key(&rt), schema);
     }
 }
 
+/// Upstream's OpenAPI v2 definitions key for `Group/Version/Kind` is the
+/// reversed-domain form of the group joined with version and kind by dots —
+/// e.g. `stable.example.com/v6/Foo` becomes `com.example.stable.v6.Foo`.
+/// Conformance polls this exact key (kube-openapi's `ToRESTFriendlyName`).
 fn definition_key(rt: &std::sync::Arc<r8s_types::ResourceType>) -> String {
-    if rt.gvr.group.is_empty() {
-        format!("{}.{}", rt.gvr.version, rt.kind)
+    to_rest_friendly_name(&rt.gvr.group, &rt.gvr.version, &rt.kind)
+}
+
+fn to_rest_friendly_name(group: &str, version: &str, kind: &str) -> String {
+    let head = if group.contains('.') {
+        let mut parts: Vec<&str> = group.split('.').collect();
+        parts.reverse();
+        parts.join(".")
     } else {
-        format!("{}.{}.{}", rt.gvr.group, rt.gvr.version, rt.kind)
+        group.to_string()
+    };
+    let mut name = String::with_capacity(head.len() + version.len() + kind.len() + 2);
+    if !head.is_empty() {
+        name.push_str(&head);
+        name.push('.');
+    }
+    name.push_str(version);
+    name.push('.');
+    name.push_str(kind);
+    name
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dotted_group_is_reversed() {
+        assert_eq!(
+            to_rest_friendly_name("stable.example.com", "v6", "Foo"),
+            "com.example.stable.v6.Foo"
+        );
+    }
+
+    #[test]
+    fn single_segment_group_is_kept_as_is() {
+        assert_eq!(to_rest_friendly_name("apps", "v1", "Deployment"), "apps.v1.Deployment");
+    }
+
+    #[test]
+    fn empty_group_uses_version_kind_only() {
+        assert_eq!(to_rest_friendly_name("", "v1", "Pod"), "v1.Pod");
     }
 }
 

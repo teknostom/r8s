@@ -120,6 +120,28 @@ impl ResourceRegistry {
             ),
             ("", "v1", "nodes", "Node", false, "node", &["no"]),
             ("", "v1", "events", "Event", true, "event", &["ev"]),
+            // Core resources needed for sig-api-machinery conformance:
+            //   - resourcequotas: ResourceQuota specs (4 conformance tests).
+            //   - podtemplates:   API chunking test creates 20 of these; if
+            //     missing it `Failf`s from a goroutine and panics the suite.
+            (
+                "",
+                "v1",
+                "resourcequotas",
+                "ResourceQuota",
+                true,
+                "resourcequota",
+                &["quota"],
+            ),
+            (
+                "",
+                "v1",
+                "podtemplates",
+                "PodTemplate",
+                true,
+                "podtemplate",
+                &[],
+            ),
             (
                 "apps",
                 "v1",

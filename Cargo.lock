@@ -1416,8 +1416,10 @@ dependencies = [
  "r8s-store",
  "r8s-types",
  "rustc-hash",
+ "rustls",
  "serde_json",
  "tokio",
+ "tokio-rustls",
  "tokio-util",
  "tracing",
 ]
@@ -1519,6 +1521,8 @@ dependencies = [
 name = "r8s-types"
 version = "0.1.0"
 dependencies = [
+ "base64",
+ "chrono",
  "k8s-openapi",
  "prost",
  "prost-build",
