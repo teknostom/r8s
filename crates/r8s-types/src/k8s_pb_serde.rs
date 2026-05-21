@@ -12,6 +12,7 @@ use serde_json::{Map, Value, json};
 
 use crate::k8s_pb::apiextensions_v1 as pbapi;
 use crate::k8s_pb::meta_v1 as pbmeta;
+use crate::k8s_pb::runtime as pbruntime;
 
 /// Magic prefix every k8s protobuf body starts with (`k8s\0`).
 const K8S_MAGIC: &[u8] = b"k8s\0";
@@ -30,9 +31,12 @@ pub fn decode_k8s_protobuf_to_json(body: &[u8]) -> Option<Value> {
     let envelope = &body[K8S_MAGIC.len()..];
 
     // `runtime.Unknown` envelope: field 1 = TypeMeta, field 2 = raw resource.
+    // NB: `runtime.TypeMeta` has (apiVersion=1, kind=2) — opposite of the
+    // namesake `meta.v1.TypeMeta` (kind=1, apiVersion=2). Decoding the
+    // envelope with the wrong one silently swaps the fields.
     let type_meta_bytes = read_message_field(envelope, 1)?;
     let raw = read_message_field(envelope, 2)?;
-    let type_meta = pbmeta::TypeMeta::decode(type_meta_bytes).ok()?;
+    let type_meta = pbruntime::TypeMeta::decode(type_meta_bytes).ok()?;
     let api_version = type_meta.api_version.as_deref().unwrap_or("");
     let kind = type_meta.kind.as_deref().unwrap_or("");
 
@@ -340,10 +344,15 @@ fn json_schema_props_to_json(s: &pbapi::JsonSchemaProps) -> Value {
             }
         };
     }
+    // JSONSchemaProps uses `omitempty` semantics for its bool fields — false
+    // is the zero value and is dropped on the wire. Some proto generators
+    // (Go's gogoproto with bare `bool` Go fields) emit explicit `false`
+    // anyway; upstream's OpenAPI converter discards those before serving.
+    // Mirror that or the conformance schema-equality check fails.
     macro_rules! bool_opt {
         ($field:ident, $json:literal) => {
-            if let Some(v) = s.$field {
-                obj.insert($json.into(), json!(v));
+            if let Some(true) = s.$field {
+                obj.insert($json.into(), json!(true));
             }
         };
     }
