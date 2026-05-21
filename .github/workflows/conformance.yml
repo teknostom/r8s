@@ -61,17 +61,16 @@ jobs:
           docker rm "$container_id" > /dev/null
           chmod +x "$RESULTS_DIR/e2e.test"
 
-      - name: Build r8sd (release)
-        run: cargo build --release --bin r8sd
+      - name: Build r8s + r8sd (release)
+        run: cargo build --release --bin r8s --bin r8sd
 
-      - name: Start r8sd
+      - name: Start r8s cluster
         run: |
           set -euo pipefail
-          sudo mkdir -p /var/lib/r8s/clusters/default
-          # Launch r8sd in the background; pin output to a file we can dump on failure.
-          sudo -E nohup ./target/release/r8sd \
-              --data-dir /var/lib/r8s/clusters/default \
-              > "$RESULTS_DIR/r8sd.log" 2>&1 &
+          # Put release binaries on PATH so `r8s up` finds r8sd alongside it.
+          export PATH="$PWD/target/release:$PATH"
+          sudo env PATH="$PATH" r8s create default
+          sudo env PATH="$PATH" r8s up default
           # Wait for the API to start serving. Up to 30s of probing.
           for i in $(seq 1 60); do
             if curl -sk https://127.0.0.1:6443/readyz >/dev/null 2>&1; then
@@ -80,9 +79,9 @@ jobs:
             fi
             sleep 0.5
           done
-          # Verify the kubeconfig actually got written.
           sudo test -f /var/lib/r8s/clusters/default/kubeconfig
           sudo chmod a+r /var/lib/r8s/clusters/default/kubeconfig
+          sudo chmod a+r /var/lib/r8s/clusters/default/certs/ca.crt 2>/dev/null || true
           echo "KUBECONFIG=/var/lib/r8s/clusters/default/kubeconfig" >> "$GITHUB_ENV"
 
       - name: Run conformance suites
@@ -124,7 +123,7 @@ jobs:
         if: failure()
         run: |
           echo "===== r8sd.log ====="
-          sudo cat "$RESULTS_DIR/r8sd.log" 2>/dev/null || true
+          sudo cat /var/lib/r8s/clusters/default/r8sd.log 2>/dev/null || true
 
       - name: Upload results
         if: always()
