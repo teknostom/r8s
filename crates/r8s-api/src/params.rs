@@ -12,6 +12,7 @@ pub struct ListParams {
     pub resource_version: Option<String>,
     pub timeout_seconds: Option<u64>,
     pub send_initial_events: Option<String>,
+    pub allow_watch_bookmarks: Option<String>,
 }
 
 impl ListParams {
@@ -22,6 +23,13 @@ impl ListParams {
     pub fn wants_initial_events(&self) -> bool {
         matches!(
             self.send_initial_events.as_deref(),
+            Some("true") | Some("1")
+        )
+    }
+
+    pub fn allow_watch_bookmarks(&self) -> bool {
+        matches!(
+            self.allow_watch_bookmarks.as_deref(),
             Some("true") | Some("1")
         )
     }

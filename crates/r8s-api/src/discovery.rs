@@ -1,7 +1,9 @@
 use std::sync::{Arc, atomic::AtomicU32};
 
 use axum::{
+    body::Body,
     extract::{Path, State},
+    http::{HeaderMap, header},
     response::Response,
 };
 
@@ -10,6 +12,47 @@ use rustc_hash::FxHashSet;
 use crate::response::object_response;
 use r8s_store::Store;
 use r8s_types::registry::ResourceRegistry;
+
+/// Media type clients send to request the aggregated discovery shape
+/// (`apidiscovery.k8s.io/v2 APIGroupDiscoveryList`). When that media type
+/// appears in the `Accept` header on `/api` or `/apis`, the response switches
+/// from the legacy `APIGroupList`/`APIVersions` shape to the aggregated one
+/// and the response Content-Type echoes the negotiated value back. Real k8s
+/// also serves `v2beta1`; we accept either to be lenient with older clients.
+const AGGREGATED_MEDIA_TYPE: &str = "application/json;g=apidiscovery.k8s.io;v=v2;as=APIGroupDiscoveryList";
+
+fn wants_aggregated_discovery(headers: &HeaderMap) -> Option<&'static str> {
+    headers
+        .get_all(header::ACCEPT)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|s| s.split(','))
+        .find_map(|part| {
+            let part = part.trim();
+            let has = |k| part.contains(k);
+            if has("g=apidiscovery.k8s.io")
+                && has("as=APIGroupDiscoveryList")
+                && (has("v=v2") || has("v=v2beta1"))
+            {
+                Some(if has("v=v2beta1") {
+                    "application/json;g=apidiscovery.k8s.io;v=v2beta1;as=APIGroupDiscoveryList"
+                } else {
+                    AGGREGATED_MEDIA_TYPE
+                })
+            } else {
+                None
+            }
+        })
+}
+
+fn aggregated_response(media_type: &'static str, body: serde_json::Value) -> Response {
+    let bytes = serde_json::to_vec(&body).unwrap_or_default();
+    Response::builder()
+        .status(200)
+        .header(header::CONTENT_TYPE, media_type)
+        .body(Body::from(bytes))
+        .expect("valid response")
+}
 
 pub type AppState = Arc<ApiState>;
 
@@ -41,7 +84,10 @@ pub async fn get_version() -> Response {
     }))
 }
 
-pub async fn get_api_versions() -> Response {
+pub async fn get_api_versions(headers: HeaderMap, State(state): State<AppState>) -> Response {
+    if let Some(media) = wants_aggregated_discovery(&headers) {
+        return aggregated_response(media, aggregated_legacy_group(&state));
+    }
     object_response(&serde_json::json!({
         "kind": "APIVersions",
         "versions": ["v1"],
@@ -51,28 +97,49 @@ pub async fn get_api_versions() -> Response {
     }))
 }
 
-pub async fn get_api_groups(State(state): State<AppState>) -> Response {
+pub async fn get_api_groups(headers: HeaderMap, State(state): State<AppState>) -> Response {
+    if let Some(media) = wants_aggregated_discovery(&headers) {
+        return aggregated_response(media, aggregated_non_legacy_groups(&state));
+    }
     let mut seen = FxHashSet::default();
     let mut groups = Vec::new();
+
+    // A group may register multiple versions (e.g. autoscaling/v1 + /v2).
+    // Collect them all so discovery advertises every served version.
+    let mut versions_by_group: rustc_hash::FxHashMap<String, Vec<String>> = Default::default();
+    for rt in state.registry.iter() {
+        if rt.gvr.group.is_empty() {
+            continue;
+        }
+        versions_by_group
+            .entry(rt.gvr.group.clone())
+            .or_default()
+            .push(rt.gvr.version.clone());
+    }
 
     for rt in state.registry.iter() {
         if rt.gvr.group.is_empty() || !seen.insert(rt.gvr.group.clone()) {
             continue;
         }
-        let gv = format!("{}/{}", rt.gvr.group, rt.gvr.version);
+        let mut versions: Vec<String> =
+            versions_by_group.get(&rt.gvr.group).cloned().unwrap_or_default();
+        versions.sort();
+        versions.dedup();
+        let version_objs: Vec<serde_json::Value> = versions
+            .iter()
+            .map(|v| {
+                let gv = format!("{}/{}", rt.gvr.group, v);
+                serde_json::json!({"groupVersion": gv, "version": v})
+            })
+            .collect();
+        let preferred = versions.last().cloned().unwrap_or_else(|| rt.gvr.version.clone());
+        let preferred_gv = format!("{}/{preferred}", rt.gvr.group);
         groups.push(serde_json::json!({
             "name": rt.gvr.group,
-            "versions": [{"groupVersion": gv, "version": rt.gvr.version}],
-            "preferredVersion": {"groupVersion": gv, "version": rt.gvr.version},
+            "versions": version_objs,
+            "preferredVersion": {"groupVersion": preferred_gv, "version": preferred},
         }));
     }
-
-    // Always include authorization.k8s.io for RBAC checks (k9s, etc.)
-    groups.push(serde_json::json!({
-        "name": "authorization.k8s.io",
-        "versions": [{"groupVersion": "authorization.k8s.io/v1", "version": "v1"}],
-        "preferredVersion": {"groupVersion": "authorization.k8s.io/v1", "version": "v1"},
-    }));
 
     object_response(&serde_json::json!({
         "kind": "APIGroupList",
@@ -92,32 +159,89 @@ pub async fn get_group_version_resources(
     api_resource_list(&state, &group, &version)
 }
 
-fn api_resource_list(state: &ApiState, group: &str, version: &str) -> Response {
-    // Handle authorization.k8s.io specially — not stored in registry
-    if group == "authorization.k8s.io" && version == "v1" {
-        return object_response(&serde_json::json!({
-            "kind": "APIResourceList",
-            "apiVersion": "v1",
-            "groupVersion": "authorization.k8s.io/v1",
-            "resources": [
-                {
-                    "name": "selfsubjectaccessreviews",
-                    "singularName": "",
-                    "namespaced": false,
-                    "kind": "SelfSubjectAccessReview",
-                    "verbs": ["create"],
-                },
-                {
-                    "name": "selfsubjectrulesreviews",
-                    "singularName": "",
-                    "namespaced": false,
-                    "kind": "SelfSubjectRulesReview",
-                    "verbs": ["create"],
-                },
-            ],
-        }));
-    }
+/// Aggregated-discovery body for `/api` (legacy "" group only).
+fn aggregated_legacy_group(state: &ApiState) -> serde_json::Value {
+    let items: Vec<serde_json::Value> = aggregated_items_for_group(state, "");
+    serde_json::json!({
+        "apiVersion": "apidiscovery.k8s.io/v2",
+        "kind": "APIGroupDiscoveryList",
+        "items": items,
+    })
+}
 
+/// Aggregated-discovery body for `/apis` (every non-empty group).
+fn aggregated_non_legacy_groups(state: &ApiState) -> serde_json::Value {
+    let mut seen = FxHashSet::default();
+    let mut groups: Vec<String> = Vec::new();
+    for rt in state.registry.iter() {
+        if rt.gvr.group.is_empty() {
+            continue;
+        }
+        if seen.insert(rt.gvr.group.clone()) {
+            groups.push(rt.gvr.group.clone());
+        }
+    }
+    groups.sort();
+    let items: Vec<serde_json::Value> = groups
+        .iter()
+        .flat_map(|g| aggregated_items_for_group(state, g))
+        .collect();
+    serde_json::json!({
+        "apiVersion": "apidiscovery.k8s.io/v2",
+        "kind": "APIGroupDiscoveryList",
+        "items": items,
+    })
+}
+
+/// Build the `items` entry for a single group, collapsing all served versions
+/// and listing each resource with the metadata clients need to route to it.
+fn aggregated_items_for_group(state: &ApiState, group: &str) -> Vec<serde_json::Value> {
+    let mut versions_map: rustc_hash::FxHashMap<String, Vec<serde_json::Value>> =
+        Default::default();
+    for rt in state.registry.iter() {
+        if rt.gvr.group != group {
+            continue;
+        }
+        let resource = serde_json::json!({
+            "resource": rt.gvr.resource,
+            "responseKind": {
+                "group": "",
+                "version": "",
+                "kind": rt.kind,
+            },
+            "scope": if rt.namespaced { "Namespaced" } else { "Cluster" },
+            "singularResource": rt.singular,
+            "shortNames": rt.short_names,
+            "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"],
+        });
+        versions_map
+            .entry(rt.gvr.version.clone())
+            .or_default()
+            .push(resource);
+    }
+    let mut versions: Vec<(String, Vec<serde_json::Value>)> = versions_map.into_iter().collect();
+    versions.sort_by(|a, b| a.0.cmp(&b.0));
+    let versions_json: Vec<serde_json::Value> = versions
+        .into_iter()
+        .map(|(v, resources)| {
+            serde_json::json!({
+                "version": v,
+                "resources": resources,
+                "freshness": "Current",
+            })
+        })
+        .collect();
+
+    if versions_json.is_empty() {
+        return Vec::new();
+    }
+    vec![serde_json::json!({
+        "metadata": {"name": group},
+        "versions": versions_json,
+    })]
+}
+
+fn api_resource_list(state: &ApiState, group: &str, version: &str) -> Response {
     let group_version = if group.is_empty() {
         version.to_string()
     } else {

@@ -192,6 +192,20 @@ impl ApiServer {
                 get(get_scale).put(put_scale).patch(patch_scale),
             );
         for rt in self.state.registry.iter() {
+            // Some resources are registered purely so they appear in
+            // discovery; their REST surface is handled by bespoke handlers
+            // installed earlier (e.g. selfsubjectaccessreviews returns a
+            // computed authorization decision, not a stored object). Skip
+            // dynamic CRUD route installation for those to avoid axum's
+            // "Overlapping method route" panic.
+            let is_special_review = matches!(
+                (rt.gvr.group.as_str(), rt.gvr.version.as_str(), rt.gvr.resource.as_str()),
+                ("authorization.k8s.io", "v1", "selfsubjectaccessreviews")
+                    | ("authorization.k8s.io", "v1", "selfsubjectrulesreviews")
+            );
+            if is_special_review {
+                continue;
+            }
             let ctx = RouteContext {
                 resource_type: Arc::clone(&rt),
             };

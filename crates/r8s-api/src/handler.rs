@@ -664,6 +664,7 @@ pub(crate) fn list_impl(
             headers,
             params.resource_version.as_deref(),
             params.wants_initial_events(),
+            params.allow_watch_bookmarks(),
         );
     }
 
@@ -732,6 +733,7 @@ fn watch_impl(
     headers: &HeaderMap,
     resource_version: Option<&str>,
     send_initial_events: bool,
+    allow_watch_bookmarks: bool,
 ) -> Response {
     // Subscribe before listing so we don't miss events between the list and the watch.
     let rx = state.store.watch(&ctx.resource_type.gvr);
@@ -782,26 +784,39 @@ fn watch_impl(
     });
     let initial_stream = tokio_stream::iter(initial);
 
+    // BOOKMARK emission policy:
+    //   - sendInitialEvents=true → MUST emit one BOOKMARK after the initial
+    //     replay carrying `k8s.io/initial-events-end: true` (KEP-3157, used
+    //     by k9s and the WatchList reflector).
+    //   - allowWatchBookmarks=true → MAY emit BOOKMARK at the server's
+    //     discretion; we send one to mark the watch's starting RV so
+    //     reflectors can resync efficiently.
+    //   - Neither → MUST NOT emit BOOKMARK. The apiextensions watch-cache
+    //     primer expects the next event after the initial state to be the
+    //     actual resource event (e.g. DELETE) and treats a BOOKMARK as a
+    //     test failure.
+    let emit_bookmark = send_initial_events || allow_watch_bookmarks;
     let av = api_version(ctx);
-    let mut bookmark_meta = serde_json::json!({"resourceVersion": rv.to_string()});
-    if send_initial_events && let Some(obj) = bookmark_meta.as_object_mut() {
-        // KEP-3157: signals end of the initial replay so clients (k9s, the
-        // WatchList reflector) know they have a consistent snapshot and can
-        // start rendering.
-        obj.insert(
-            "annotations".to_string(),
-            serde_json::json!({"k8s.io/initial-events-end": "true"}),
-        );
-    }
-    let bookmark_obj = serde_json::json!({
-        "apiVersion": av,
-        "kind": ctx.resource_type.kind,
-        "metadata": bookmark_meta,
-    });
-    let bookmark_formatted = format_object(&bookmark_obj);
-    let bookmark = tokio_stream::iter(std::iter::once(Ok::<_, std::io::Error>(
-        response::watch_event_line("BOOKMARK", &bookmark_formatted),
-    )));
+    let bookmark = if emit_bookmark {
+        let mut bookmark_meta = serde_json::json!({"resourceVersion": rv.to_string()});
+        if send_initial_events && let Some(obj) = bookmark_meta.as_object_mut() {
+            obj.insert(
+                "annotations".to_string(),
+                serde_json::json!({"k8s.io/initial-events-end": "true"}),
+            );
+        }
+        let bookmark_obj = serde_json::json!({
+            "apiVersion": av,
+            "kind": ctx.resource_type.kind,
+            "metadata": bookmark_meta,
+        });
+        let bookmark_formatted = format_object(&bookmark_obj);
+        tokio_stream::iter(Some(Ok::<_, std::io::Error>(
+            response::watch_event_line("BOOKMARK", &bookmark_formatted),
+        )))
+    } else {
+        tokio_stream::iter(None)
+    };
 
     let ns_filter: Option<String> = namespace.map(|s| s.to_string());
     // On broadcast lag, terminate so the client reconnects (standard K8s behavior).
