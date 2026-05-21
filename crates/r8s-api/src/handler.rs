@@ -404,6 +404,20 @@ pub(crate) fn create_impl(
         return resp;
     }
 
+    // ResourceQuota admission: reject creates that would push usage past any
+    // hard limit in the namespace. Cluster-scoped resources skip the check
+    // entirely (quotas only constrain namespaced state).
+    if let Some(ns) = namespace
+        && let Err(msg) = r8s_controllers::quota::check_admission(
+            &state.store,
+            &ctx.resource_type.gvr,
+            ns,
+            &body,
+        )
+    {
+        return response::status_error(StatusCode::FORBIDDEN, "Forbidden", &msg);
+    }
+
     let resource_ref = ResourceRef {
         gvr: &ctx.resource_type.gvr,
         namespace,
@@ -477,6 +491,113 @@ pub async fn update_ns(
     update_impl(&state, &ctx, Some(&ns), &name, body)
 }
 
+/// DELETE on a collection endpoint — k8s' `deletecollection` verb. Honors
+/// the same label/field selectors as LIST (the test uses LabelSelector to
+/// bound which resources to nuke) plus the propagation policy from the
+/// query/body. Returns a Status object on success per upstream.
+pub(crate) fn delete_collection_impl(
+    state: &AppState,
+    ctx: &RouteContext,
+    namespace: Option<&str>,
+    params: &ListParams,
+    policy: PropagationPolicy,
+) -> Response {
+    let label_sel = match params
+        .label_selector
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .map(LabelSelector::parse)
+        .transpose()
+    {
+        Ok(s) => s,
+        Err(e) => {
+            return response::status_error(StatusCode::BAD_REQUEST, "Invalid", &e.to_string());
+        }
+    };
+    let field_sel = match params
+        .field_selector
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .map(FieldSelector::parse)
+        .transpose()
+    {
+        Ok(s) => s,
+        Err(e) => {
+            return response::status_error(StatusCode::BAD_REQUEST, "Invalid", &e.to_string());
+        }
+    };
+    let list = match state.store.list(
+        &ctx.resource_type.gvr,
+        namespace,
+        label_sel.as_ref(),
+        field_sel.as_ref(),
+        None,
+        None,
+    ) {
+        Ok(r) => r,
+        Err(err) => return response::anyhow_error_response(err),
+    };
+    for item in list.items {
+        let name = item
+            .get("metadata")
+            .and_then(|m| m.get("name"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if name.is_empty() {
+            continue;
+        }
+        let ns = item
+            .get("metadata")
+            .and_then(|m| m.get("namespace"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        // Use the item's own namespace if listing across all namespaces;
+        // otherwise honour the URL-scoped namespace.
+        let effective_ns = namespace.or(ns.as_deref());
+        delete_impl(state, ctx, effective_ns, &name, policy);
+    }
+    response::object_response(&serde_json::json!({
+        "kind": "Status",
+        "apiVersion": "v1",
+        "status": "Success",
+        "details": {"kind": ctx.resource_type.gvr.resource},
+    }))
+}
+
+pub async fn delete_collection_ns(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<RouteContext>,
+    Path(ns): Path<String>,
+    Query(params): Query<ListParams>,
+    axum::extract::RawQuery(query): axum::extract::RawQuery,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let content_type = headers
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let policy = extract_propagation_policy(query.as_deref(), &body, content_type);
+    delete_collection_impl(&state, &ctx, Some(&ns), &params, policy)
+}
+
+pub async fn delete_collection_cluster(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<RouteContext>,
+    Query(params): Query<ListParams>,
+    axum::extract::RawQuery(query): axum::extract::RawQuery,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let content_type = headers
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let policy = extract_propagation_policy(query.as_deref(), &body, content_type);
+    delete_collection_impl(&state, &ctx, None, &params, policy)
+}
+
 pub async fn update_cluster(
     State(state): State<AppState>,
     Extension(ctx): Extension<RouteContext>,
@@ -490,17 +611,287 @@ pub async fn update_cluster(
     };
     update_impl(&state, &ctx, None, &name, body)
 }
-pub(crate) fn delete_impl(
+
+// ─── /status subresource ────────────────────────────────────────────────────
+//
+// Upstream lets clients GET/PUT/PATCH `{resource}/{name}/status` separately
+// from the main object. PUT replaces only the `status` field of the stored
+// object (everything else in the body is ignored); PATCH applies the patch
+// directly. GET returns the whole object (matching upstream — `/status` is a
+// view, not a separate document). We don't enforce the spec/status split with
+// validation or RBAC; just route the subresource so clients can use it.
+
+fn status_put_impl(
     state: &AppState,
     ctx: &RouteContext,
     namespace: Option<&str>,
     name: &str,
+    body: serde_json::Value,
 ) -> Response {
     let rref = ResourceRef {
         gvr: &ctx.resource_type.gvr,
         namespace,
         name,
     };
+    let mut current = match state.store.get(&rref) {
+        Ok(Some(v)) => v,
+        Ok(None) => {
+            return response::status_error(
+                StatusCode::NOT_FOUND,
+                "NotFound",
+                &format!("{} '{}' not found", ctx.resource_type.kind, name),
+            );
+        }
+        Err(err) => return response::anyhow_error_response(err),
+    };
+    let new_status = body.get("status").cloned().unwrap_or(serde_json::Value::Null);
+    if let Some(obj) = current.as_object_mut() {
+        if matches!(new_status, serde_json::Value::Null) {
+            obj.remove("status");
+        } else {
+            obj.insert("status".to_string(), new_status);
+        }
+    }
+    match state.store.update(&rref, &current) {
+        Ok(obj) => response::object_response(&obj),
+        Err(err) => response::anyhow_error_response(err),
+    }
+}
+
+pub async fn get_status_ns(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<RouteContext>,
+    Path((ns, name)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    get_impl(&state, &ctx, Some(&ns), &name, &headers)
+}
+
+pub async fn get_status_cluster(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<RouteContext>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    get_impl(&state, &ctx, None, &name, &headers)
+}
+
+pub async fn put_status_ns(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<RouteContext>,
+    Path((ns, name)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let body = match require_json(&headers, &body) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    status_put_impl(&state, &ctx, Some(&ns), &name, body)
+}
+
+pub async fn put_status_cluster(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<RouteContext>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let body = match require_json(&headers, &body) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    status_put_impl(&state, &ctx, None, &name, body)
+}
+
+pub async fn patch_status_ns(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<RouteContext>,
+    Path((ns, name)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    patch_impl(&state, &ctx, Some(&ns), &name, &headers, body)
+}
+
+pub async fn patch_status_cluster(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<RouteContext>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    patch_impl(&state, &ctx, None, &name, &headers, body)
+}
+/// How an object's dependents are handled when the object is deleted.
+/// Sourced from `DeleteOptions.PropagationPolicy` (or the legacy
+/// `?propagationPolicy=` query param). Background is the default upstream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PropagationPolicy {
+    /// Default: return as soon as the object is gone; GC controller cleans
+    /// dependents asynchronously via owner-reference cascades.
+    Background,
+    /// Strip the object's UID from every dependent's `ownerReferences` so
+    /// the GC controller doesn't see them as orphans. The dependents stay.
+    Orphan,
+    /// Set a `foregroundDeletion` finalizer on the object and return; the
+    /// object stays around until the GC controller removes the finalizer
+    /// after all dependents are gone. (Not yet implemented in r8s — treated
+    /// as Background.)
+    Foreground,
+}
+
+impl PropagationPolicy {
+    fn parse(s: &str) -> Option<Self> {
+        match s {
+            "Background" => Some(Self::Background),
+            "Orphan" => Some(Self::Orphan),
+            "Foreground" => Some(Self::Foreground),
+            _ => None,
+        }
+    }
+}
+
+pub(crate) fn extract_propagation_policy(
+    query: Option<&str>,
+    body: &Bytes,
+    content_type: &str,
+) -> PropagationPolicy {
+    // 1. Explicit query parameter wins — that's how kubectl and client-go's
+    //    DeleteOptions encoder primarily ship the policy.
+    if let Some(q) = query {
+        for kv in q.split('&') {
+            if let Some(v) = kv.strip_prefix("propagationPolicy=")
+                && let Some(p) = PropagationPolicy::parse(v)
+            {
+                return p;
+            }
+        }
+    }
+    // 2. JSON body (DELETE may carry a DeleteOptions object).
+    if !body.is_empty() && !content_type.contains("protobuf")
+        && let Ok(v) = serde_json::from_slice::<serde_json::Value>(body)
+    {
+        if let Some(p) = v
+            .get("propagationPolicy")
+            .and_then(|v| v.as_str())
+            .and_then(PropagationPolicy::parse)
+        {
+            return p;
+        }
+        // 3. Legacy `orphanDependents: bool`.
+        if let Some(b) = v.get("orphanDependents").and_then(|v| v.as_bool()) {
+            return if b {
+                PropagationPolicy::Orphan
+            } else {
+                PropagationPolicy::Background
+            };
+        }
+    }
+    PropagationPolicy::Background
+}
+
+/// Walk every registered GVR and remove `uid` from any dependent's
+/// `metadata.ownerReferences`. Called before the actual delete when
+/// propagationPolicy=Orphan so the GC controller's cascade no longer sees
+/// the children as belonging to a deleted owner.
+fn orphan_dependents(state: &AppState, uid: &str) {
+    if uid.is_empty() {
+        return;
+    }
+    for rt in state.registry.iter() {
+        let items = match state
+            .store
+            .list(&rt.gvr, None, None, None, None, None)
+        {
+            Ok(r) => r.items,
+            Err(_) => continue,
+        };
+        for mut item in items {
+            let Some(refs) = item
+                .get("metadata")
+                .and_then(|m| m.get("ownerReferences"))
+                .and_then(|v| v.as_array())
+                .cloned()
+            else {
+                continue;
+            };
+            let new_refs: Vec<serde_json::Value> = refs
+                .into_iter()
+                .filter(|r| r.get("uid").and_then(|v| v.as_str()) != Some(uid))
+                .collect();
+            // Nothing to strip on this object.
+            if new_refs.len()
+                == item
+                    .get("metadata")
+                    .and_then(|m| m.get("ownerReferences"))
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.len())
+                    .unwrap_or(0)
+            {
+                continue;
+            }
+            let name = item
+                .get("metadata")
+                .and_then(|m| m.get("name"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let ns = item
+                .get("metadata")
+                .and_then(|m| m.get("namespace"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            if let Some(meta) = item.get_mut("metadata").and_then(|v| v.as_object_mut()) {
+                if new_refs.is_empty() {
+                    meta.remove("ownerReferences");
+                } else {
+                    meta.insert("ownerReferences".to_string(), serde_json::Value::Array(new_refs));
+                }
+            }
+            let rref = ResourceRef {
+                gvr: &rt.gvr,
+                namespace: ns.as_deref(),
+                name: &name,
+            };
+            let _ = state.store.update(&rref, &item);
+        }
+    }
+}
+
+pub(crate) fn delete_impl(
+    state: &AppState,
+    ctx: &RouteContext,
+    namespace: Option<&str>,
+    name: &str,
+    policy: PropagationPolicy,
+) -> Response {
+    let rref = ResourceRef {
+        gvr: &ctx.resource_type.gvr,
+        namespace,
+        name,
+    };
+
+    if matches!(policy, PropagationPolicy::Orphan) {
+        // Look up the object's UID before deleting so we know what
+        // ownerRef to strip from dependents.
+        let uid = state
+            .store
+            .get(&rref)
+            .ok()
+            .flatten()
+            .and_then(|v| {
+                v.get("metadata")
+                    .and_then(|m| m.get("uid"))
+                    .and_then(|u| u.as_str())
+                    .map(String::from)
+            })
+            .unwrap_or_default();
+        if !uid.is_empty() {
+            orphan_dependents(state, &uid);
+        }
+    }
+
     match state.store.delete(&rref) {
         Ok(Some(obj)) => response::object_response(&obj),
         Ok(None) => response::status_error(
@@ -516,16 +907,32 @@ pub async fn delete_ns(
     State(state): State<AppState>,
     Extension(ctx): Extension<RouteContext>,
     Path((ns, name)): Path<(String, String)>,
+    axum::extract::RawQuery(query): axum::extract::RawQuery,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> Response {
-    delete_impl(&state, &ctx, Some(&ns), &name)
+    let content_type = headers
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let policy = extract_propagation_policy(query.as_deref(), &body, content_type);
+    delete_impl(&state, &ctx, Some(&ns), &name, policy)
 }
 
 pub async fn delete_cluster(
     State(state): State<AppState>,
     Extension(ctx): Extension<RouteContext>,
     Path(name): Path<String>,
+    axum::extract::RawQuery(query): axum::extract::RawQuery,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> Response {
-    delete_impl(&state, &ctx, None, &name)
+    let content_type = headers
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let policy = extract_propagation_policy(query.as_deref(), &body, content_type);
+    delete_impl(&state, &ctx, None, &name, policy)
 }
 
 pub(crate) fn patch_impl(
@@ -561,6 +968,19 @@ pub(crate) fn patch_impl(
             );
         }
     };
+    // Patches in k8s are blind by default — only when the client explicitly
+    // included a `metadata.resourceVersion` in the patch body should the
+    // server enforce optimistic concurrency. The store does this check based
+    // on the incoming object's metadata.resourceVersion, so unless the patch
+    // bumped it (rare), we strip it before update to avoid spurious 409s
+    // when a controller (e.g. quota status) races the client.
+    let patch_carries_rv = match &patch {
+        serde_json::Value::Object(obj) => obj
+            .get("metadata")
+            .and_then(|m| m.get("resourceVersion"))
+            .is_some(),
+        _ => false,
+    };
     match state.store.get(&rref) {
         Ok(Some(mut current)) => {
             if is_json_patch {
@@ -573,6 +993,11 @@ pub(crate) fn patch_impl(
                 }
             } else {
                 json_merge_patch(&mut current, &patch);
+            }
+            if !patch_carries_rv && let Some(meta) =
+                current.get_mut("metadata").and_then(|v| v.as_object_mut())
+            {
+                meta.remove("resourceVersion");
             }
             if let Some(resp) = validate_cr(ctx, &current) {
                 return resp;
@@ -665,6 +1090,8 @@ pub(crate) fn list_impl(
             params.resource_version.as_deref(),
             params.wants_initial_events(),
             params.allow_watch_bookmarks(),
+            params.label_selector.as_deref(),
+            params.field_selector.as_deref(),
         );
     }
 
@@ -726,6 +1153,39 @@ pub(crate) fn list_impl(
     }
 }
 
+/// Apply the namespace path component plus the optional label/field selectors
+/// from the watch query to a candidate event object. Returns true if the
+/// client should see this event.
+fn event_matches(
+    obj: &serde_json::Value,
+    namespace: Option<&str>,
+    label_sel: Option<&LabelSelector>,
+    field_sel: Option<&FieldSelector>,
+    gvr_key: &str,
+) -> bool {
+    if let Some(ns) = namespace {
+        let obj_ns = obj
+            .get("metadata")
+            .and_then(|m| m.get("namespace"))
+            .and_then(|v| v.as_str());
+        if obj_ns != Some(ns) {
+            return false;
+        }
+    }
+    if let Some(ls) = label_sel
+        && !ls.matches(obj)
+    {
+        return false;
+    }
+    if let Some(fs) = field_sel
+        && !fs.matches(obj, gvr_key)
+    {
+        return false;
+    }
+    true
+}
+
+#[allow(clippy::too_many_arguments)]
 fn watch_impl(
     state: &AppState,
     ctx: &RouteContext,
@@ -734,30 +1194,85 @@ fn watch_impl(
     resource_version: Option<&str>,
     send_initial_events: bool,
     allow_watch_bookmarks: bool,
+    label_selector: Option<&str>,
+    field_selector: Option<&str>,
 ) -> Response {
-    // Subscribe before listing so we don't miss events between the list and the watch.
-    let rx = state.store.watch(&ctx.resource_type.gvr);
-
-    // When `sendInitialEvents=true` (k9s and the WatchList protocol), the
-    // client expects the current state streamed as ADDED events followed by
-    // a sentinel BOOKMARK before live events resume — even if a resource
-    // version was supplied. Otherwise, a client that has already done a list
-    // (or passed an explicit rv) does NOT want the initial state replayed
-    // (that's what gives `kubectl get -w` duplicate rows).
+    // Parse selectors upfront so a malformed query string returns 400 instead
+    // of silently degrading to an unfiltered watch.
+    let label_sel = match label_selector
+        .filter(|s| !s.is_empty())
+        .map(LabelSelector::parse)
+        .transpose()
+    {
+        Ok(s) => s.map(std::sync::Arc::new),
+        Err(e) => {
+            return response::status_error(StatusCode::BAD_REQUEST, "Invalid", &e.to_string());
+        }
+    };
+    let field_sel = match field_selector
+        .filter(|s| !s.is_empty())
+        .map(FieldSelector::parse)
+        .transpose()
+    {
+        Ok(s) => s.map(std::sync::Arc::new),
+        Err(e) => {
+            return response::status_error(StatusCode::BAD_REQUEST, "Invalid", &e.to_string());
+        }
+    };
+    let gvr_key = ctx.resource_type.gvr.key_prefix();
+    // Three watch modes, depending on what the client asked for:
+    //
+    //   1. `sendInitialEvents=true` or no resourceVersion / rv=0 (the "fresh
+    //      reflector" case): list the current state, emit each as ADDED, then
+    //      tail the live broadcast. KEP-3157 BOOKMARK is emitted between the
+    //      replay and the live tail when sendInitialEvents=true.
+    //
+    //   2. resourceVersion=N > 0: replay buffered events with rv > N from the
+    //      WatchHub's history (so an apiextensions test that creates+deletes
+    //      then watches at the created rv sees the DELETE), then live tail.
+    //      If N is older than the oldest buffered event we return 410 Gone so
+    //      the client falls back to list-then-watch.
+    //
+    //   3. (Fallthrough) — the watch is just a live tail, no replay.
     let replay_initial =
         send_initial_events || matches!(resource_version, None | Some("") | Some("0"));
-
-    let (items, rv) = if replay_initial {
-        state
-            .store
-            .list(&ctx.resource_type.gvr, namespace, None, None, None, None)
-            .map(|r| (r.items, r.resource_version))
-            .unwrap_or_default()
+    let since_rv = if replay_initial {
+        0
     } else {
-        let parsed = resource_version
+        resource_version
             .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(0);
-        (Vec::new(), parsed)
+            .unwrap_or(0)
+    };
+
+    let (items, rv, history, rx) = if replay_initial {
+        let rx = state.store.watch(&ctx.resource_type.gvr);
+        let (items, rv) = state
+            .store
+            .list(
+                &ctx.resource_type.gvr,
+                namespace,
+                label_sel.as_deref(),
+                field_sel.as_deref(),
+                None,
+                None,
+            )
+            .map(|r| (r.items, r.resource_version))
+            .unwrap_or_default();
+        (items, rv, Vec::new(), rx)
+    } else {
+        match state.store.watch_from(&ctx.resource_type.gvr, since_rv) {
+            Ok((history, rx)) => (Vec::new(), since_rv, history, rx),
+            Err(too_old) => {
+                return response::status_error(
+                    StatusCode::GONE,
+                    "Expired",
+                    &format!(
+                        "too old resource version: {} ({})",
+                        too_old.requested, too_old.oldest_available
+                    ),
+                );
+            }
+        }
     };
 
     let as_table = wants_table(headers);
@@ -783,6 +1298,33 @@ fn watch_impl(
         Ok::<_, std::io::Error>(response::watch_event_line("ADDED", &format_initial(&obj)))
     });
     let initial_stream = tokio_stream::iter(initial);
+
+    let format_history = format_object.clone();
+    let history_ns_filter: Option<String> = namespace.map(|s| s.to_string());
+    let history_label = label_sel.clone();
+    let history_field = field_sel.clone();
+    let history_gvr = gvr_key.clone();
+    let history_iter = history.into_iter().filter_map(move |event| {
+        if !event_matches(
+            &event.object,
+            history_ns_filter.as_deref(),
+            history_label.as_deref(),
+            history_field.as_deref(),
+            &history_gvr,
+        ) {
+            return None;
+        }
+        let type_str = match event.event_type {
+            WatchEventType::Added => "ADDED",
+            WatchEventType::Modified => "MODIFIED",
+            WatchEventType::Deleted => "DELETED",
+        };
+        let payload = format_history(&event.object);
+        Some(Ok::<_, std::io::Error>(response::watch_event_line(
+            type_str, &payload,
+        )))
+    });
+    let history_stream = tokio_stream::iter(history_iter);
 
     // BOOKMARK emission policy:
     //   - sendInitialEvents=true → MUST emit one BOOKMARK after the initial
@@ -819,19 +1361,21 @@ fn watch_impl(
     };
 
     let ns_filter: Option<String> = namespace.map(|s| s.to_string());
+    let live_label = label_sel.clone();
+    let live_field = field_sel.clone();
+    let live_gvr = gvr_key.clone();
     // On broadcast lag, terminate so the client reconnects (standard K8s behavior).
     let live_stream = BroadcastStream::new(rx)
         .take_while(|result| result.is_ok())
         .filter_map(move |result| {
             let event = result.ok()?;
-            if let Some(ref ns) = ns_filter
-                && event
-                    .object
-                    .get("metadata")
-                    .and_then(|m| m.get("namespace"))
-                    .and_then(|v| v.as_str())
-                    != Some(ns.as_str())
-            {
+            if !event_matches(
+                &event.object,
+                ns_filter.as_deref(),
+                live_label.as_deref(),
+                live_field.as_deref(),
+                &live_gvr,
+            ) {
                 return None;
             }
             let type_str = match event.event_type {
@@ -845,7 +1389,10 @@ fn watch_impl(
             )))
         });
 
-    let stream = initial_stream.chain(bookmark).chain(live_stream);
+    let stream = initial_stream
+        .chain(history_stream)
+        .chain(bookmark)
+        .chain(live_stream);
 
     Response::builder()
         .status(200)

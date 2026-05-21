@@ -412,6 +412,27 @@ impl ResourceRegistry {
                 "csinode",
                 &[],
             ),
+            // Used by ResourceQuota (counts are reported) — accepted and
+            // stored, but no controller behaviour yet (no PVC binding, no
+            // RC reconciliation). Sufficient for conformance count tests.
+            (
+                "",
+                "v1",
+                "persistentvolumeclaims",
+                "PersistentVolumeClaim",
+                true,
+                "persistentvolumeclaim",
+                &["pvc"],
+            ),
+            (
+                "",
+                "v1",
+                "replicationcontrollers",
+                "ReplicationController",
+                true,
+                "replicationcontroller",
+                &["rc"],
+            ),
         ];
 
         for &(group, version, resource, kind, namespaced, singular, short_names) in types {

@@ -19,10 +19,13 @@ use crate::{
         get_group_version_resources, get_single_api_group, get_version,
     },
     handler::{
-        RouteContext, create_cluster, create_impl, create_ns, delete_cluster, delete_impl,
-        delete_ns, get_cluster, get_impl, get_ns, list_all_ns, list_cluster, list_impl, list_ns,
-        patch_cluster, patch_impl, patch_ns, pod_logs_ns, require_json, update_cluster,
-        update_impl, update_ns,
+        RouteContext, create_cluster, create_impl, create_ns, delete_cluster,
+        delete_collection_cluster, delete_collection_ns, delete_impl, delete_ns,
+        extract_propagation_policy, get_cluster, get_impl, get_ns, get_status_cluster,
+        get_status_ns, list_all_ns, list_cluster, list_impl, list_ns, patch_cluster,
+        patch_impl, patch_ns, patch_status_cluster, patch_status_ns, pod_logs_ns,
+        put_status_cluster, put_status_ns, require_json, update_cluster, update_impl,
+        update_ns,
     },
     openapi_v2::get_openapi_v2,
     openapi_v3::{get_openapi_v3_core, get_openapi_v3_discovery, get_openapi_v3_group},
@@ -95,6 +98,7 @@ async fn dynamic_dispatch(
 ) -> Response {
     let method = req.method().clone();
     let path = req.uri().path().to_string();
+    let raw_query = req.uri().query().map(|s| s.to_string());
 
     let api_path = match parse_api_path(&path) {
         Some(p) => p,
@@ -142,7 +146,12 @@ async fn dynamic_dispatch(
             patch_impl(&state, &ctx, api_path.namespace.as_deref(), name, &headers, body)
         }
         (Method::DELETE, Some(ref name)) => {
-            delete_impl(&state, &ctx, api_path.namespace.as_deref(), name)
+            let content_type = headers
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            let policy = extract_propagation_policy(raw_query.as_deref(), &body, content_type);
+            delete_impl(&state, &ctx, api_path.namespace.as_deref(), name, policy)
         }
         _ => not_found(),
     }
@@ -225,11 +234,15 @@ impl ApiServer {
             if rt.namespaced {
                 let collection = format!("{base}/namespaces/{{ns}}/{}", rt.gvr.resource);
                 let item = format!("{base}/namespaces/{{ns}}/{}/{{name}}", rt.gvr.resource);
+                let status = format!("{base}/namespaces/{{ns}}/{}/{{name}}/status", rt.gvr.resource);
                 let all_ns = format!("{base}/{}", rt.gvr.resource);
                 router = router
                     .route(
                         &collection,
-                        get(list_ns).post(create_ns).layer(Extension(ctx.clone())),
+                        get(list_ns)
+                            .post(create_ns)
+                            .delete(delete_collection_ns)
+                            .layer(Extension(ctx.clone())),
                     )
                     .route(
                         &item,
@@ -237,6 +250,13 @@ impl ApiServer {
                             .put(update_ns)
                             .patch(patch_ns)
                             .delete(delete_ns)
+                            .layer(Extension(ctx.clone())),
+                    )
+                    .route(
+                        &status,
+                        get(get_status_ns)
+                            .put(put_status_ns)
+                            .patch(patch_status_ns)
                             .layer(Extension(ctx.clone())),
                     )
                     .route(&all_ns, get(list_all_ns).layer(Extension(ctx)));
@@ -248,11 +268,13 @@ impl ApiServer {
             } else {
                 let collection = format!("{base}/{}", rt.gvr.resource);
                 let item = format!("{base}/{}/{{name}}", rt.gvr.resource);
+                let status = format!("{base}/{}/{{name}}/status", rt.gvr.resource);
                 router = router
                     .route(
                         &collection,
                         get(list_cluster)
                             .post(create_cluster)
+                            .delete(delete_collection_cluster)
                             .layer(Extension(ctx.clone())),
                     )
                     .route(
@@ -261,6 +283,13 @@ impl ApiServer {
                             .put(update_cluster)
                             .patch(patch_cluster)
                             .delete(delete_cluster)
+                            .layer(Extension(ctx.clone())),
+                    )
+                    .route(
+                        &status,
+                        get(get_status_cluster)
+                            .put(put_status_cluster)
+                            .patch(patch_status_cluster)
                             .layer(Extension(ctx)),
                     );
             }

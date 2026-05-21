@@ -30,6 +30,9 @@ jobs:
       SUITES: |
         crd-publish-openapi|\[sig-api-machinery\] CustomResourcePublishOpenAPI.*\[Conformance\]|9|0
         discovery|\[sig-api-machinery\] Discovery .*\[Conformance\]|2|0
+        aggregated-discovery|\[sig-api-machinery\] AggregatedDiscovery.*\[Conformance\]|4|0
+        gc-deployment|\[sig-api-machinery\] Garbage collector .* (RS created by deployment|deployment when deleteOptions.PropagationPolicy is Orphan).*\[Conformance\]|2|0
+        resourcequota|\[sig-api-machinery\] ResourceQuota .*\[Conformance\]|12|0
 
     steps:
       - uses: actions/checkout@v4

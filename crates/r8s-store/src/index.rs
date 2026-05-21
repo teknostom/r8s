@@ -19,6 +19,11 @@ pub enum Requirement {
     NotEquals(String, String),
     Exists(String),
     NotExists(String),
+    /// `key in (v1, v2, ...)` — label value must equal one of the listed values.
+    In(String, Vec<String>),
+    /// `key notin (v1, v2, ...)` — label value must NOT equal any of the listed values.
+    /// Note: an absent label vacuously satisfies `notin`, matching k8s semantics.
+    NotIn(String, Vec<String>),
 }
 
 pub enum FieldRequirement {
@@ -36,43 +41,132 @@ impl LabelSelector {
             .get("metadata")
             .and_then(|m| m.get("labels"))
             .and_then(|l| l.as_object());
+        let lookup = |key: &str| {
+            labels
+                .and_then(|l| l.get(key))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        };
         self.requirements.iter().all(|req| match req {
-            Requirement::Equals(key, value) => {
-                labels.and_then(|l| l.get(key)).and_then(|v| v.as_str()) == Some(value.as_str())
-            }
-            Requirement::NotEquals(key, value) => {
-                labels.and_then(|l| l.get(key)).and_then(|v| v.as_str()) != Some(value.as_str())
-            }
+            Requirement::Equals(key, value) => lookup(key).as_deref() == Some(value.as_str()),
+            Requirement::NotEquals(key, value) => lookup(key).as_deref() != Some(value.as_str()),
             Requirement::Exists(key) => labels.is_some_and(|l| l.contains_key(key)),
             Requirement::NotExists(key) => !labels.is_some_and(|l| l.contains_key(key)),
+            Requirement::In(key, values) => lookup(key).is_some_and(|v| values.iter().any(|x| x == &v)),
+            Requirement::NotIn(key, values) => {
+                lookup(key).is_none_or(|v| !values.iter().any(|x| x == &v))
+            }
         })
     }
 
+    /// Parse a Kubernetes label selector. Supports the full set of operators
+    /// upstream's `k8s.io/apimachinery/pkg/labels` accepts:
+    ///
+    ///   `key=value`         equality
+    ///   `key!=value`        inequality
+    ///   `key in (v1,v2)`    membership
+    ///   `key notin (v1,v2)` non-membership
+    ///   `key`               exists
+    ///   `!key`              not-exists
+    ///
+    /// Top-level requirements are comma-separated, but commas inside the
+    /// `in`/`notin` value list are not separators — the splitter respects
+    /// parenthesis nesting accordingly.
     pub fn parse(s: &str) -> anyhow::Result<Self> {
-        if s.is_empty() {
+        if s.trim().is_empty() {
             return Ok(Self {
                 requirements: vec![],
             });
         }
 
-        Ok(Self {
-            requirements: s
-                .split(',')
-                .map(|part| {
-                    let part = part.trim();
-                    if let Some((key, value)) = part.split_once("!=") {
-                        Requirement::NotEquals(key.into(), value.into())
-                    } else if let Some((key, value)) = part.split_once('=') {
-                        Requirement::Equals(key.into(), value.into())
-                    } else if let Some(key) = part.strip_prefix('!') {
-                        Requirement::NotExists(key.into())
-                    } else {
-                        Requirement::Exists(part.into())
-                    }
-                })
-                .collect(),
-        })
+        let parts = split_top_level_commas(s);
+        let mut requirements = Vec::with_capacity(parts.len());
+        for raw in parts {
+            let part = raw.trim();
+            if part.is_empty() {
+                continue;
+            }
+            requirements.push(parse_requirement(part)?);
+        }
+        Ok(Self { requirements })
     }
+}
+
+fn split_top_level_commas(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut buf = String::new();
+    let mut depth = 0i32;
+    for ch in s.chars() {
+        match ch {
+            '(' => {
+                depth += 1;
+                buf.push(ch);
+            }
+            ')' => {
+                depth -= 1;
+                buf.push(ch);
+            }
+            ',' if depth == 0 => {
+                out.push(std::mem::take(&mut buf));
+            }
+            _ => buf.push(ch),
+        }
+    }
+    if !buf.is_empty() {
+        out.push(buf);
+    }
+    out
+}
+
+fn parse_requirement(part: &str) -> anyhow::Result<Requirement> {
+    // Try `in` / `notin` first — they're delimited by whitespace, unlike `=` /
+    // `!=` which can appear inside a value list (e.g. `key in (a=b)`).
+    if let Some(rest) = part.strip_prefix("!") {
+        return Ok(Requirement::NotExists(rest.trim().to_string()));
+    }
+    // Look for ` notin (` and ` in (` as the operator (whitespace-bounded so
+    // we don't match a literal "in" inside a label key).
+    if let Some((key, values)) = split_set_op(part, "notin") {
+        return Ok(Requirement::NotIn(key, values));
+    }
+    if let Some((key, values)) = split_set_op(part, "in") {
+        return Ok(Requirement::In(key, values));
+    }
+    if let Some((key, value)) = part.split_once("!=") {
+        return Ok(Requirement::NotEquals(
+            key.trim().to_string(),
+            value.trim().to_string(),
+        ));
+    }
+    if let Some((key, value)) = part.split_once("==") {
+        return Ok(Requirement::Equals(
+            key.trim().to_string(),
+            value.trim().to_string(),
+        ));
+    }
+    if let Some((key, value)) = part.split_once('=') {
+        return Ok(Requirement::Equals(
+            key.trim().to_string(),
+            value.trim().to_string(),
+        ));
+    }
+    Ok(Requirement::Exists(part.trim().to_string()))
+}
+
+fn split_set_op(part: &str, op: &str) -> Option<(String, Vec<String>)> {
+    // Match `<key> <op> (<v1>, <v2>, ...)`. Operator must be surrounded by
+    // whitespace; values are inside the parens, comma-separated.
+    let mid_pattern = format!(" {op} ");
+    let idx = part.find(&mid_pattern)?;
+    let key = part[..idx].trim().to_string();
+    let after = part[idx + mid_pattern.len()..].trim();
+    let inner = after.strip_prefix('(')?.strip_suffix(')')?;
+    let values: Vec<String> = inner
+        .split(',')
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .collect();
+    Some((key, values))
 }
 
 impl FieldSelector {

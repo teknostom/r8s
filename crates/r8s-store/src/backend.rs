@@ -433,6 +433,16 @@ impl Store {
         self.watches.subscribe(&gvr.key_prefix())
     }
 
+    /// Open a watch with history: returns every recently-buffered event with
+    /// `resource_version > since_rv` followed by a live receiver. Pass 0 for
+    /// `since_rv` to request no history.
+    pub fn watch_from(
+        &self,
+        gvr: &GroupVersionResource,
+        since_rv: u64,
+    ) -> Result<(Vec<WatchEvent>, broadcast::Receiver<WatchEvent>), crate::watch::TooOld> {
+        self.watches.subscribe_with_history(&gvr.key_prefix(), since_rv)
+    }
 }
 
 /// Remove the revision entry that just fell out of the keep window. Called
