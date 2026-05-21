@@ -20,11 +20,15 @@ jobs:
       CONFORMANCE_IMAGE: registry.k8s.io/conformance:v1.32.0
       RESULTS_DIR: ${{ github.workspace }}/conformance-results
       # Suites this job enforces. Each row is:
-      #   NAME | FOCUS_REGEX | EXPECTED_PASSED | EXPECTED_FAILED
+      #   NAME|FOCUS_REGEX|EXPECTED_PASSED|EXPECTED_FAILED
       # Add more rows here when a new SIG/test family goes green.
       # The FOCUS regex is passed to the e2e.test binary's --ginkgo.focus.
+      # No spaces around the `|` separators — they'd be parsed as part of
+      # the field, and stripping them with echo|xargs eats the regex
+      # backslash escapes (which ginkgo then mis-reads as character class
+      # ranges, e.g. `[sig-api-machinery]` becoming `[s-i-g-a...y]`).
       SUITES: |
-        crd-publish-openapi | \[sig-api-machinery\] CustomResourcePublishOpenAPI.*\[Conformance\] | 9 | 0
+        crd-publish-openapi|\[sig-api-machinery\] CustomResourcePublishOpenAPI.*\[Conformance\]|9|0
 
     steps:
       - uses: actions/checkout@v4
@@ -95,10 +99,6 @@ jobs:
             line="${line%%#*}"  # strip trailing comments
             [[ -z "${line// }" ]] && continue
             IFS='|' read -r NAME FOCUS EXP_PASS EXP_FAIL <<< "$line"
-            NAME="$(echo "$NAME" | xargs)"
-            FOCUS="$(echo "$FOCUS" | xargs)"
-            EXP_PASS="$(echo "$EXP_PASS" | xargs)"
-            EXP_FAIL="$(echo "$EXP_FAIL" | xargs)"
             echo "::group::suite=$NAME focus=$FOCUS"
             FOCUS="$FOCUS" ./scripts/conformance.sh custom \
               | tee "$RESULTS_DIR/$NAME.log"
