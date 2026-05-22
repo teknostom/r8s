@@ -31,10 +31,10 @@ jobs:
         crd-publish-openapi|\[sig-api-machinery\] CustomResourcePublishOpenAPI.*\[Conformance\]|9|0
         discovery|\[sig-api-machinery\] Discovery .*\[Conformance\]|2|0
         aggregated-discovery|\[sig-api-machinery\] AggregatedDiscovery.*\[Conformance\]|4|0
-        # gc-deployment is two specs; keep them as separate rows so the focus
-        # regex doesn't need an inner `|` (the SUITES parser splits on `|`).
-        gc-deployment-rs|\[sig-api-machinery\] Garbage collector .* RS created by deployment.*\[Conformance\]|1|0
-        gc-deployment-orphan|\[sig-api-machinery\] Garbage collector .* deployment when deleteOptions.PropagationPolicy is Orphan.*\[Conformance\]|1|0
+        # Both "should orphan RS created by deployment ..." and "should delete
+        # RS created by deployment when not orphaning" match this focus; keep
+        # them on one row to avoid regex `|` colliding with the field split.
+        gc-deployment|\[sig-api-machinery\] Garbage collector .* RS created by deployment.*\[Conformance\]|2|0
         resourcequota|\[sig-api-machinery\] ResourceQuota .*\[Conformance\]|12|0
 
     steps:
