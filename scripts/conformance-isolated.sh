@@ -74,13 +74,18 @@ escape_regex() {
 }
 
 # --- Helper: write a minimal kubeconfig ---
+# Arg 1: kubeconfig path. Arg 2: data dir r8sd will use (the CA lands at
+# <data_dir>/certs/ca.crt once r8sd starts). r8sd serves TLS on 6443, so
+# this must reference that CA — a plaintext http:// kubeconfig dials the
+# TLS port and the client parser chokes on the handshake bytes.
 write_kubeconfig() {
-    cat > "$1" <<'KC'
+    cat > "$1" <<KC
 apiVersion: v1
 kind: Config
 clusters:
 - cluster:
-    server: http://127.0.0.1:6443
+    server: https://127.0.0.1:6443
+    certificate-authority: $2/certs/ca.crt
   name: r8s-test
 contexts:
 - context:
@@ -90,7 +95,8 @@ contexts:
 current-context: r8s-test
 users:
 - name: r8s-admin
-  user: {}
+  user:
+    token: r8s-admin
 KC
 }
 
@@ -151,7 +157,7 @@ for i in "${!TESTS[@]}"; do
     TMPDIR=$(mktemp -d /tmp/r8s-iso-$$-XXXX)
     KUBECONFIG="$TMPDIR/kubeconfig"
 
-    write_kubeconfig "$KUBECONFIG"
+    write_kubeconfig "$KUBECONFIG" "$TMPDIR"
 
     # Ensure port 6443 is free before starting
     kill_stale_r8sd
@@ -177,6 +183,7 @@ for i in "${!TESTS[@]}"; do
 
     if "$E2E" \
         --kubeconfig="$KUBECONFIG" \
+        --kube-api-content-type=application/json \
         --ginkgo.focus="${ESCAPED}" \
         --ginkgo.no-color \
         --ginkgo.timeout="$PER_TEST_TIMEOUT" \
