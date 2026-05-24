@@ -520,21 +520,50 @@ fn update_deploy_status(store: &Store, deploy_value: &serde_json::Value) -> anyh
         ready_replicas += status.ready_replicas.unwrap_or(0);
         max_revision = max_revision.max(rs_revision(rs));
     }
+    // The "new" replica set is the one at max_revision. `updatedReplicas`
+    // is its replica count — what Helm's kstatus uses to tell when a roll
+    // has finished. Without this, `helm install --wait` polls forever.
+    let updated_replicas: i32 = owned_rs
+        .iter()
+        .filter(|rs| rs_revision(rs) == max_revision && max_revision > 0)
+        .filter_map(|rs| rs.status.as_ref().map(|s| s.replicas))
+        .sum();
+    let desired_replicas = deploy
+        .spec
+        .as_ref()
+        .and_then(|s| s.replicas)
+        .unwrap_or(1);
+    let progressing_done =
+        updated_replicas == desired_replicas && ready_replicas >= desired_replicas;
 
     let status = DeploymentStatus {
         replicas: Some(total_replicas),
         ready_replicas: Some(ready_replicas),
         available_replicas: Some(ready_replicas),
-        conditions: Some(vec![DeploymentCondition {
-            type_: "Available".into(),
-            status: if ready_replicas > 0 {
-                "True".into()
-            } else {
-                "False".into()
+        updated_replicas: Some(updated_replicas),
+        observed_generation: deploy.metadata.generation,
+        conditions: Some(vec![
+            DeploymentCondition {
+                type_: "Available".into(),
+                status: if ready_replicas > 0 {
+                    "True".into()
+                } else {
+                    "False".into()
+                },
+                reason: Some("MinimumReplicasAvailable".into()),
+                ..Default::default()
             },
-            reason: Some("MinimumReplicasAvailable".into()),
-            ..Default::default()
-        }]),
+            DeploymentCondition {
+                type_: "Progressing".into(),
+                status: "True".into(),
+                reason: Some(if progressing_done {
+                    "NewReplicaSetAvailable".into()
+                } else {
+                    "ReplicaSetUpdated".into()
+                }),
+                ..Default::default()
+            },
+        ]),
         ..Default::default()
     };
     let new_status_val = serde_json::to_value(&status)?;

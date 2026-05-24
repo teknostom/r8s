@@ -13,6 +13,7 @@
 include!(concat!(env!("OUT_DIR"), "/k8s_pb.rs"));
 
 /// Convenience re-exports of the module paths we actually use.
+pub use k8s::io::api::core::v1 as core_v1;
 pub use k8s::io::apiextensions_apiserver::pkg::apis::apiextensions::v1 as apiextensions_v1;
 pub use k8s::io::apimachinery::pkg::api::resource;
 pub use k8s::io::apimachinery::pkg::apis::meta::v1 as meta_v1;

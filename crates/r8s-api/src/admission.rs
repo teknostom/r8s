@@ -775,8 +775,9 @@ fn dechunk(input: &[u8]) -> Result<Vec<u8>, String> {
 }
 
 fn tls_config(ca_pem: Option<&[u8]>) -> Result<ClientConfig, String> {
-    // Single source of truth for CryptoProvider — match the one axum-server uses.
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    // Single source of truth for CryptoProvider — match the one axum-server
+    // configures in `ApiServer::serve_tls` (aws-lc-rs).
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
 
     let mut roots = RootCertStore::empty();
     if let Some(pem) = ca_pem {

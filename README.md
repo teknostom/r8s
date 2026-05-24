@@ -10,6 +10,7 @@ A lightweight single-node Kubernetes distribution written in Rust. Designed for 
 - containerd running (`sudo systemctl start containerd`)
 - Root access (networking setup requires it)
 - Helm and kubectl on PATH (for `r8s env` commands)
+- `protoc` (buildtime)
 
 ## Install
 

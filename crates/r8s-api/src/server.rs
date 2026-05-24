@@ -50,6 +50,12 @@ fn not_found() -> Response {
     )
 }
 
+/// `?dryRun=All` → server-side dry-run. Anything else (or missing) → not.
+fn parse_dry_run_query(raw_query: Option<&str>) -> bool {
+    let Some(q) = raw_query else { return false };
+    q.split('&').any(|p| p == "dryRun=All")
+}
+
 struct ApiPath {
     group: String,
     version: String,
@@ -130,7 +136,8 @@ async fn dynamic_dispatch(
                 Ok(v) => v,
                 Err(resp) => return resp,
             };
-            create_impl(&state, &ctx, api_path.namespace.as_deref(), json)
+            let dry_run = parse_dry_run_query(raw_query.as_deref());
+            create_impl(&state, &ctx, api_path.namespace.as_deref(), json, dry_run).await
         }
         (Method::GET, Some(ref name)) => {
             get_impl(&state, &ctx, api_path.namespace.as_deref(), name, &headers)
@@ -140,10 +147,21 @@ async fn dynamic_dispatch(
                 Ok(v) => v,
                 Err(resp) => return resp,
             };
-            update_impl(&state, &ctx, api_path.namespace.as_deref(), name, json)
+            let dry_run = parse_dry_run_query(raw_query.as_deref());
+            update_impl(&state, &ctx, api_path.namespace.as_deref(), name, json, dry_run).await
         }
         (Method::PATCH, Some(ref name)) => {
-            patch_impl(&state, &ctx, api_path.namespace.as_deref(), name, &headers, body)
+            let dry_run = parse_dry_run_query(raw_query.as_deref());
+            patch_impl(
+                &state,
+                &ctx,
+                api_path.namespace.as_deref(),
+                name,
+                &headers,
+                body,
+                dry_run,
+            )
+            .await
         }
         (Method::DELETE, Some(ref name)) => {
             let content_type = headers
@@ -151,7 +169,8 @@ async fn dynamic_dispatch(
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("");
             let policy = extract_propagation_policy(raw_query.as_deref(), &body, content_type);
-            delete_impl(&state, &ctx, api_path.namespace.as_deref(), name, policy)
+            let dry_run = parse_dry_run_query(raw_query.as_deref());
+            delete_impl(&state, &ctx, api_path.namespace.as_deref(), name, policy, dry_run).await
         }
         _ => not_found(),
     }

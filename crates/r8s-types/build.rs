@@ -28,6 +28,7 @@ fn main() {
         "k8s.io/apimachinery/pkg/api/resource/generated.proto",
         "k8s.io/apimachinery/pkg/apis/meta/v1/generated.proto",
         "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1/generated.proto",
+        "k8s.io/api/core/v1/generated.proto",
     ];
     for p in &k8s_protos {
         println!("cargo:rerun-if-changed=proto/{p}");

@@ -11,6 +11,7 @@ use prost::Message;
 use serde_json::{Map, Value, json};
 
 use crate::k8s_pb::apiextensions_v1 as pbapi;
+use crate::k8s_pb::core_v1 as pbcore;
 use crate::k8s_pb::meta_v1 as pbmeta;
 use crate::k8s_pb::runtime as pbruntime;
 
@@ -45,8 +46,58 @@ pub fn decode_k8s_protobuf_to_json(body: &[u8]) -> Option<Value> {
             let crd = pbapi::CustomResourceDefinition::decode(raw).ok()?;
             Some(crd_to_json(&crd, api_version, kind))
         }
+        ("v1", "Secret") => {
+            let secret = pbcore::Secret::decode(raw).ok()?;
+            Some(secret_to_json(&secret, api_version, kind))
+        }
         _ => None,
     }
+}
+
+// ─── Secret walker ──────────────────────────────────────────────────────────
+//
+// Helm 3 stores its release info as a Secret via the typed client, which
+// serializes as protobuf. Decoder must preserve `data` losslessly (it carries
+// the gzip'd chart) — the old metadata-only path silently dropped it and
+// broke `helm uninstall`.
+
+fn secret_to_json(s: &pbcore::Secret, api_version: &str, kind: &str) -> Value {
+    let mut obj = Map::new();
+    obj.insert("apiVersion".into(), json!(api_version));
+    obj.insert("kind".into(), json!(kind));
+    if let Some(meta) = s.metadata.as_ref() {
+        obj.insert("metadata".into(), object_meta_to_json(meta));
+    }
+    if let Some(t) = s.r#type.as_deref() {
+        obj.insert("type".into(), json!(t));
+    }
+    if let Some(im) = s.immutable {
+        obj.insert("immutable".into(), json!(im));
+    }
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD;
+    if !s.data.is_empty() {
+        let mut data = Map::new();
+        for (k, v) in &s.data {
+            data.insert(k.clone(), json!(b64.encode(v)));
+        }
+        obj.insert("data".into(), Value::Object(data));
+    }
+    // `stringData` is a write-side convenience: per the k8s API contract the
+    // server folds each entry into `data` (base64-encoding the UTF-8 bytes)
+    // and the persisted object only has `data`. Mirror that here so callers
+    // see a single canonical shape.
+    if !s.string_data.is_empty() {
+        let data_entry = obj.entry("data".to_string()).or_insert_with(|| {
+            Value::Object(Map::new())
+        });
+        if let Some(data_obj) = data_entry.as_object_mut() {
+            for (k, v) in &s.string_data {
+                data_obj.insert(k.clone(), json!(b64.encode(v.as_bytes())));
+            }
+        }
+    }
+    Value::Object(obj)
 }
 
 // ─── CRD walker ─────────────────────────────────────────────────────────────

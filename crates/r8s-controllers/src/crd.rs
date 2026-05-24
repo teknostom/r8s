@@ -1,4 +1,4 @@
-use r8s_store::{Store, watch::WatchEventType};
+use r8s_store::{Store, backend::ResourceRef, watch::WatchEventType};
 use r8s_types::{
     CustomResourceDefinition, GroupVersionResource, ResourceType, registry::ResourceRegistry,
 };
@@ -37,6 +37,7 @@ pub async fn run(
                                 // served versions, never removes stale ones.
                                 unregister_crd(&registry, &crd);
                                 register_crd(&registry, &crd);
+                                mark_established(&store, &crd);
                             }
                             WatchEventType::Deleted => {
                                 unregister_crd(&registry, &crd);
@@ -64,6 +65,65 @@ fn reconcile_all(store: &Store, crd_gvr: &GroupVersionResource, registry: &Resou
     };
     for crd in &crds {
         register_crd(registry, crd);
+        mark_established(store, crd);
+    }
+}
+
+/// Write back `status.conditions = [Established=True, NamesAccepted=True]`
+/// and `status.acceptedNames`/`status.storedVersions` so Helm's kstatus
+/// readiness check treats the CRD as ready. r8s has no real establishment
+/// process — registration is synchronous and never fails — so we always
+/// mark True. The store's no-op detection means re-applying the same
+/// status doesn't re-fire a watch event (which would loop us back here).
+fn mark_established(store: &Store, crd: &CustomResourceDefinition) {
+    let crd_gvr = GroupVersionResource::crds();
+    let name = crd.metadata.name.as_deref().unwrap_or("");
+    if name.is_empty() {
+        return;
+    }
+    let rref = ResourceRef {
+        gvr: &crd_gvr,
+        namespace: None,
+        name,
+    };
+    let mut obj = match store.get(&rref) {
+        Ok(Some(v)) => v,
+        _ => return,
+    };
+    let stored_versions: Vec<serde_json::Value> = crd
+        .spec
+        .versions
+        .iter()
+        .filter(|v| v.storage)
+        .map(|v| serde_json::Value::String(v.name.clone()))
+        .collect();
+    let accepted_names = serde_json::to_value(&crd.spec.names).unwrap_or(serde_json::json!({}));
+    let new_status = serde_json::json!({
+        "conditions": [
+            {
+                "type": "NamesAccepted",
+                "status": "True",
+                "reason": "NoConflicts",
+                "message": "no conflicts found",
+            },
+            {
+                "type": "Established",
+                "status": "True",
+                "reason": "InitialNamesAccepted",
+                "message": "the initial names have been accepted",
+            },
+        ],
+        "acceptedNames": accepted_names,
+        "storedVersions": stored_versions,
+    });
+    if obj.get("status") == Some(&new_status) {
+        return;
+    }
+    if let Some(map) = obj.as_object_mut() {
+        map.insert("status".into(), new_status);
+    }
+    if let Err(e) = store.update(&rref, &obj) {
+        tracing::debug!("crd status update for '{name}' failed: {e}");
     }
 }
 

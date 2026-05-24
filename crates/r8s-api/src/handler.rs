@@ -18,12 +18,55 @@ use serde::Deserialize;
 use tokio_stream::wrappers::BroadcastStream;
 
 use crate::{
+    admission::{self, AdmissionCtx, AdmissionError, Operation},
     discovery::AppState,
     params::ListParams,
     patch::json_merge_patch,
     response::{self, status_error},
     table,
 };
+
+/// Translate an admission failure into the HTTP response real k8s returns.
+/// `Denied` forwards the webhook's own `metav1.Status` verbatim (clients like
+/// cert-manager's startupapicheck inspect `details.causes[].field`); webhook
+/// transport / decode failures surface as 500.
+fn admission_error_response(err: AdmissionError) -> Response {
+    match err {
+        AdmissionError::Denied {
+            webhook: _,
+            message,
+            status,
+        } => {
+            if let Some(status) = status {
+                response::json_response(StatusCode::FORBIDDEN.as_u16() as u16, &status)
+            } else {
+                response::status_error(StatusCode::FORBIDDEN, "Forbidden", &message)
+            }
+        }
+        AdmissionError::CallFailed { webhook, error } => response::status_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "InternalError",
+            &format!("admission webhook '{webhook}' failed: {error}"),
+        ),
+        AdmissionError::InvalidResponse { webhook, error } => response::status_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "InternalError",
+            &format!("admission webhook '{webhook}' returned invalid response: {error}"),
+        ),
+        AdmissionError::Internal(msg) => response::status_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "InternalError",
+            &msg,
+        ),
+    }
+}
+
+/// Parse `?dryRun=All` from a raw query string. Anything else (including
+/// missing) is treated as a real (non-dry-run) request.
+fn parse_dry_run(raw_query: Option<&str>) -> bool {
+    let Some(q) = raw_query else { return false };
+    q.split('&').any(|p| p == "dryRun=All")
+}
 use axum::extract::Query;
 use tokio_stream::StreamExt;
 
@@ -351,11 +394,12 @@ fn validate_cr(ctx: &RouteContext, body: &serde_json::Value) -> Option<Response>
     }
 }
 
-pub(crate) fn create_impl(
+pub(crate) async fn create_impl(
     state: &AppState,
     ctx: &RouteContext,
     namespace: Option<&str>,
     mut body: serde_json::Value,
+    dry_run: bool,
 ) -> Response {
     let name = match body
         .get("metadata")
@@ -400,6 +444,26 @@ pub(crate) fn create_impl(
         r8s_controllers::pod_admission::inject_sa_token(&state.store, &mut body);
     }
 
+    // Mutating webhooks run first — let cert-manager-style mutators patch
+    // the body before validation / storage. Webhooks with sideEffects !=
+    // None/NoneOnDryRun are skipped on dry-run by admission.rs.
+    let admission_ctx = AdmissionCtx {
+        store: &state.store,
+        gvr: &ctx.resource_type.gvr,
+        kind: &ctx.resource_type.kind,
+        operation: Operation::Create,
+        namespace,
+        name: &name,
+        dry_run,
+        user_info: serde_json::json!({}),
+    };
+    if let Err(e) = admission::invoke_mutating(&admission_ctx, &mut body, None).await {
+        return admission_error_response(e);
+    }
+    if let Err(e) = admission::invoke_validating(&admission_ctx, &body, None).await {
+        return admission_error_response(e);
+    }
+
     if let Some(resp) = validate_cr(ctx, &body) {
         return resp;
     }
@@ -418,6 +482,12 @@ pub(crate) fn create_impl(
         return response::status_error(StatusCode::FORBIDDEN, "Forbidden", &msg);
     }
 
+    // dryRun=All: return the (now-mutated) body without persisting. Matches
+    // upstream apiserver semantics — clients use this to preview admission.
+    if dry_run {
+        return response::created_response(&body);
+    }
+
     let resource_ref = ResourceRef {
         gvr: &ctx.resource_type.gvr,
         namespace,
@@ -433,6 +503,7 @@ pub async fn create_ns(
     State(state): State<AppState>,
     Extension(ctx): Extension<RouteContext>,
     Path(ns): Path<String>,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
@@ -440,12 +511,14 @@ pub async fn create_ns(
         Ok(v) => v,
         Err(resp) => return resp,
     };
-    create_impl(&state, &ctx, Some(&ns), body)
+    let dry_run = parse_dry_run(raw_query.as_deref());
+    create_impl(&state, &ctx, Some(&ns), body, dry_run).await
 }
 
 pub async fn create_cluster(
     State(state): State<AppState>,
     Extension(ctx): Extension<RouteContext>,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
@@ -453,24 +526,53 @@ pub async fn create_cluster(
         Ok(v) => v,
         Err(resp) => return resp,
     };
-    create_impl(&state, &ctx, None, body)
+    let dry_run = parse_dry_run(raw_query.as_deref());
+    create_impl(&state, &ctx, None, body, dry_run).await
 }
 
-pub(crate) fn update_impl(
+pub(crate) async fn update_impl(
     state: &AppState,
     ctx: &RouteContext,
     namespace: Option<&str>,
     name: &str,
-    body: serde_json::Value,
+    mut body: serde_json::Value,
+    dry_run: bool,
 ) -> Response {
-    if let Some(resp) = validate_cr(ctx, &body) {
-        return resp;
-    }
     let resource_ref = ResourceRef {
         gvr: &ctx.resource_type.gvr,
         namespace,
         name,
     };
+    let old_object = match state.store.get(&resource_ref) {
+        Ok(v) => v,
+        Err(err) => return response::anyhow_error_response(err),
+    };
+    let admission_ctx = AdmissionCtx {
+        store: &state.store,
+        gvr: &ctx.resource_type.gvr,
+        kind: &ctx.resource_type.kind,
+        operation: Operation::Update,
+        namespace,
+        name,
+        dry_run,
+        user_info: serde_json::json!({}),
+    };
+    if let Err(e) =
+        admission::invoke_mutating(&admission_ctx, &mut body, old_object.as_ref()).await
+    {
+        return admission_error_response(e);
+    }
+    if let Err(e) =
+        admission::invoke_validating(&admission_ctx, &body, old_object.as_ref()).await
+    {
+        return admission_error_response(e);
+    }
+    if let Some(resp) = validate_cr(ctx, &body) {
+        return resp;
+    }
+    if dry_run {
+        return response::object_response(&body);
+    }
     match state.store.update(&resource_ref, &body) {
         Ok(obj) => response::object_response(&obj),
         Err(err) => response::anyhow_error_response(err),
@@ -481,6 +583,7 @@ pub async fn update_ns(
     State(state): State<AppState>,
     Extension(ctx): Extension<RouteContext>,
     Path((ns, name)): Path<(String, String)>,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
@@ -488,14 +591,15 @@ pub async fn update_ns(
         Ok(v) => v,
         Err(resp) => return resp,
     };
-    update_impl(&state, &ctx, Some(&ns), &name, body)
+    let dry_run = parse_dry_run(raw_query.as_deref());
+    update_impl(&state, &ctx, Some(&ns), &name, body, dry_run).await
 }
 
 /// DELETE on a collection endpoint — k8s' `deletecollection` verb. Honors
 /// the same label/field selectors as LIST (the test uses LabelSelector to
 /// bound which resources to nuke) plus the propagation policy from the
 /// query/body. Returns a Status object on success per upstream.
-pub(crate) fn delete_collection_impl(
+pub(crate) async fn delete_collection_impl(
     state: &AppState,
     ctx: &RouteContext,
     namespace: Option<&str>,
@@ -555,7 +659,7 @@ pub(crate) fn delete_collection_impl(
         // Use the item's own namespace if listing across all namespaces;
         // otherwise honour the URL-scoped namespace.
         let effective_ns = namespace.or(ns.as_deref());
-        delete_impl(state, ctx, effective_ns, &name, policy);
+        let _ = delete_impl(state, ctx, effective_ns, &name, policy, false).await;
     }
     response::object_response(&serde_json::json!({
         "kind": "Status",
@@ -579,7 +683,7 @@ pub async fn delete_collection_ns(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     let policy = extract_propagation_policy(query.as_deref(), &body, content_type);
-    delete_collection_impl(&state, &ctx, Some(&ns), &params, policy)
+    delete_collection_impl(&state, &ctx, Some(&ns), &params, policy).await
 }
 
 pub async fn delete_collection_cluster(
@@ -595,13 +699,14 @@ pub async fn delete_collection_cluster(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     let policy = extract_propagation_policy(query.as_deref(), &body, content_type);
-    delete_collection_impl(&state, &ctx, None, &params, policy)
+    delete_collection_impl(&state, &ctx, None, &params, policy).await
 }
 
 pub async fn update_cluster(
     State(state): State<AppState>,
     Extension(ctx): Extension<RouteContext>,
     Path(name): Path<String>,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
@@ -609,7 +714,8 @@ pub async fn update_cluster(
         Ok(v) => v,
         Err(resp) => return resp,
     };
-    update_impl(&state, &ctx, None, &name, body)
+    let dry_run = parse_dry_run(raw_query.as_deref());
+    update_impl(&state, &ctx, None, &name, body, dry_run).await
 }
 
 // ─── /status subresource ────────────────────────────────────────────────────
@@ -711,7 +817,9 @@ pub async fn patch_status_ns(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    patch_impl(&state, &ctx, Some(&ns), &name, &headers, body)
+    // Status subresource updates don't go through the admission chain in
+    // upstream k8s; we'd skip mutating webhooks here too. dryRun is unused.
+    patch_impl(&state, &ctx, Some(&ns), &name, &headers, body, false).await
 }
 
 pub async fn patch_status_cluster(
@@ -721,7 +829,7 @@ pub async fn patch_status_cluster(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    patch_impl(&state, &ctx, None, &name, &headers, body)
+    patch_impl(&state, &ctx, None, &name, &headers, body, false).await
 }
 /// How an object's dependents are handled when the object is deleted.
 /// Sourced from `DeleteOptions.PropagationPolicy` (or the legacy
@@ -859,12 +967,13 @@ fn orphan_dependents(state: &AppState, uid: &str) {
     }
 }
 
-pub(crate) fn delete_impl(
+pub(crate) async fn delete_impl(
     state: &AppState,
     ctx: &RouteContext,
     namespace: Option<&str>,
     name: &str,
     policy: PropagationPolicy,
+    dry_run: bool,
 ) -> Response {
     let rref = ResourceRef {
         gvr: &ctx.resource_type.gvr,
@@ -872,21 +981,48 @@ pub(crate) fn delete_impl(
         name,
     };
 
+    // Look up the object once: validating webhooks need oldObject; orphan
+    // propagation needs the uid; the missing-resource case wants a 404.
+    let existing = match state.store.get(&rref) {
+        Ok(Some(v)) => v,
+        Ok(None) => {
+            return response::status_error(
+                StatusCode::NOT_FOUND,
+                "NotFound",
+                &format!("{} '{}' not found", ctx.resource_type.kind, name),
+            );
+        }
+        Err(err) => return response::anyhow_error_response(err),
+    };
+
+    // Only validating webhooks fire for DELETE (no mutation possible).
+    let admission_ctx = AdmissionCtx {
+        store: &state.store,
+        gvr: &ctx.resource_type.gvr,
+        kind: &ctx.resource_type.kind,
+        operation: Operation::Delete,
+        namespace,
+        name,
+        dry_run,
+        user_info: serde_json::json!({}),
+    };
+    if let Err(e) =
+        admission::invoke_validating(&admission_ctx, &existing, Some(&existing)).await
+    {
+        return admission_error_response(e);
+    }
+
+    if dry_run {
+        return response::object_response(&existing);
+    }
+
     if matches!(policy, PropagationPolicy::Orphan) {
-        // Look up the object's UID before deleting so we know what
-        // ownerRef to strip from dependents.
-        let uid = state
-            .store
-            .get(&rref)
-            .ok()
-            .flatten()
-            .and_then(|v| {
-                v.get("metadata")
-                    .and_then(|m| m.get("uid"))
-                    .and_then(|u| u.as_str())
-                    .map(String::from)
-            })
-            .unwrap_or_default();
+        let uid = existing
+            .get("metadata")
+            .and_then(|m| m.get("uid"))
+            .and_then(|u| u.as_str())
+            .unwrap_or("")
+            .to_string();
         if !uid.is_empty() {
             orphan_dependents(state, &uid);
         }
@@ -916,7 +1052,8 @@ pub async fn delete_ns(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     let policy = extract_propagation_policy(query.as_deref(), &body, content_type);
-    delete_impl(&state, &ctx, Some(&ns), &name, policy)
+    let dry_run = parse_dry_run(query.as_deref());
+    delete_impl(&state, &ctx, Some(&ns), &name, policy, dry_run).await
 }
 
 pub async fn delete_cluster(
@@ -932,16 +1069,18 @@ pub async fn delete_cluster(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     let policy = extract_propagation_policy(query.as_deref(), &body, content_type);
-    delete_impl(&state, &ctx, None, &name, policy)
+    let dry_run = parse_dry_run(query.as_deref());
+    delete_impl(&state, &ctx, None, &name, policy, dry_run).await
 }
 
-pub(crate) fn patch_impl(
+pub(crate) async fn patch_impl(
     state: &AppState,
     ctx: &RouteContext,
     namespace: Option<&str>,
     name: &str,
     headers: &HeaderMap,
     bytes: Bytes,
+    dry_run: bool,
 ) -> Response {
     let rref = ResourceRef {
         gvr: &ctx.resource_type.gvr,
@@ -983,6 +1122,7 @@ pub(crate) fn patch_impl(
     };
     match state.store.get(&rref) {
         Ok(Some(mut current)) => {
+            let old_object = current.clone();
             if is_json_patch {
                 if let Err(e) = crate::jsonpatch::apply(&mut current, &patch) {
                     return response::status_error(
@@ -999,8 +1139,32 @@ pub(crate) fn patch_impl(
             {
                 meta.remove("resourceVersion");
             }
+            let admission_ctx = AdmissionCtx {
+                store: &state.store,
+                gvr: &ctx.resource_type.gvr,
+                kind: &ctx.resource_type.kind,
+                operation: Operation::Update,
+                namespace,
+                name,
+                dry_run,
+                user_info: serde_json::json!({}),
+            };
+            if let Err(e) =
+                admission::invoke_mutating(&admission_ctx, &mut current, Some(&old_object))
+                    .await
+            {
+                return admission_error_response(e);
+            }
+            if let Err(e) =
+                admission::invoke_validating(&admission_ctx, &current, Some(&old_object)).await
+            {
+                return admission_error_response(e);
+            }
             if let Some(resp) = validate_cr(ctx, &current) {
                 return resp;
+            }
+            if dry_run {
+                return response::object_response(&current);
             }
             match state.store.update(&rref, &current) {
                 Ok(obj) => response::object_response(&obj),
@@ -1031,8 +1195,27 @@ pub(crate) fn patch_impl(
                 obj.insert("metadata".to_string(), serde_json::Value::Object(meta));
             }
             maybe_allocate_cluster_ip(state, ctx, &mut body);
+            let admission_ctx = AdmissionCtx {
+                store: &state.store,
+                gvr: &ctx.resource_type.gvr,
+                kind: &ctx.resource_type.kind,
+                operation: Operation::Create,
+                namespace,
+                name,
+                dry_run,
+                user_info: serde_json::json!({}),
+            };
+            if let Err(e) = admission::invoke_mutating(&admission_ctx, &mut body, None).await {
+                return admission_error_response(e);
+            }
+            if let Err(e) = admission::invoke_validating(&admission_ctx, &body, None).await {
+                return admission_error_response(e);
+            }
             if let Some(resp) = validate_cr(ctx, &body) {
                 return resp;
+            }
+            if dry_run {
+                return response::created_response(&body);
             }
             match state.store.create(rref, &body) {
                 Ok(obj) => response::created_response(&obj),
@@ -1047,20 +1230,24 @@ pub async fn patch_ns(
     State(state): State<AppState>,
     Extension(ctx): Extension<RouteContext>,
     Path((ns, name)): Path<(String, String)>,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    patch_impl(&state, &ctx, Some(&ns), &name, &headers, body)
+    let dry_run = parse_dry_run(raw_query.as_deref());
+    patch_impl(&state, &ctx, Some(&ns), &name, &headers, body, dry_run).await
 }
 
 pub async fn patch_cluster(
     State(state): State<AppState>,
     Extension(ctx): Extension<RouteContext>,
     Path(name): Path<String>,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    patch_impl(&state, &ctx, None, &name, &headers, body)
+    let dry_run = parse_dry_run(raw_query.as_deref());
+    patch_impl(&state, &ctx, None, &name, &headers, body, dry_run).await
 }
 
 fn api_version(ctx: &RouteContext) -> String {
