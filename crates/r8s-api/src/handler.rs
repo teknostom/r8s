@@ -956,6 +956,11 @@ fn orphan_dependents(state: &AppState, uid: &str) {
                 } else {
                     meta.insert("ownerReferences".to_string(), serde_json::Value::Array(new_refs));
                 }
+                // Blind write — the store would otherwise reject if a
+                // controller raced our list-snapshot with another update.
+                // Orphaning must not silently no-op or the GC follow-up
+                // will see the still-attached ref and delete the dependent.
+                meta.remove("resourceVersion");
             }
             let rref = ResourceRef {
                 gvr: &rt.gvr,
@@ -1028,6 +1033,34 @@ pub(crate) async fn delete_impl(
         }
     }
 
+    if matches!(policy, PropagationPolicy::Foreground) {
+        // Foreground deletion: stamp `metadata.deletionTimestamp` and add the
+        // `foregroundDeletion` finalizer instead of actually removing the
+        // object. The GC controller watches for this state, cascades to
+        // dependents, then strips the finalizer once they're gone — at which
+        // point a follow-up delete (issued by the GC) finally erases the
+        // parent. Foreground returns 200 with the marked-for-deletion object.
+        match state.store.get(&rref) {
+            Ok(Some(mut current)) => {
+                if mark_foreground_deletion(&mut current) {
+                    match state.store.update(&rref, &current) {
+                        Ok(obj) => return response::object_response(&obj),
+                        Err(err) => return response::anyhow_error_response(err),
+                    }
+                }
+                // Nothing to mark (already marked) — fall through to actual delete.
+            }
+            Ok(None) => {
+                return response::status_error(
+                    StatusCode::NOT_FOUND,
+                    "NotFound",
+                    &format!("{} '{}' not found", ctx.resource_type.kind, name),
+                );
+            }
+            Err(err) => return response::anyhow_error_response(err),
+        }
+    }
+
     match state.store.delete(&rref) {
         Ok(Some(obj)) => response::object_response(&obj),
         Ok(None) => response::status_error(
@@ -1037,6 +1070,37 @@ pub(crate) async fn delete_impl(
         ),
         Err(err) => response::anyhow_error_response(err),
     }
+}
+
+/// Stamp `metadata.deletionTimestamp` (RFC3339) and add the
+/// `foregroundDeletion` finalizer to `obj`. Returns true if the object was
+/// modified (false if it was already marked).
+fn mark_foreground_deletion(obj: &mut serde_json::Value) -> bool {
+    let meta = match obj.get_mut("metadata").and_then(|v| v.as_object_mut()) {
+        Some(m) => m,
+        None => return false,
+    };
+    let mut changed = false;
+    if !meta.contains_key("deletionTimestamp") {
+        meta.insert(
+            "deletionTimestamp".to_string(),
+            serde_json::json!(chrono::Utc::now().to_rfc3339()),
+        );
+        changed = true;
+    }
+    let finalizers = meta
+        .entry("finalizers".to_string())
+        .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+    if let Some(arr) = finalizers.as_array_mut() {
+        let has = arr
+            .iter()
+            .any(|v| v.as_str() == Some("foregroundDeletion"));
+        if !has {
+            arr.push(serde_json::Value::String("foregroundDeletion".into()));
+            changed = true;
+        }
+    }
+    changed
 }
 
 pub async fn delete_ns(

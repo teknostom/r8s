@@ -31,10 +31,14 @@ jobs:
         crd-publish-openapi|\[sig-api-machinery\] CustomResourcePublishOpenAPI.*\[Conformance\]|9|0
         discovery|\[sig-api-machinery\] Discovery .*\[Conformance\]|2|0
         aggregated-discovery|\[sig-api-machinery\] AggregatedDiscovery.*\[Conformance\]|4|0
-        # Both "should orphan RS created by deployment ..." and "should delete
-        # RS created by deployment when not orphaning" match this focus; keep
-        # them on one row to avoid regex `|` colliding with the field split.
-        gc-deployment|\[sig-api-machinery\] Garbage collector .* RS created by deployment.*\[Conformance\]|2|0
+        # Garbage collector suites — one test family per row. Inline regex
+        # alternation (`|`) collides with the SUITES field split, so families
+        # that would otherwise need a `|` each get their own row instead.
+        gc-rs-deployment|\[sig-api-machinery\] Garbage collector .* RS created by deployment.*\[Conformance\]|2|0
+        gc-deployment-orphan|\[sig-api-machinery\] Garbage collector .* deployment when deleteOptions.PropagationPolicy is Orphan.*\[Conformance\]|1|0
+        gc-rc-delete|\[sig-api-machinery\] Garbage collector .* delete pods created by rc when not orphaning.*\[Conformance\]|1|0
+        gc-rc-orphan|\[sig-api-machinery\] Garbage collector .* orphan pods created by rc if delete options say so.*\[Conformance\]|1|0
+        gc-rc-keep|\[sig-api-machinery\] Garbage collector .* keep the rc around until all its pods are deleted.*\[Conformance\]|1|0
         resourcequota|\[sig-api-machinery\] ResourceQuota .*\[Conformance\]|12|0
 
     steps:

@@ -4,6 +4,7 @@ pub mod cronjob;
 pub mod daemonset;
 pub mod deployment;
 pub mod endpoints;
+pub mod foreground_gc;
 pub mod gc;
 pub mod job;
 pub mod manager;
@@ -12,6 +13,7 @@ pub mod pod_admission;
 pub mod quantity;
 pub mod quota;
 pub mod replicaset;
+pub mod replicationcontroller;
 pub mod serviceaccount;
 pub mod statefulset;
 

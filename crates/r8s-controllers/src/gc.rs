@@ -14,6 +14,7 @@ pub async fn run(store: Store, shutdown: CancellationToken) -> anyhow::Result<()
     tracing::info!("gc controller started");
     let deploy_gvr = GroupVersionResource::deployments();
     let rs_gvr = GroupVersionResource::replica_sets();
+    let rc_gvr = GroupVersionResource::new("", "v1", "replicationcontrollers");
     let sts_gvr = GroupVersionResource::stateful_sets();
     let ds_gvr = GroupVersionResource::daemon_sets();
     let job_gvr = GroupVersionResource::jobs();
@@ -22,6 +23,7 @@ pub async fn run(store: Store, shutdown: CancellationToken) -> anyhow::Result<()
 
     let mut deploy_rx = store.watch(&deploy_gvr);
     let mut rs_rx = store.watch(&rs_gvr);
+    let mut rc_rx = store.watch(&rc_gvr);
     let mut sts_rx = store.watch(&sts_gvr);
     let mut ds_rx = store.watch(&ds_gvr);
     let mut job_rx = store.watch(&job_gvr);
@@ -62,6 +64,23 @@ pub async fn run(store: Store, shutdown: CancellationToken) -> anyhow::Result<()
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => {
                         gc_orphans(&store, &rs_gvr, &pods_gvr);
+                    }
+                    Err(broadcast::error::RecvError::Closed) => return Ok(()),
+                    _ => {}
+                }
+            }
+            event = rc_rx.recv() => {
+                match event {
+                    Ok(event) if matches!(event.event_type, WatchEventType::Deleted) => {
+                        let meta: MetadataOnly = match serde_json::from_value(event.object) {
+                            Ok(m) => m,
+                            Err(_) => continue,
+                        };
+                        let uid = meta.metadata.uid.as_deref().unwrap_or("");
+                        delete_owned(&store, &pods_gvr, uid);
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        gc_orphans(&store, &rc_gvr, &pods_gvr);
                     }
                     Err(broadcast::error::RecvError::Closed) => return Ok(()),
                     _ => {}

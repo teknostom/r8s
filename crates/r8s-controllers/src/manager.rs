@@ -56,6 +56,7 @@ impl ControllerManager {
         spawn_controller_with_ca!("namespace", super::namespace::run);
         spawn_controller_with_ca!("serviceaccount", super::serviceaccount::run);
         spawn_controller!("replicaset", super::replicaset::run);
+        spawn_controller!("replicationcontroller", super::replicationcontroller::run);
         spawn_controller!("deployment", super::deployment::run);
         spawn_controller!("gc", super::gc::run);
         spawn_controller!("endpoints", super::endpoints::run);
@@ -73,6 +74,18 @@ impl ControllerManager {
             self.handles.push(tokio::spawn(async move {
                 if let Err(e) = super::crd::run(store, token, registry).await {
                     tracing::error!("crd controller error: {e}");
+                }
+            }));
+        }
+
+        // Foreground GC also needs the registry to walk every type.
+        {
+            let store = self.store.clone();
+            let token = self.shutdown.clone();
+            let registry = self.registry.clone();
+            self.handles.push(tokio::spawn(async move {
+                if let Err(e) = super::foreground_gc::run(store, token, registry).await {
+                    tracing::error!("foreground-gc controller error: {e}");
                 }
             }));
         }

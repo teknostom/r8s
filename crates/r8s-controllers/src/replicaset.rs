@@ -100,6 +100,12 @@ fn reconcile_rs(store: &Store, rs_value: &serde_json::Value) -> anyhow::Result<(
         Some(rs) => rs,
         None => return Ok(()),
     };
+    // Once a deletionTimestamp is set, stop creating new pods. The foreground
+    // GC reconciler is in charge of cascading the existing ones; spinning up
+    // replacements here would race against it forever.
+    if current.metadata.deletion_timestamp.is_some() {
+        return Ok(());
+    }
     let current_uid = current.metadata.uid.as_deref().unwrap_or(rs_uid);
     let current_spec = current
         .spec
