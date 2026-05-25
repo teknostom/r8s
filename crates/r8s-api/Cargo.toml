@@ -7,8 +7,9 @@ edition.workspace = true
 r8s-types.workspace = true
 r8s-store.workspace = true
 r8s-controllers.workspace = true
+r8s-runtime.workspace = true
 
-axum.workspace = true
+axum = { workspace = true, features = ["ws"] }
 rustc-hash.workspace = true
 hyper.workspace = true
 tokio.workspace = true
@@ -28,6 +29,7 @@ tokio-rustls.workspace = true
 base64.workspace = true
 axum-server.workspace = true
 rand.workspace = true
+futures-util = "0.3"
 
 [dev-dependencies]
 tempfile.workspace = true

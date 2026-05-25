@@ -62,6 +62,9 @@ pub struct ApiState {
     pub data_dir: std::path::PathBuf,
     /// Starts at 2 because 10.96.0.1 is reserved for the kubernetes service.
     pub next_cluster_ip: AtomicU32,
+    /// Backend for `kubectl exec`. `None` under the mock runtime (tests) — the
+    /// exec endpoint then reports that exec is unsupported.
+    pub exec_runtime: Option<Arc<dyn r8s_runtime::ExecRuntime>>,
 }
 
 impl ApiState {

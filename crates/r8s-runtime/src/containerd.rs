@@ -21,7 +21,8 @@ use containerd_client::{
 };
 use oci_spec::runtime::{
     Capability, LinuxBuilder, LinuxCapabilitiesBuilder, LinuxNamespaceBuilder, LinuxNamespaceType,
-    Mount as OciMount, MountBuilder, ProcessBuilder, RootBuilder, SpecBuilder, get_default_mounts,
+    Mount as OciMount, MountBuilder, ProcessBuilder, RootBuilder, SpecBuilder, UserBuilder,
+    get_default_mounts,
 };
 use sha2::{Digest, Sha256};
 
@@ -43,6 +44,12 @@ impl ContainerdRuntime {
             data_dir,
             pull_lock: tokio::sync::Mutex::new(()),
         })
+    }
+
+    /// A `kubectl exec` backend sharing this runtime's containerd connection.
+    /// Handed to the API server so it can exec into running containers.
+    pub fn exec_handle(&self) -> crate::exec::ContainerdExec {
+        crate::exec::ContainerdExec::new(self.channel.clone(), self.data_dir.clone())
     }
 
     async fn cleanup_stale(&self, name: &str) {
@@ -204,10 +211,23 @@ fn normalize_image_ref(image: &str) -> String {
         } else {
             format!("docker.io/library/{rest}")
         }
-    } else if image.contains('/') {
-        image.to_string()
     } else {
-        format!("docker.io/library/{image}")
+        // Docker's reference-normalization rule for the component before the
+        // first `/`: it's a registry only if it looks like a host — contains a
+        // `.` or `:` (port), or is `localhost`. Otherwise it's a Docker Hub
+        // namespace and the ref is implicitly under docker.io. So a bare
+        // `traefik` → docker.io/library/traefik, a namespaced
+        // `hashicorp/http-echo` → docker.io/hashicorp/http-echo, while
+        // `quay.io/jetstack/x` and `localhost:5000/x` are left alone.
+        match image.split_once('/') {
+            Some((first, _))
+                if first.contains('.') || first.contains(':') || first == "localhost" =>
+            {
+                image.to_string()
+            }
+            Some(_) => format!("docker.io/{image}"),
+            None => format!("docker.io/library/{image}"),
+        }
     };
 
     if with_registry
@@ -378,11 +398,22 @@ fn build_oci_spec(
     ]
     .into_iter()
     .collect::<std::collections::HashSet<_>>();
+    // Ambient caps survive the switch to a non-root user. A container that
+    // sets runAsUser != 0 (e.g. ingress-nginx as uid 101) still needs e.g.
+    // NET_BIND_SERVICE to bind :80/:443, which only carries over if it's in
+    // the ambient set. For root, ambient is irrelevant.
+    let ambient: std::collections::HashSet<Capability> =
+        if config.run_as_user.unwrap_or(0) != 0 {
+            default_caps.clone()
+        } else {
+            Default::default()
+        };
     let capabilities = LinuxCapabilitiesBuilder::default()
         .bounding(default_caps.clone())
         .effective(default_caps.clone())
         .permitted(default_caps.clone())
         .inheritable(default_caps)
+        .ambient(ambient)
         .build()?;
 
     let hostname = config
@@ -400,15 +431,23 @@ fn build_oci_spec(
                 .readonly(false)
                 .build()?,
         )
-        .process(
-            ProcessBuilder::default()
+        .process({
+            let mut pb = ProcessBuilder::default()
                 .args(args)
                 .env(env)
                 .cwd(cwd)
                 .terminal(false)
-                .capabilities(capabilities)
-                .build()?,
-        )
+                .capabilities(capabilities);
+            if let Some(uid) = config.run_as_user {
+                pb = pb.user(
+                    UserBuilder::default()
+                        .uid(uid)
+                        .gid(config.run_as_group.unwrap_or(0))
+                        .build()?,
+                );
+            }
+            pb.build()?
+        })
         .mounts(mounts)
         .linux(
             LinuxBuilder::default()
@@ -744,5 +783,45 @@ impl ContainerRuntime for ContainerdRuntime {
             .process
             .ok_or_else(|| anyhow::anyhow!("no process info"))?;
         Ok(process.pid)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_image_ref;
+
+    #[test]
+    fn normalizes_image_refs() {
+        // Bare name -> docker.io/library + :latest
+        assert_eq!(normalize_image_ref("traefik"), "docker.io/library/traefik:latest");
+        assert_eq!(normalize_image_ref("ubuntu:22.04"), "docker.io/library/ubuntu:22.04");
+
+        // Docker Hub *namespaced* short ref (the ingress-nginx echo backend):
+        // `hashicorp` is a namespace, not a registry, so it lives under docker.io.
+        assert_eq!(
+            normalize_image_ref("hashicorp/http-echo:0.2.3"),
+            "docker.io/hashicorp/http-echo:0.2.3"
+        );
+
+        // Explicit registries (have a dot / port / localhost) are left alone.
+        assert_eq!(
+            normalize_image_ref("quay.io/jetstack/cert-manager-controller:v1.20.2"),
+            "quay.io/jetstack/cert-manager-controller:v1.20.2"
+        );
+        assert_eq!(
+            normalize_image_ref("registry.k8s.io/ingress-nginx/controller:v1.11.0"),
+            "registry.k8s.io/ingress-nginx/controller:v1.11.0"
+        );
+        assert_eq!(
+            normalize_image_ref("localhost:5000/my/app:dev"),
+            "localhost:5000/my/app:dev"
+        );
+
+        // Explicit docker.io prefix: official images get library/, others kept.
+        assert_eq!(normalize_image_ref("docker.io/redis:7"), "docker.io/library/redis:7");
+        assert_eq!(
+            normalize_image_ref("docker.io/bitnami/redis:7"),
+            "docker.io/bitnami/redis:7"
+        );
     }
 }

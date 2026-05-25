@@ -2,6 +2,7 @@ pub mod admission;
 pub mod auth;
 pub mod bootstrap;
 pub mod discovery;
+pub mod exec;
 pub mod handler;
 pub mod jsonpatch;
 pub mod openapi_v2;

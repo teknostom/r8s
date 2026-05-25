@@ -211,13 +211,19 @@ pub struct ApiServer {
 }
 
 impl ApiServer {
-    pub fn new(store: Store, registry: ResourceRegistry, data_dir: std::path::PathBuf) -> Self {
+    pub fn new(
+        store: Store,
+        registry: ResourceRegistry,
+        data_dir: std::path::PathBuf,
+        exec_runtime: Option<Arc<dyn r8s_runtime::ExecRuntime>>,
+    ) -> Self {
         Self {
             state: Arc::new(ApiState {
                 store,
                 registry,
                 data_dir,
                 next_cluster_ip: std::sync::atomic::AtomicU32::new(2),
+                exec_runtime,
             }),
         }
     }
@@ -312,7 +318,11 @@ impl ApiServer {
                 if rt.gvr.resource == "pods" {
                     let log_route =
                         format!("{base}/namespaces/{{ns}}/{}/{{name}}/log", rt.gvr.resource);
-                    router = router.route(&log_route, get(pod_logs_ns))
+                    router = router.route(&log_route, get(pod_logs_ns));
+                    // `kubectl exec` upgrades this GET to a WebSocket.
+                    let exec_route =
+                        format!("{base}/namespaces/{{ns}}/{}/{{name}}/exec", rt.gvr.resource);
+                    router = router.route(&exec_route, get(crate::exec::pod_exec));
                 }
             } else {
                 let collection = format!("{base}/{}", rt.gvr.resource);

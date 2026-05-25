@@ -20,7 +20,7 @@ pub struct Mount {
     pub readonly: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ContainerConfig {
     pub name: String,
     pub namespace: String,
@@ -30,12 +30,54 @@ pub struct ContainerConfig {
     pub env: Vec<(String, String)>,
     pub working_dir: Option<String>,
     pub mounts: Vec<Mount>,
+    /// `securityContext.runAsUser` — UID the container process runs as. `None`
+    /// means root (uid 0), the previous behavior.
+    pub run_as_user: Option<u32>,
+    /// `securityContext.runAsGroup` — GID the container process runs as.
+    pub run_as_group: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
 pub struct RegistryAuth {
     pub username: String,
     pub password: String,
+}
+
+// ─── Exec (`kubectl exec`) ──────────────────────────────────────────────────
+
+/// What to run inside an already-running container.
+#[derive(Debug, Clone)]
+pub struct ExecConfig {
+    pub container_id: ContainerId,
+    pub command: Vec<String>,
+    /// Allocate a PTY (`kubectl exec -t`). When set, stderr is merged into
+    /// stdout and `ExecStreams::stderr_rx` is `None`.
+    pub tty: bool,
+    /// Initial terminal size `(cols, rows)`, if known at start.
+    pub initial_size: Option<(u16, u16)>,
+}
+
+/// Bidirectional streams for a live exec session. The API server's WebSocket
+/// handler pumps these against the k8s channel protocol.
+pub struct ExecStreams {
+    /// Bytes written here are forwarded to the process's stdin.
+    pub stdin_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    pub stdout_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    /// `None` when `tty` is set (stderr is merged into stdout).
+    pub stderr_rx: Option<tokio::sync::mpsc::Receiver<Vec<u8>>>,
+    /// Terminal resize `(cols, rows)`; a no-op when `tty` is false.
+    pub resize_tx: tokio::sync::mpsc::Sender<(u16, u16)>,
+    /// Resolves with the process exit code once it terminates.
+    pub exit_rx: tokio::sync::oneshot::Receiver<i32>,
+}
+
+/// Runs a command inside a running container. Object-safe (boxed future) so the
+/// API server can hold it behind `Arc<dyn ExecRuntime>`.
+pub trait ExecRuntime: Send + Sync {
+    fn exec(
+        &self,
+        config: ExecConfig,
+    ) -> std::pin::Pin<Box<dyn Future<Output = anyhow::Result<ExecStreams>> + Send + '_>>;
 }
 
 pub trait ContainerRuntime: Send + Sync {

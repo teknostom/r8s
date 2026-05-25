@@ -179,6 +179,7 @@ impl TestCluster {
             self.store.clone(),
             self.registry.clone(),
             self._temp_dir.path().to_path_buf(),
+            None,
         )
         .into_router()
     }

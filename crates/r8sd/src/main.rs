@@ -78,6 +78,9 @@ async fn main() -> anyhow::Result<()> {
         run_service_proxy(store.clone(), shutdown.clone()),
     );
 
+    // Exec backend for the API server's `kubectl exec` endpoint. Only the
+    // containerd runtime supports it; under mock it stays None.
+    let mut exec_handle: Option<Arc<dyn r8s_runtime::ExecRuntime>> = None;
     let runtime_type = std::env::var("R8S_RUNTIME").unwrap_or_else(|_| "containerd".to_string());
     match runtime_type.as_str() {
         "mock" => {
@@ -100,6 +103,7 @@ async fn main() -> anyhow::Result<()> {
             }
             tracing::info!(socket, "using containerd runtime");
             let runtime = Arc::new(ContainerdRuntime::new(&socket, data_dir.clone()).await?);
+            exec_handle = Some(Arc::new(runtime.exec_handle()));
             spawn(
                 &mut tasks,
                 "kubelet",
@@ -108,7 +112,7 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    let api_server = ApiServer::new(store, registry, data_dir);
+    let api_server = ApiServer::new(store, registry, data_dir, exec_handle);
     let addr: SocketAddr = "0.0.0.0:6443".parse()?;
     let cert_pem = certs.server_cert_pem.clone().into_bytes();
     let key_pem = certs.server_key_pem.clone().into_bytes();

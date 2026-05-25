@@ -318,10 +318,16 @@ async fn pump(
         frame.push(CHAN_ERROR);
         frame.extend_from_slice(&body);
         let _ = close_tx.send(Message::Binary(frame.into())).await;
-        // Tell the client the session is over. Without this, kubectl waits
-        // forever for more frames — sending Close gives it a clean shutdown
-        // signal, after which our ws_rx loop sees Close and exits too.
-        let _ = close_tx.send(Message::Close(None)).await;
+        // Tell the client the session is over with a *normal* (1000) close.
+        // `Close(None)` sends no status code, which kubectl's stream readers
+        // surface as `websocket: close 1005 (no status)` errors even on a
+        // clean exit. An explicit 1000 closes the streams cleanly.
+        let _ = close_tx
+            .send(Message::Close(Some(axum::extract::ws::CloseFrame {
+                code: 1000,
+                reason: "".into(),
+            })))
+            .await;
         // Dropping close_tx (and the original out_tx above) will let out_rx
         // close, ending the writer_task.
     });

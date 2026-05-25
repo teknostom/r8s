@@ -180,6 +180,13 @@ impl FieldSelector {
         let mut requirements = Vec::new();
         for part in s.split(',') {
             let part = part.trim();
+            // Tolerate empty terms, e.g. the leading comma in
+            // `,type!=helm.sh/release.v1` that client-go emits when it joins an
+            // empty selector with a real one (ingress-nginx's Secret informer
+            // does exactly this). Upstream ignores empty terms rather than 400.
+            if part.is_empty() {
+                continue;
+            }
             if let Some((key, value)) = part.split_once("!=") {
                 requirements.push(FieldRequirement::NotEquals(key.into(), value.into()));
             } else if let Some((key, value)) = part.split_once('=') {
@@ -275,5 +282,42 @@ impl LabelIndex {
         }
 
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn field_selector_tolerates_leading_comma() {
+        // ingress-nginx's Secret informer sends `,type!=helm.sh/release.v1`
+        // (client-go joins an empty selector with a real one). Must parse.
+        let sel = FieldSelector::parse(",type!=helm.sh/release.v1").expect("should parse");
+        let helm = serde_json::json!({ "type": "helm.sh/release.v1" });
+        let tls = serde_json::json!({ "type": "kubernetes.io/tls" });
+        // Helm release secret excluded; TLS secret kept.
+        assert!(!sel.matches(&helm, "/v1/secrets"));
+        assert!(sel.matches(&tls, "/v1/secrets"));
+    }
+
+    #[test]
+    fn field_selector_equals_matches() {
+        let sel = FieldSelector::parse("metadata.name=foo").expect("should parse");
+        assert!(sel.matches(&serde_json::json!({ "metadata": { "name": "foo" } }), "/v1/pods"));
+        assert!(!sel.matches(&serde_json::json!({ "metadata": { "name": "bar" } }), "/v1/pods"));
+    }
+
+    #[test]
+    fn field_selector_rejects_term_without_operator() {
+        assert!(FieldSelector::parse("garbage").is_err());
+    }
+
+    #[test]
+    fn field_selector_empty_is_ok() {
+        assert!(FieldSelector::parse("").expect("empty ok").matches(
+            &serde_json::json!({ "type": "anything" }),
+            "/v1/secrets"
+        ));
     }
 }

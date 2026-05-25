@@ -437,6 +437,36 @@ fn maybe_allocate_cluster_ip(state: &AppState, ctx: &RouteContext, body: &mut se
     }
 }
 
+/// Default ServicePort fields the apiserver fills in but clients commonly
+/// omit: `protocol` → `TCP`, and `targetPort` → the `port` value. The protocol
+/// default in particular matters because controllers match a Service's ports
+/// to its EndpointSlice ports *by protocol* (ingress-nginx does
+/// `*epPort.Protocol == servicePort.Protocol`); an absent protocol reads as ""
+/// on the Service but `TCP` on the slice, so no endpoint matches and the
+/// controller serves 503.
+fn default_service_ports(ctx: &RouteContext, body: &mut serde_json::Value) {
+    if ctx.resource_type.gvr.resource != "services" {
+        return;
+    }
+    if let Some(ports) = body
+        .get_mut("spec")
+        .and_then(|s| s.get_mut("ports"))
+        .and_then(|p| p.as_array_mut())
+    {
+        for port in ports.iter_mut() {
+            if let Some(obj) = port.as_object_mut() {
+                obj.entry("protocol")
+                    .or_insert_with(|| serde_json::json!("TCP"));
+                if !obj.contains_key("targetPort")
+                    && let Some(p) = obj.get("port").cloned()
+                {
+                    obj.insert("targetPort".to_string(), p);
+                }
+            }
+        }
+    }
+}
+
 /// For CRDs, validate the incoming object against the CRD's openAPIV3Schema.
 /// Skipped for built-in resources (their vendored schemas are very strict and
 /// we don't currently want to reject otherwise-valid input there).
@@ -505,6 +535,7 @@ pub(crate) async fn create_impl(
     }
 
     maybe_allocate_cluster_ip(state, ctx, &mut body);
+    default_service_ports(ctx, &mut body);
     if ctx.resource_type.gvr.resource == "pods" {
         r8s_controllers::pod_admission::inject_sa_token(&state.store, &mut body);
     }
@@ -1324,6 +1355,7 @@ pub(crate) async fn patch_impl(
                 obj.insert("metadata".to_string(), serde_json::Value::Object(meta));
             }
             maybe_allocate_cluster_ip(state, ctx, &mut body);
+    default_service_ports(ctx, &mut body);
             let admission_ctx = AdmissionCtx {
                 store: &state.store,
                 gvr: &ctx.resource_type.gvr,

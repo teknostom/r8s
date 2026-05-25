@@ -478,6 +478,22 @@ async fn start_containers<R: ContainerRuntime>(
             .map(|s| expand_vars(s, &env))
             .collect();
 
+        // securityContext.runAsUser/runAsGroup: container-level wins, else the
+        // pod-level default. Without honoring these r8s runs everything as
+        // root, which breaks images that expect to run as a fixed UID (e.g.
+        // ingress-nginx as 101, whose nginx workers then can't read files the
+        // root-run controller wrote).
+        let csc = container_spec.security_context.as_ref();
+        let psc = spec.security_context.as_ref();
+        let run_as_user = csc
+            .and_then(|c| c.run_as_user)
+            .or_else(|| psc.and_then(|p| p.run_as_user))
+            .map(|u| u as u32);
+        let run_as_group = csc
+            .and_then(|c| c.run_as_group)
+            .or_else(|| psc.and_then(|p| p.run_as_group))
+            .map(|g| g as u32);
+
         let config = ContainerConfig {
             name: format!("{pod_name}_{container_name}"),
             namespace: pod_ns.unwrap_or("default").to_string(),
@@ -487,6 +503,8 @@ async fn start_containers<R: ContainerRuntime>(
             env,
             working_dir: container_spec.working_dir.clone(),
             mounts,
+            run_as_user,
+            run_as_group,
         };
 
         let container_id = match runtime.create_container(&config).await {
