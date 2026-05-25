@@ -14,8 +14,8 @@ use std::time::Duration;
 
 use containerd_client::{
     services::v1::{
-        DeleteProcessRequest, ExecProcessRequest, ResizePtyRequest, StartRequest, WaitRequest,
-        tasks_client::TasksClient,
+        DeleteProcessRequest, ExecProcessRequest, GetContainerRequest, ResizePtyRequest,
+        StartRequest, WaitRequest, containers_client::ContainersClient, tasks_client::TasksClient,
     },
     tonic::{Request, transport::Channel},
     with_namespace,
@@ -115,11 +115,10 @@ async fn start_exec(
 
     // Minimal OCI Process spec for exec — namespaces are inherited from the
     // container's existing task. We do NOT set capabilities (containerd's shim
-    // inherits the container's set when the exec spec omits them).
-    let mut env = vec![
-        "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string(),
-        "HOME=/root".to_string(),
-    ];
+    // inherits the container's set when the exec spec omits them). The env is
+    // pulled from the container's own spec so exec'd processes (incl. probes)
+    // resolve binaries against the same PATH as the container's main process.
+    let mut env = fetch_container_env(channel.clone(), &config.container_id.0).await;
     if config.tty {
         env.push("TERM=xterm-256color".to_string());
     }
@@ -285,6 +284,45 @@ async fn start_exec(
         resize_tx,
         exit_rx,
     })
+}
+
+/// Read the container's environment (notably `PATH`) out of its stored OCI
+/// runtime spec so exec'd processes resolve binaries the way the container's
+/// main process does. Falls back to a minimal PATH if the lookup fails.
+async fn fetch_container_env(channel: Channel, container_id: &str) -> Vec<String> {
+    let fallback = || {
+        vec![
+            "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string(),
+            "HOME=/root".to_string(),
+        ]
+    };
+
+    let req = GetContainerRequest {
+        id: container_id.to_string(),
+    };
+    let spec = match ContainersClient::new(channel)
+        .get(with_namespace!(req, NAMESPACE))
+        .await
+    {
+        Ok(resp) => resp.into_inner().container.and_then(|c| c.spec),
+        Err(_) => None,
+    };
+    let Some(spec) = spec else {
+        return fallback();
+    };
+    let env: Vec<String> = serde_json::from_slice::<serde_json::Value>(&spec.value)
+        .ok()
+        .as_ref()
+        .and_then(|v| v.get("process").and_then(|p| p.get("env")))
+        .and_then(|e| e.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if env.is_empty() { fallback() } else { env }
 }
 
 fn spawn_pipe_reader(path: std::path::PathBuf, tx: mpsc::Sender<Vec<u8>>) {

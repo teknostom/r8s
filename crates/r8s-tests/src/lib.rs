@@ -35,6 +35,7 @@ impl TestCluster {
         let store = Store::open(&dir.path().join("test.db")).expect("failed to open store");
 
         r8s_api::bootstrap::bootstrap_namespaces(&store).expect("bootstrap failed");
+        r8s_api::bootstrap::bootstrap_storage_class(&store).expect("bootstrap failed");
 
         let shutdown = CancellationToken::new();
         let registry = ResourceRegistry::default_mvp();
@@ -44,6 +45,7 @@ impl TestCluster {
             shutdown.clone(),
             registry.clone(),
             String::new(),
+            dir.path().to_path_buf(),
         );
         controller_manager.start();
 

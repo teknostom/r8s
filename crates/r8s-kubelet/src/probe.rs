@@ -1,6 +1,7 @@
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
+use r8s_runtime::{ContainerId, ContainerRuntime};
 use r8s_types::{ContainerPort, IntOrString, Probe};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
@@ -26,7 +27,13 @@ fn resolve_port(ios: &IntOrString, ports: &[ContainerPort]) -> i32 {
 }
 
 /// Execute a probe against a container. Returns true if the probe succeeds.
-pub async fn exec_probe(probe: &Probe, pod_ip: &str, _pid: u32, ports: &[ContainerPort]) -> bool {
+pub async fn exec_probe<R: ContainerRuntime>(
+    probe: &Probe,
+    pod_ip: &str,
+    runtime: &R,
+    container_id: &ContainerId,
+    ports: &[ContainerPort],
+) -> bool {
     let timeout = Duration::from_secs(probe.timeout_seconds.unwrap_or(1) as u64);
 
     if let Some(http) = &probe.http_get {
@@ -50,7 +57,14 @@ pub async fn exec_probe(probe: &Probe, pod_ip: &str, _pid: u32, ports: &[Contain
     if let Some(exec_action) = &probe.exec
         && let Some(command) = &exec_action.command
     {
-        return exec_command_probe(_pid, command, timeout).await;
+        // Run inside the container (via the runtime's exec), not a host-side
+        // nsenter: the command resolves against the container's PATH and runs
+        // in its network namespace, so checks like `pg_isready -h 127.0.0.1`
+        // reach the container's own server.
+        return matches!(
+            runtime.exec_sync(container_id, command, timeout).await,
+            Ok(0)
+        );
     }
 
     // No probe handler configured — treat as success
@@ -174,29 +188,3 @@ async fn tcp_probe(host: &str, port: i32, timeout: Duration) -> bool {
         .is_ok_and(|r| r.is_ok())
 }
 
-async fn exec_command_probe(pid: u32, command: &[String], timeout: Duration) -> bool {
-    if command.is_empty() {
-        return false;
-    }
-
-    let result = tokio::time::timeout(timeout, async {
-        let mut args = vec![
-            "-t".to_string(),
-            pid.to_string(),
-            "-m".to_string(),
-            "-p".to_string(),
-            "--".to_string(),
-        ];
-        args.extend(command.iter().cloned());
-
-        tokio::process::Command::new("nsenter")
-            .args(&args)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .await
-    })
-    .await;
-
-    matches!(result, Ok(Ok(status)) if status.success())
-}

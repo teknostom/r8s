@@ -124,4 +124,15 @@ impl ContainerRuntime for MockRuntime {
     async fn container_pid(&self, _id: &ContainerId) -> anyhow::Result<u32> {
         anyhow::bail!("mock runtime has no container PIDs")
     }
+
+    async fn exec_sync(
+        &self,
+        _id: &ContainerId,
+        _command: &[String],
+        _timeout: Duration,
+    ) -> anyhow::Result<i32> {
+        // Mock has no real process to exec into; treat probes as passing so
+        // probe-bearing pods reach Ready in in-process tests.
+        Ok(0)
+    }
 }

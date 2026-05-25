@@ -412,9 +412,10 @@ impl ResourceRegistry {
                 "csinode",
                 &[],
             ),
-            // Used by ResourceQuota (counts are reported) — accepted and
-            // stored, but no controller behaviour yet (no PVC binding, no
-            // RC reconciliation). Sufficient for conformance count tests.
+            // Storage: PVCs are dynamically provisioned by the local
+            // provisioner controller, which binds each to a hostPath-backed
+            // PV under the cluster data dir. StorageClass is cluster-scoped;
+            // the default ("standard") is bootstrapped at boot.
             (
                 "",
                 "v1",
@@ -423,6 +424,24 @@ impl ResourceRegistry {
                 true,
                 "persistentvolumeclaim",
                 &["pvc"],
+            ),
+            (
+                "",
+                "v1",
+                "persistentvolumes",
+                "PersistentVolume",
+                false,
+                "persistentvolume",
+                &["pv"],
+            ),
+            (
+                "storage.k8s.io",
+                "v1",
+                "storageclasses",
+                "StorageClass",
+                false,
+                "storageclass",
+                &["sc"],
             ),
             (
                 "",

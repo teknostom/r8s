@@ -137,6 +137,35 @@ pub fn bootstrap_namespaces(store: &Store) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The default StorageClass. PVCs that omit `storageClassName` bind through
+/// this class; the local provisioner controller honors its provisioner name.
+pub fn bootstrap_storage_class(store: &Store) -> anyhow::Result<()> {
+    let gvr = GroupVersionResource::storage_classes();
+    let rref = ResourceRef {
+        gvr: &gvr,
+        namespace: None,
+        name: "standard",
+    };
+    if store.get(&rref)?.is_none() {
+        let sc = serde_json::json!({
+            "apiVersion": "storage.k8s.io/v1",
+            "kind": "StorageClass",
+            "metadata": {
+                "name": "standard",
+                "annotations": {
+                    "storageclass.kubernetes.io/is-default-class": "true",
+                },
+            },
+            "provisioner": "r8s.dev/local",
+            "reclaimPolicy": "Delete",
+            "volumeBindingMode": "Immediate",
+        });
+        store.create(rref, &sc)?;
+        tracing::info!("bootstrapped 'standard' StorageClass");
+    }
+    Ok(())
+}
+
 pub fn bootstrap_ingress_class(store: &Store) -> anyhow::Result<()> {
     let gvr = GroupVersionResource::ingress_classes();
     let rref = ResourceRef {

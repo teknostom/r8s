@@ -1,6 +1,7 @@
 use r8s_store::{Store, backend::ResourceRef, watch::WatchEventType};
 use r8s_types::{
-    GroupVersionResource, ObjectMeta, OwnerReference, Pod, PodTemplateSpec, StatefulSetStatus,
+    GroupVersionResource, ObjectMeta, OwnerReference, PersistentVolumeClaim,
+    PersistentVolumeClaimVolumeSource, Pod, PodTemplateSpec, StatefulSetStatus, Volume,
 };
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
@@ -105,6 +106,10 @@ fn reconcile_sts(store: &Store, sts_value: &serde_json::Value) -> anyhow::Result
 
     let desired = current_spec.replicas.unwrap_or(1) as u64;
     let template = &current_spec.template;
+    let vcts = current_spec
+        .volume_claim_templates
+        .as_deref()
+        .unwrap_or_default();
 
     let pod_gvr = GroupVersionResource::pods();
     let mut owned: Vec<Pod> = store
@@ -123,7 +128,7 @@ fn reconcile_sts(store: &Store, sts_value: &serde_json::Value) -> anyhow::Result
         let mut ordinal = 0u64;
         while created < desired - current_count {
             if !existing_ordinals.contains(&ordinal) {
-                create_pod(store, sts_name, current_uid, sts_ns, template, ordinal)?;
+                create_pod(store, sts_name, current_uid, sts_ns, template, vcts, ordinal)?;
                 created += 1;
             }
             ordinal += 1;
@@ -150,17 +155,21 @@ fn reconcile_sts(store: &Store, sts_value: &serde_json::Value) -> anyhow::Result
         .filter(|p| is_owned_by(&p.metadata, current_uid))
         .collect();
     let total = final_owned.len() as i32;
-    let ready = final_owned
-        .iter()
-        .filter(|p| {
-            p.status
-                .as_ref()
-                .is_some_and(|s| s.phase.as_deref() == Some("Running"))
-        })
-        .count() as i32;
-    update_sts_status(store, sts_name, sts_ns, total, ready)?;
+    let ready = final_owned.iter().filter(|p| pod_ready(p)).count() as i32;
+    update_sts_status(store, sts_name, sts_ns, total, ready, current.metadata.generation)?;
 
     Ok(())
+}
+
+/// A pod counts as ready only when its `Ready` condition is `True` — not merely
+/// when its phase is `Running`. A crash-looping container is `Running`/`0/1`,
+/// and counting it as ready makes `kubectl get sts` lie and lets `helm --wait`
+/// believe a broken rollout succeeded.
+fn pod_ready(pod: &Pod) -> bool {
+    pod.status
+        .as_ref()
+        .and_then(|s| s.conditions.as_ref())
+        .is_some_and(|cs| cs.iter().any(|c| c.type_ == "Ready" && c.status == "True"))
 }
 
 fn pod_ordinal(pod: &Pod) -> u64 {
@@ -178,6 +187,7 @@ fn create_pod(
     sts_uid: &str,
     namespace: Option<&str>,
     template: &PodTemplateSpec,
+    volume_claim_templates: &[PersistentVolumeClaim],
     ordinal: u64,
 ) -> anyhow::Result<()> {
     let pod_name = format!("{sts_name}-{ordinal}");
@@ -190,6 +200,32 @@ fn create_pod(
         "statefulset.kubernetes.io/pod-name".into(),
         pod_name.clone(),
     );
+
+    // Each volumeClaimTemplate gets a per-ordinal PVC (`<tmpl>-<sts>-<ordinal>`)
+    // and a matching `persistentVolumeClaim` volume injected into the pod. The
+    // PVCs are intentionally *not* owned by the StatefulSet, so they (and their
+    // data) outlive pod deletion — that's what makes the data stable.
+    let mut spec = template.spec.clone();
+    for vct in volume_claim_templates {
+        let Some(tmpl_name) = vct.metadata.name.as_deref() else {
+            continue;
+        };
+        let pvc_name = format!("{tmpl_name}-{sts_name}-{ordinal}");
+        ensure_pvc(store, namespace, &pvc_name, vct)?;
+        if let Some(spec) = spec.as_mut() {
+            let vols = spec.volumes.get_or_insert_with(Vec::new);
+            if !vols.iter().any(|v| v.name == tmpl_name) {
+                vols.push(Volume {
+                    name: tmpl_name.to_string(),
+                    persistent_volume_claim: Some(PersistentVolumeClaimVolumeSource {
+                        claim_name: pvc_name.clone(),
+                        read_only: None,
+                    }),
+                    ..Default::default()
+                });
+            }
+        }
+    }
 
     let pod = Pod {
         metadata: ObjectMeta {
@@ -206,7 +242,7 @@ fn create_pod(
             }]),
             ..Default::default()
         },
-        spec: template.spec.clone(),
+        spec,
         status: None,
     };
 
@@ -222,12 +258,48 @@ fn create_pod(
     Ok(())
 }
 
+/// Create a PVC from a volumeClaimTemplate if it doesn't already exist.
+/// Idempotent: on pod recreation the PVC is found and reused, preserving data.
+fn ensure_pvc(
+    store: &Store,
+    namespace: Option<&str>,
+    pvc_name: &str,
+    template: &PersistentVolumeClaim,
+) -> anyhow::Result<()> {
+    let gvr = GroupVersionResource::persistent_volume_claims();
+    let resource_ref = ResourceRef {
+        gvr: &gvr,
+        namespace,
+        name: pvc_name,
+    };
+    if store.get(&resource_ref)?.is_some() {
+        return Ok(());
+    }
+
+    let mut pvc = template.clone();
+    pvc.metadata.name = Some(pvc_name.to_string());
+    pvc.metadata.namespace = namespace.map(String::from);
+    pvc.metadata.uid = None;
+    pvc.metadata.resource_version = None;
+    pvc.status = None;
+
+    let mut value = serde_json::to_value(&pvc)?;
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert("apiVersion".into(), serde_json::json!("v1"));
+        obj.insert("kind".into(), serde_json::json!("PersistentVolumeClaim"));
+    }
+    store.create(resource_ref, &value)?;
+    tracing::info!("sts pvc '{pvc_name}' created");
+    Ok(())
+}
+
 fn update_sts_status(
     store: &Store,
     sts_name: &str,
     sts_ns: Option<&str>,
     total: i32,
     ready: i32,
+    generation: Option<i64>,
 ) -> anyhow::Result<()> {
     let gvr = GroupVersionResource::stateful_sets();
     let resource_ref = ResourceRef {
@@ -241,10 +313,18 @@ fn update_sts_status(
         None => return Ok(()),
     };
 
+    // `helm --wait` (and kstatus) gate StatefulSet readiness on more than
+    // readyReplicas: observedGeneration must be set and >= generation, and
+    // under the default RollingUpdate strategy updatedReplicas must reach the
+    // replica count. r8s doesn't track revisions, so currentRevision/
+    // updateRevision are left equal (both unset) to clear the rollout check.
     let new_status = StatefulSetStatus {
         replicas: total,
         ready_replicas: Some(ready),
         available_replicas: Some(ready),
+        current_replicas: Some(total),
+        updated_replicas: Some(total),
+        observed_generation: Some(generation.unwrap_or(0).max(1)),
         ..Default::default()
     };
     let new_status_val = serde_json::to_value(&new_status)?;

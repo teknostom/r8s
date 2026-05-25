@@ -5,6 +5,7 @@ use r8s_api::{
     ApiServer,
     bootstrap::{
         bootstrap_apiserver_authentication, bootstrap_ingress_class, bootstrap_namespaces,
+        bootstrap_storage_class,
     },
 };
 use r8s_controllers::ControllerManager;
@@ -38,6 +39,7 @@ async fn main() -> anyhow::Result<()> {
 
     bootstrap_namespaces(&store)?;
     bootstrap_ingress_class(&store)?;
+    bootstrap_storage_class(&store)?;
 
     let certs = r8s_controllers::certs::ensure_cluster_certs(&data_dir)?;
     bootstrap_apiserver_authentication(&store, &certs.ca_pem)?;
@@ -52,6 +54,7 @@ async fn main() -> anyhow::Result<()> {
         shutdown.clone(),
         registry.clone(),
         certs.ca_pem.clone(),
+        data_dir.clone(),
     );
     controller_manager.start();
 

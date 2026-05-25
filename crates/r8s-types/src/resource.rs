@@ -50,6 +50,15 @@ impl GroupVersionResource {
     pub fn pod_templates() -> Self {
         Self::new("", "v1", "podtemplates")
     }
+    pub fn persistent_volumes() -> Self {
+        Self::new("", "v1", "persistentvolumes")
+    }
+    pub fn persistent_volume_claims() -> Self {
+        Self::new("", "v1", "persistentvolumeclaims")
+    }
+    pub fn storage_classes() -> Self {
+        Self::new("storage.k8s.io", "v1", "storageclasses")
+    }
 
     pub fn deployments() -> Self {
         Self::new("apps", "v1", "deployments")

@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use r8s_store::Store;
 use r8s_types::registry::ResourceRegistry;
 use tokio::task::JoinHandle;
@@ -8,6 +10,7 @@ pub struct ControllerManager {
     shutdown: CancellationToken,
     registry: ResourceRegistry,
     ca_pem: String,
+    data_dir: PathBuf,
     handles: Vec<JoinHandle<()>>,
 }
 
@@ -17,12 +20,14 @@ impl ControllerManager {
         shutdown: CancellationToken,
         registry: ResourceRegistry,
         ca_pem: String,
+        data_dir: PathBuf,
     ) -> Self {
         Self {
             store,
             shutdown,
             registry,
             ca_pem,
+            data_dir,
             handles: Vec::new(),
         }
     }
@@ -65,6 +70,18 @@ impl ControllerManager {
         spawn_controller!("job", super::job::run);
         spawn_controller!("cronjob", super::cronjob::run);
         spawn_controller!("quota", super::quota::run);
+
+        // Provisioner needs the data dir to carve out hostPath-backed PVs.
+        {
+            let store = self.store.clone();
+            let token = self.shutdown.clone();
+            let data_dir = self.data_dir.clone();
+            self.handles.push(tokio::spawn(async move {
+                if let Err(e) = super::provisioner::run(store, token, data_dir).await {
+                    tracing::error!("provisioner controller error: {e}");
+                }
+            }));
+        }
 
         // CRD controller needs the registry
         {

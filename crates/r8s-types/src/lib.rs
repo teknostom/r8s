@@ -13,10 +13,10 @@ pub use k8s_openapi::api::core::v1::{
     DaemonEndpoint, EmptyDirVolumeSource, EndpointAddress, EndpointPort, EndpointSubset, Endpoints,
     EnvVar, EnvVarSource, ExecAction, HTTPGetAction, HostPathVolumeSource, LocalObjectReference,
     Namespace, NamespaceStatus, Node, NodeAddress, NodeCondition, NodeDaemonEndpoints, NodeSpec,
-    NodeStatus, NodeSystemInfo, ObjectReference,
-    Pod, PodCondition, PodIP, PodSpec, PodStatus, PodTemplateSpec, Probe, Secret,
-    SecretVolumeSource, Service, ServiceAccount, ServicePort, ServiceSpec, TCPSocketAction, Volume,
-    VolumeMount,
+    NodeStatus, NodeSystemInfo, ObjectReference, PersistentVolume, PersistentVolumeClaim,
+    PersistentVolumeClaimVolumeSource, Pod, PodCondition, PodIP, PodSpec, PodStatus,
+    PodTemplateSpec, Probe, Secret, SecretVolumeSource, Service, ServiceAccount, ServicePort,
+    ServiceSpec, TCPSocketAction, Volume, VolumeMount,
 };
 
 pub use k8s_openapi::apimachinery::pkg::api::resource::Quantity;

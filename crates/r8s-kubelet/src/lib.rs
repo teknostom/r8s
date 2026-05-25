@@ -1116,11 +1116,8 @@ async fn run_probes<R: ContainerRuntime>(
         };
         let pod_ip = format!("10.244.0.{}", tracked.ip_num);
 
-        let pid = match tracked.container_ids.first() {
-            Some(cid) => match runtime.container_pid(cid).await {
-                Ok(p) => p,
-                Err(_) => continue,
-            },
+        let cid = match tracked.container_ids.first().cloned() {
+            Some(cid) => cid,
             None => continue,
         };
 
@@ -1142,7 +1139,7 @@ async fn run_probes<R: ContainerRuntime>(
             let failure_threshold = probe_spec.failure_threshold.unwrap_or(3);
             if now.duration_since(probe_state.last_check) >= period {
                 probe_state.last_check = now;
-                let ok = probe::exec_probe(probe_spec, &pod_ip, pid, ports).await;
+                let ok = probe::exec_probe(probe_spec, &pod_ip, runtime, &cid, ports).await;
                 if ok {
                     tracing::info!("pod '{}': startup probe succeeded", tracked.name);
                     startup_successes.push(pod_uid.clone());
@@ -1173,7 +1170,7 @@ async fn run_probes<R: ContainerRuntime>(
             let failure_threshold = probe_spec.failure_threshold.unwrap_or(3);
             if now.duration_since(probe_state.last_check) >= period {
                 probe_state.last_check = now;
-                let ok = probe::exec_probe(probe_spec, &pod_ip, pid, ports).await;
+                let ok = probe::exec_probe(probe_spec, &pod_ip, runtime, &cid, ports).await;
                 if ok {
                     probe_state.consecutive_failures = 0;
                 } else {
@@ -1202,7 +1199,7 @@ async fn run_probes<R: ContainerRuntime>(
             let failure_threshold = probe_spec.failure_threshold.unwrap_or(3);
             if now.duration_since(probe_state.last_check) >= period {
                 probe_state.last_check = now;
-                let ok = probe::exec_probe(probe_spec, &pod_ip, pid, ports).await;
+                let ok = probe::exec_probe(probe_spec, &pod_ip, runtime, &cid, ports).await;
                 if ok {
                     probe_state.consecutive_failures = 0;
                     if !tracked.ready {
@@ -1415,6 +1412,12 @@ fn prepare_volumes(
             let secret_name = secret_src.secret_name.as_deref().unwrap_or_default();
             project_secret(store, pod_ns, secret_name, &dir)?;
             dir.to_string_lossy().to_string()
+        } else if let Some(pvc_src) = &vol.persistent_volume_claim {
+            // Resolve PVC -> bound PV -> hostPath. An unbound claim or missing
+            // PV is a hard error (not a silent skip): prepare_volumes fails, the
+            // pod isn't started this pass, and the kubelet retries on its next
+            // health tick once the provisioner has bound the claim.
+            resolve_pvc_host_path(store, pod_ns, &pvc_src.claim_name)?
         } else {
             tracing::warn!("volume '{}': unsupported volume source, skipping", vol.name);
             continue;
@@ -1424,6 +1427,46 @@ fn prepare_volumes(
     }
 
     Ok(paths)
+}
+
+/// Resolve a `persistentVolumeClaim` volume source to a host directory by
+/// following PVC -> `spec.volumeName` -> PV -> `spec.hostPath.path`. Errors if
+/// the claim is missing, not yet bound, or its PV has no hostPath.
+fn resolve_pvc_host_path(
+    store: &Store,
+    namespace: Option<&str>,
+    claim_name: &str,
+) -> anyhow::Result<String> {
+    let pvc_gvr = GroupVersionResource::persistent_volume_claims();
+    let pvc = store
+        .get(&ResourceRef {
+            gvr: &pvc_gvr,
+            namespace,
+            name: claim_name,
+        })?
+        .ok_or_else(|| anyhow::anyhow!("persistentVolumeClaim '{claim_name}' not found"))?;
+
+    let volume_name = pvc
+        .pointer("/spec/volumeName")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("pvc '{claim_name}' is not bound yet"))?;
+
+    let pv_gvr = GroupVersionResource::persistent_volumes();
+    let pv = store
+        .get(&ResourceRef {
+            gvr: &pv_gvr,
+            namespace: None,
+            name: volume_name,
+        })?
+        .ok_or_else(|| anyhow::anyhow!("persistentVolume '{volume_name}' not found"))?;
+
+    let path = pv
+        .pointer("/spec/hostPath/path")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("pv '{volume_name}' has no hostPath"))?;
+    std::fs::create_dir_all(path)?;
+    Ok(path.to_string())
 }
 
 fn project_configmap(

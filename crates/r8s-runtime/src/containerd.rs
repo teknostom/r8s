@@ -784,6 +784,40 @@ impl ContainerRuntime for ContainerdRuntime {
             .ok_or_else(|| anyhow::anyhow!("no process info"))?;
         Ok(process.pid)
     }
+
+    async fn exec_sync(
+        &self,
+        id: &ContainerId,
+        command: &[String],
+        timeout: std::time::Duration,
+    ) -> anyhow::Result<i32> {
+        use crate::traits::{ExecConfig, ExecRuntime};
+
+        let streams = self
+            .exec_handle()
+            .exec(ExecConfig {
+                container_id: id.clone(),
+                command: command.to_vec(),
+                tty: false,
+                initial_size: None,
+            })
+            .await?;
+
+        // Drain stdout/stderr so the FIFO pump tasks never block on a full
+        // channel (probe output is tiny, but a blocked pump can wedge the
+        // exec'd process before it exits).
+        let mut stdout_rx = streams.stdout_rx;
+        tokio::spawn(async move { while stdout_rx.recv().await.is_some() {} });
+        if let Some(mut stderr_rx) = streams.stderr_rx {
+            tokio::spawn(async move { while stderr_rx.recv().await.is_some() {} });
+        }
+
+        match tokio::time::timeout(timeout, streams.exit_rx).await {
+            Ok(Ok(code)) => Ok(code),
+            Ok(Err(_)) => anyhow::bail!("exec wait channel closed"),
+            Err(_) => anyhow::bail!("exec '{}' timed out", id.0),
+        }
+    }
 }
 
 #[cfg(test)]

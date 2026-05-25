@@ -119,4 +119,16 @@ pub trait ContainerRuntime: Send + Sync {
     ) -> impl Future<Output = anyhow::Result<ContainerStatus>> + Send;
 
     fn container_pid(&self, id: &ContainerId) -> impl Future<Output = anyhow::Result<u32>> + Send;
+
+    /// Run a command inside a running container and return its exit code. Used
+    /// by exec-style probes. Unlike a host-side `nsenter`, this runs with the
+    /// container's real environment and all of its namespaces — so PATH-relative
+    /// binaries (`pg_isready`) and loopback-bound checks behave exactly as they
+    /// do for a process inside the container.
+    fn exec_sync(
+        &self,
+        id: &ContainerId,
+        command: &[String],
+        timeout: Duration,
+    ) -> impl Future<Output = anyhow::Result<i32>> + Send;
 }

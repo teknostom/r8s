@@ -10,6 +10,7 @@ pub mod job;
 pub mod manager;
 pub mod namespace;
 pub mod pod_admission;
+pub mod provisioner;
 pub mod quantity;
 pub mod quota;
 pub mod replicaset;

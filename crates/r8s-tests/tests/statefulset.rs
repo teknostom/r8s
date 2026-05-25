@@ -88,6 +88,100 @@ async fn statefulset_scale_down() {
 }
 
 #[tokio::test]
+async fn statefulset_volume_claim_template() {
+    let cluster = TestCluster::start().await;
+    let gvr = GroupVersionResource::stateful_sets();
+    let pod_gvr = GroupVersionResource::pods();
+    let pvc_gvr = GroupVersionResource::persistent_volume_claims();
+    let pv_gvr = GroupVersionResource::persistent_volumes();
+
+    let sts = serde_json::json!({
+        "apiVersion": "apps/v1",
+        "kind": "StatefulSet",
+        "metadata": { "name": "db", "namespace": "default" },
+        "spec": {
+            "replicas": 1,
+            "serviceName": "db",
+            "selector": { "matchLabels": { "app": "db" } },
+            "template": {
+                "metadata": { "labels": { "app": "db" } },
+                "spec": { "containers": [ {
+                    "name": "app",
+                    "image": "nginx:latest",
+                    "volumeMounts": [ { "name": "data", "mountPath": "/data" } ]
+                } ] }
+            },
+            "volumeClaimTemplates": [ {
+                "metadata": { "name": "data" },
+                "spec": {
+                    "accessModes": ["ReadWriteOnce"],
+                    "resources": { "requests": { "storage": "1Gi" } }
+                }
+            } ]
+        }
+    });
+    cluster.create(&gvr, "default", "db", &sts);
+
+    assert!(
+        wait_for(&cluster.store, &pod_gvr, Some("default"), "db-0", |_| true, TIMEOUT).await,
+        "StatefulSet should create pod db-0"
+    );
+
+    // The volumeClaimTemplate should produce a per-ordinal PVC that the
+    // provisioner binds to a freshly carved PV.
+    let pvc_bound = wait_for(
+        &cluster.store,
+        &pvc_gvr,
+        Some("default"),
+        "data-db-0",
+        |v| v["status"]["phase"] == serde_json::json!("Bound"),
+        TIMEOUT,
+    )
+    .await;
+    assert!(pvc_bound, "PVC data-db-0 should be provisioned and Bound");
+
+    let pvc = cluster.get(&pvc_gvr, "default", "data-db-0");
+    let pv_name = pvc["spec"]["volumeName"].as_str().unwrap().to_string();
+    assert!(
+        wait_for(&cluster.store, &pv_gvr, None, &pv_name, |_| true, TIMEOUT).await,
+        "the bound PV should exist"
+    );
+
+    // The pod must carry a persistentVolumeClaim volume wired to that PVC.
+    let pod = cluster.get(&pod_gvr, "default", "db-0");
+    let vols = pod["spec"]["volumes"].as_array().cloned().unwrap_or_default();
+    assert!(
+        vols.iter().any(|v| {
+            v["name"] == serde_json::json!("data")
+                && v["persistentVolumeClaim"]["claimName"] == serde_json::json!("data-db-0")
+        }),
+        "pod should mount the PVC as volume 'data', got: {vols:?}"
+    );
+
+    // Persistence: deleting the pod recreates it against the *same* PVC.
+    let pvc_uid = cluster.uid(&pvc_gvr, "default", "data-db-0");
+    let old_pod_uid = cluster.uid(&pod_gvr, "default", "db-0");
+    cluster.delete(&pod_gvr, "default", "db-0");
+    let recreated = wait_for(
+        &cluster.store,
+        &pod_gvr,
+        Some("default"),
+        "db-0",
+        |v| v["metadata"]["uid"].as_str() != Some(&old_pod_uid),
+        TIMEOUT,
+    )
+    .await;
+    assert!(recreated, "db-0 should be recreated");
+    assert_eq!(
+        cluster.uid(&pvc_gvr, "default", "data-db-0"),
+        pvc_uid,
+        "the PVC (and its data) must survive pod recreation"
+    );
+
+    cluster.shutdown().await;
+}
+
+#[tokio::test]
 async fn statefulset_ordinal_gap_fill() {
     let cluster = TestCluster::start().await;
     let gvr = GroupVersionResource::stateful_sets();
