@@ -102,7 +102,16 @@ pub async fn get_api_versions(headers: HeaderMap, State(state): State<AppState>)
 
 pub async fn get_api_groups(headers: HeaderMap, State(state): State<AppState>) -> Response {
     if let Some(media) = wants_aggregated_discovery(&headers) {
-        return aggregated_response(media, aggregated_non_legacy_groups(&state));
+        let mut doc = aggregated_non_legacy_groups(&state);
+        // Modern kubectl (>=1.30) discovers via aggregated v2 only, so inject
+        // aggregated APIService groups (e.g. metrics.k8s.io) here too — fetching
+        // their resource lists from the backend — or `kubectl top` etc. report
+        // the API as unavailable despite the proxy working.
+        let extra = aggregated_apiservice_v2_items(&state).await;
+        if let Some(items) = doc.get_mut("items").and_then(|v| v.as_array_mut()) {
+            items.extend(extra);
+        }
+        return aggregated_response(media, doc);
     }
     let mut seen = FxHashSet::default();
     let mut groups = Vec::new();
@@ -144,11 +153,51 @@ pub async fn get_api_groups(headers: HeaderMap, State(state): State<AppState>) -
         }));
     }
 
+    // Aggregated groups: APIServices with a backing service (e.g.
+    // metrics-server's metrics.k8s.io). Advertise them so clients like
+    // `kubectl top` discover the group; requests then route through the
+    // aggregator proxy.
+    for (group, version) in aggregated_api_groups(&state) {
+        if !seen.insert(group.clone()) {
+            continue;
+        }
+        let gv = format!("{group}/{version}");
+        groups.push(serde_json::json!({
+            "name": group,
+            "versions": [{"groupVersion": gv, "version": version}],
+            "preferredVersion": {"groupVersion": gv, "version": version},
+        }));
+    }
+
     object_response(&serde_json::json!({
         "kind": "APIGroupList",
         "apiVersion": "v1",
         "groups": groups,
     }))
+}
+
+/// (group, version) for every aggregated APIService — one that declares a
+/// backing `spec.service` (as opposed to the built-in/local API groups).
+pub(crate) fn aggregated_api_groups(state: &ApiState) -> Vec<(String, String)> {
+    let gvr = r8s_types::GroupVersionResource::new("apiregistration.k8s.io", "v1", "apiservices");
+    let Ok(list) = state.store.list(&gvr, None, None, None, None, None) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for item in &list.items {
+        let Some(spec) = item.get("spec") else { continue };
+        if spec.get("service").and_then(|v| v.as_object()).is_none() {
+            continue;
+        }
+        let (Some(g), Some(v)) = (
+            spec.get("group").and_then(|v| v.as_str()).filter(|s| !s.is_empty()),
+            spec.get("version").and_then(|v| v.as_str()),
+        ) else {
+            continue;
+        };
+        out.push((g.to_string(), v.to_string()));
+    }
+    out
 }
 
 pub async fn get_core_v1_resources(State(state): State<AppState>) -> Response {
@@ -169,6 +218,14 @@ pub async fn get_single_api_group(
         .filter(|rt| rt.gvr.group == group)
         .map(|rt| rt.gvr.version.clone())
         .collect();
+    if versions.is_empty() {
+        // Maybe an aggregated group (e.g. metrics.k8s.io) — list its versions.
+        versions = aggregated_api_groups(&state)
+            .into_iter()
+            .filter(|(g, _)| *g == group)
+            .map(|(_, v)| v)
+            .collect();
+    }
     if versions.is_empty() {
         return crate::response::status_error(
             axum::http::StatusCode::NOT_FOUND,
@@ -199,7 +256,23 @@ pub async fn get_single_api_group(
 pub async fn get_group_version_resources(
     State(state): State<AppState>,
     Path((group, version)): Path<(String, String)>,
+    headers: HeaderMap,
 ) -> Response {
+    // Aggregated groups have no local resources; proxy the discovery request
+    // to the backend so clients (e.g. `kubectl top`) learn its resource list.
+    if state
+        .registry
+        .resources_for_group_version(&group, &version)
+        .is_empty()
+    {
+        let path = format!("/apis/{group}/{version}");
+        if let Some(resp) =
+            crate::aggregation::try_proxy(&state, &axum::http::Method::GET, &path, None, &headers, &[])
+                .await
+        {
+            return resp;
+        }
+    }
     api_resource_list(&state, &group, &version)
 }
 
@@ -211,6 +284,67 @@ fn aggregated_legacy_group(state: &ApiState) -> serde_json::Value {
         "kind": "APIGroupDiscoveryList",
         "items": items,
     })
+}
+
+/// v2 aggregated-discovery items for aggregated APIService groups. For each,
+/// proxy the backend's APIResourceList and convert it to the v2 shape kubectl
+/// needs to route (e.g. `kubectl top`).
+async fn aggregated_apiservice_v2_items(state: &AppState) -> Vec<serde_json::Value> {
+    let mut items = Vec::new();
+    for (group, version) in aggregated_api_groups(state) {
+        let path = format!("/apis/{group}/{version}");
+        let Some(resp) = crate::aggregation::try_proxy(
+            state,
+            &axum::http::Method::GET,
+            &path,
+            None,
+            &HeaderMap::new(),
+            &[],
+        )
+        .await
+        else {
+            continue;
+        };
+        let body = match axum::body::to_bytes(resp.into_body(), 1024 * 1024).await {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        let Ok(list) = serde_json::from_slice::<serde_json::Value>(&body) else {
+            continue;
+        };
+        let resources: Vec<serde_json::Value> = list
+            .get("resources")
+            .and_then(|r| r.as_array())
+            .map(|rs| {
+                rs.iter()
+                    .map(|r| {
+                        let namespaced =
+                            r.get("namespaced").and_then(|v| v.as_bool()).unwrap_or(false);
+                        serde_json::json!({
+                            "resource": r.get("name").cloned().unwrap_or_default(),
+                            "responseKind": {
+                                "group": group,
+                                "version": version,
+                                "kind": r.get("kind").cloned().unwrap_or_default(),
+                            },
+                            "scope": if namespaced { "Namespaced" } else { "Cluster" },
+                            "singularResource": r.get("singularName").cloned().unwrap_or(serde_json::json!("")),
+                            "verbs": r.get("verbs").cloned().unwrap_or(serde_json::json!([])),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        items.push(serde_json::json!({
+            "metadata": { "name": group },
+            "versions": [{
+                "version": version,
+                "resources": resources,
+                "freshness": "Current",
+            }],
+        }));
+    }
+    items
 }
 
 /// Aggregated-discovery body for `/apis` (every non-empty group).

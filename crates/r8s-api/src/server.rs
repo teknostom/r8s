@@ -13,7 +13,7 @@ use r8s_store::Store;
 use r8s_types::{GroupVersionResource, registry::ResourceRegistry};
 
 use crate::{
-    auth::{self_subject_access_review, self_subject_rules_review},
+    auth::{self_subject_access_review, self_subject_rules_review, subject_access_review},
     discovery::{
         ApiState, AppState, get_api_groups, get_api_versions, get_core_v1_resources,
         get_group_version_resources, get_single_api_group, get_version,
@@ -120,17 +120,30 @@ async fn dynamic_dispatch(
         None => return not_found(),
     };
 
-    let gvr = GroupVersionResource::new(&api_path.group, &api_path.version, &api_path.resource);
-    let rt = match state.registry.get_by_gvr(&gvr) {
-        Some(rt) => rt,
-        None => return not_found(),
-    };
-
-    let ctx = RouteContext { resource_type: rt };
-
     let body = axum::body::to_bytes(req.into_body(), 1024 * 1024)
         .await
         .unwrap_or_default();
+
+    let gvr = GroupVersionResource::new(&api_path.group, &api_path.version, &api_path.resource);
+    let rt = match state.registry.get_by_gvr(&gvr) {
+        Some(rt) => rt,
+        None => {
+            // No local resource serves this group/version — it may be an
+            // aggregated API backed by an APIService (e.g. metrics-server).
+            return crate::aggregation::try_proxy(
+                &state,
+                &method,
+                &path,
+                raw_query.as_deref(),
+                &headers,
+                &body,
+            )
+            .await
+            .unwrap_or_else(not_found);
+        }
+    };
+
+    let ctx = RouteContext { resource_type: rt };
 
     // The `status` subresource is handled separately from the main object:
     // status-only writes that do NOT run the spec admission chain. Upstream
@@ -259,6 +272,10 @@ impl ApiServer {
                 post(self_subject_rules_review),
             )
             .route(
+                "/apis/authorization.k8s.io/v1/subjectaccessreviews",
+                post(subject_access_review),
+            )
+            .route(
                 "/apis/apps/v1/namespaces/{ns}/{resource}/{name}/scale",
                 get(get_scale).put(put_scale).patch(patch_scale),
             );
@@ -273,6 +290,7 @@ impl ApiServer {
                 (rt.gvr.group.as_str(), rt.gvr.version.as_str(), rt.gvr.resource.as_str()),
                 ("authorization.k8s.io", "v1", "selfsubjectaccessreviews")
                     | ("authorization.k8s.io", "v1", "selfsubjectrulesreviews")
+                    | ("authorization.k8s.io", "v1", "subjectaccessreviews")
             );
             if is_special_review {
                 continue;

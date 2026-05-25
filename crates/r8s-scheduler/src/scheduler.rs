@@ -2,9 +2,16 @@ use std::collections::BTreeMap;
 
 use r8s_store::{Store, backend::ResourceRef, watch::WatchEventType};
 use r8s_types::{
-    GroupVersionResource, Node, NodeCondition, NodeSpec, NodeStatus, NodeSystemInfo, ObjectMeta,
-    Pod, PodCondition, Quantity, Time,
+    DaemonEndpoint, GroupVersionResource, Node, NodeAddress, NodeCondition, NodeDaemonEndpoints,
+    NodeSpec, NodeStatus, NodeSystemInfo, ObjectMeta, Pod, PodCondition, Quantity, Time,
 };
+
+/// The node's InternalIP. It's the r8s bridge gateway, which is the host —
+/// reachable from pods, so metrics-server (a pod) can scrape the kubelet
+/// metrics server r8sd runs there. Must match where that server binds.
+pub const NODE_INTERNAL_IP: &str = "10.244.0.1";
+/// Port the kubelet metrics server listens on (advertised via daemonEndpoints).
+pub const KUBELET_PORT: i32 = 10250;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
@@ -94,6 +101,21 @@ fn register_node(store: &Store) -> anyhow::Result<()> {
             }),
             capacity: Some(capacity.clone()),
             allocatable: Some(capacity),
+            // Addresses + kubelet endpoint so metrics-server can locate and
+            // scrape this node's /metrics/resource.
+            addresses: Some(vec![
+                NodeAddress {
+                    type_: "InternalIP".into(),
+                    address: NODE_INTERNAL_IP.into(),
+                },
+                NodeAddress {
+                    type_: "Hostname".into(),
+                    address: NODE_NAME.into(),
+                },
+            ]),
+            daemon_endpoints: Some(NodeDaemonEndpoints {
+                kubelet_endpoint: Some(DaemonEndpoint { port: KUBELET_PORT }),
+            }),
             ..Default::default()
         }),
     };

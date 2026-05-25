@@ -1,4 +1,5 @@
 pub mod admission;
+pub mod aggregation;
 pub mod auth;
 pub mod bootstrap;
 pub mod discovery;

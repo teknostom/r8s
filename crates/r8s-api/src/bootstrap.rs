@@ -7,6 +7,41 @@ use r8s_types::{
     ServiceSpec,
 };
 
+/// Publish `kube-system/extension-apiserver-authentication` — the ConfigMap
+/// aggregated apiservers (metrics-server) read to learn the requestheader CA
+/// and header names, so they trust the front-proxy identity the aggregator
+/// presents. Real apiservers create this at startup; r8s mirrors it.
+pub fn bootstrap_apiserver_authentication(store: &Store, ca_pem: &str) -> anyhow::Result<()> {
+    let gvr = GroupVersionResource::new("", "v1", "configmaps");
+    let rref = ResourceRef {
+        gvr: &gvr,
+        namespace: Some("kube-system"),
+        name: "extension-apiserver-authentication",
+    };
+    if store.get(&rref)?.is_some() {
+        return Ok(());
+    }
+    let cm = serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "ConfigMap",
+        "metadata": {
+            "name": "extension-apiserver-authentication",
+            "namespace": "kube-system",
+        },
+        "data": {
+            "client-ca-file": ca_pem,
+            "requestheader-client-ca-file": ca_pem,
+            "requestheader-allowed-names": "[]",
+            "requestheader-extra-headers-prefix": "[\"X-Remote-Extra-\"]",
+            "requestheader-group-headers": "[\"X-Remote-Group\"]",
+            "requestheader-username-headers": "[\"X-Remote-User\"]",
+        },
+    });
+    store.create(rref, &cm)?;
+    tracing::info!("bootstrapped extension-apiserver-authentication ConfigMap");
+    Ok(())
+}
+
 pub fn bootstrap_namespaces(store: &Store) -> anyhow::Result<()> {
     let gvr = GroupVersionResource::namespaces();
 

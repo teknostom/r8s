@@ -10,9 +10,10 @@ pub use resource::{GroupVersionResource, ResourceType};
 pub use k8s_openapi::api::core::v1::{
     ConfigMap, ConfigMapVolumeSource, Container, ContainerPort, ContainerState,
     ContainerStateRunning, ContainerStateTerminated, ContainerStateWaiting, ContainerStatus,
-    EmptyDirVolumeSource, EndpointAddress, EndpointPort, EndpointSubset, Endpoints, EnvVar,
-    EnvVarSource, ExecAction, HTTPGetAction, HostPathVolumeSource, LocalObjectReference, Namespace,
-    NamespaceStatus, Node, NodeCondition, NodeSpec, NodeStatus, NodeSystemInfo, ObjectReference,
+    DaemonEndpoint, EmptyDirVolumeSource, EndpointAddress, EndpointPort, EndpointSubset, Endpoints,
+    EnvVar, EnvVarSource, ExecAction, HTTPGetAction, HostPathVolumeSource, LocalObjectReference,
+    Namespace, NamespaceStatus, Node, NodeAddress, NodeCondition, NodeDaemonEndpoints, NodeSpec,
+    NodeStatus, NodeSystemInfo, ObjectReference,
     Pod, PodCondition, PodIP, PodSpec, PodStatus, PodTemplateSpec, Probe, Secret,
     SecretVolumeSource, Service, ServiceAccount, ServicePort, ServiceSpec, TCPSocketAction, Volume,
     VolumeMount,

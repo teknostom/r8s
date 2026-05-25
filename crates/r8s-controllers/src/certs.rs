@@ -13,6 +13,8 @@ const CA_CERT_FILE: &str = "ca.crt";
 const CA_KEY_FILE: &str = "ca.key";
 const SERVER_CERT_FILE: &str = "tls.crt";
 const SERVER_KEY_FILE: &str = "tls.key";
+const FRONT_PROXY_CERT_FILE: &str = "front-proxy-client.crt";
+const FRONT_PROXY_KEY_FILE: &str = "front-proxy-client.key";
 
 /// Cluster TLS material loaded from disk (or freshly minted).
 #[derive(Clone, Debug)]
@@ -20,6 +22,10 @@ pub struct CertBundle {
     pub ca_pem: String,
     pub server_cert_pem: String,
     pub server_key_pem: String,
+    /// Client cert (ClientAuth EKU) the aggregator presents to extension
+    /// apiservers (e.g. metrics-server) for requestheader/front-proxy auth.
+    pub front_proxy_cert_pem: String,
+    pub front_proxy_key_pem: String,
 }
 
 impl CertBundle {
@@ -47,11 +53,57 @@ pub fn ensure_cluster_certs(data_dir: &Path) -> anyhow::Result<CertBundle> {
         generate(&cert_dir)?;
     }
 
+    // Front-proxy client cert: minted separately (signed by the existing CA)
+    // so clusters created before aggregation support gain it on restart
+    // without regenerating — and thus invalidating — the CA.
+    let fp_cert_path = cert_dir.join(FRONT_PROXY_CERT_FILE);
+    let fp_key_path = cert_dir.join(FRONT_PROXY_KEY_FILE);
+    if !all_present(&[&fp_cert_path, &fp_key_path]) {
+        generate_front_proxy_cert(
+            &cert_dir,
+            &std::fs::read_to_string(&ca_cert_path)?,
+            &std::fs::read_to_string(&ca_key_path)?,
+        )?;
+    }
+
     Ok(CertBundle {
         ca_pem: std::fs::read_to_string(&ca_cert_path)?,
         server_cert_pem: std::fs::read_to_string(&server_cert_path)?,
         server_key_pem: std::fs::read_to_string(&server_key_path)?,
+        front_proxy_cert_pem: std::fs::read_to_string(&fp_cert_path)?,
+        front_proxy_key_pem: std::fs::read_to_string(&fp_key_path)?,
     })
+}
+
+/// Mint a ClientAuth cert for front-proxy auth, signed by the cluster CA loaded
+/// from its persisted PEM (so we don't disturb the existing CA).
+fn generate_front_proxy_cert(
+    cert_dir: &Path,
+    ca_cert_pem: &str,
+    ca_key_pem: &str,
+) -> anyhow::Result<()> {
+    let ca_key = KeyPair::from_pem(ca_key_pem)?;
+    let ca_params = CertificateParams::from_ca_cert_pem(ca_cert_pem)?;
+    let ca_cert = ca_params.self_signed(&ca_key)?;
+
+    let key = KeyPair::generate()?;
+    let mut params = CertificateParams::new(Vec::<String>::new())?;
+    // CN is the requestheader identity metrics-server sees as X-Remote-User's
+    // peer; allowed by requestheader-allowed-names (we publish "[]" = any).
+    params
+        .distinguished_name
+        .push(DnType::CommonName, "front-proxy-client");
+    params.key_usages = vec![
+        KeyUsagePurpose::DigitalSignature,
+        KeyUsagePurpose::KeyEncipherment,
+    ];
+    params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
+    let cert = params.signed_by(&key, &ca_cert, &ca_key)?;
+
+    std::fs::write(cert_dir.join(FRONT_PROXY_CERT_FILE), cert.pem())?;
+    std::fs::write(cert_dir.join(FRONT_PROXY_KEY_FILE), key.serialize_pem())?;
+    tracing::info!("generated front-proxy client cert");
+    Ok(())
 }
 
 fn all_present(paths: &[&PathBuf]) -> bool {

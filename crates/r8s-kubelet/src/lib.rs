@@ -1,3 +1,4 @@
+pub mod metrics_server;
 mod probe;
 
 use std::{

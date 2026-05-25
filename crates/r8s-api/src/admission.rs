@@ -585,7 +585,7 @@ fn build_admission_review(
 /// We can't dial Service ClusterIPs from r8sd's host netns (no kube-proxy on
 /// host yet — only 10.96.0.1/apiserver has a fixed DNAT rule), but pod CIDR
 /// is routable, so we go Service → EndpointSlice → Pod and dial pod-direct.
-fn resolve_service_endpoint(
+pub(crate) fn resolve_service_endpoint(
     store: &Store,
     ns: &str,
     name: &str,
@@ -818,7 +818,7 @@ fn dechunk(input: &[u8]) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
-fn tls_config(ca_pem: Option<&[u8]>) -> Result<ClientConfig, String> {
+pub(crate) fn tls_config(ca_pem: Option<&[u8]>) -> Result<ClientConfig, String> {
     // Single source of truth for CryptoProvider — match the one axum-server
     // configures in `ApiServer::serve_tls` (aws-lc-rs).
     let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());

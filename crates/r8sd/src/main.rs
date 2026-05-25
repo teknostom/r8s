@@ -3,7 +3,9 @@ use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 use clap::Parser;
 use r8s_api::{
     ApiServer,
-    bootstrap::{bootstrap_ingress_class, bootstrap_namespaces},
+    bootstrap::{
+        bootstrap_apiserver_authentication, bootstrap_ingress_class, bootstrap_namespaces,
+    },
 };
 use r8s_controllers::ControllerManager;
 use r8s_runtime::{MockRuntime, containerd::ContainerdRuntime};
@@ -38,6 +40,7 @@ async fn main() -> anyhow::Result<()> {
     bootstrap_ingress_class(&store)?;
 
     let certs = r8s_controllers::certs::ensure_cluster_certs(&data_dir)?;
+    bootstrap_apiserver_authentication(&store, &certs.ca_pem)?;
 
     let shutdown = CancellationToken::new();
     let registry = ResourceRegistry::default_mvp();
@@ -104,6 +107,19 @@ async fn main() -> anyhow::Result<()> {
             tracing::info!(socket, "using containerd runtime");
             let runtime = Arc::new(ContainerdRuntime::new(&socket, data_dir.clone()).await?);
             exec_handle = Some(Arc::new(runtime.exec_handle()));
+            // Kubelet resource-metrics server (/metrics/resource) so
+            // metrics-server has a node to scrape. Containerd only — it reads
+            // real cgroup stats.
+            spawn(
+                &mut tasks,
+                "kubelet-metrics",
+                r8s_kubelet::metrics_server::run(
+                    store.clone(),
+                    runtime.clone(),
+                    certs.server_cert_pem.clone().into_bytes(),
+                    certs.server_key_pem.clone().into_bytes(),
+                ),
+            );
             spawn(
                 &mut tasks,
                 "kubelet",
