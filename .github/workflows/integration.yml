@@ -1,0 +1,80 @@
+name: integration
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+# Cancel in-flight runs of the same ref when a new commit arrives.
+concurrency:
+  group: integration-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  integration:
+    name: Third-party integration suites
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install protoc
+        run: |
+          sudo apt-get update
+          # libprotobuf-dev ships the well-known types; the compiler package
+          # alone is just the protoc binary.
+          sudo apt-get install -y --no-install-recommends \
+            protobuf-compiler libprotobuf-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      # `integration/*/` suites drive real charts with helm + kubectl. kubectl
+      # is preinstalled on ubuntu runners but we pin it for reproducibility.
+      - name: Install helm
+        uses: azure/setup-helm@v4
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v4
+
+      - name: Build r8s + r8sd (release)
+        run: cargo build --release --bin r8s --bin r8sd
+
+      - name: Start r8s cluster
+        run: |
+          set -euo pipefail
+          # Put release binaries on PATH so `r8s up` finds r8sd alongside it.
+          export PATH="$PWD/target/release:$PATH"
+          sudo env PATH="$PATH" r8s create default
+          sudo env PATH="$PATH" r8s up default
+          # Wait for the API to start serving. Up to 30s of probing.
+          for i in $(seq 1 60); do
+            if curl -sk https://127.0.0.1:6443/readyz >/dev/null 2>&1; then
+              echo "r8sd up after ${i}/60 probes"
+              break
+            fi
+            sleep 0.5
+          done
+          sudo test -f /var/lib/r8s/clusters/default/kubeconfig
+          # helm/kubectl run as the runner user and read the kubeconfig (+ CA).
+          sudo chmod a+r /var/lib/r8s/clusters/default/kubeconfig
+          sudo chmod a+r /var/lib/r8s/clusters/default/certs/ca.crt 2>/dev/null || true
+          echo "KUBECONFIG=/var/lib/r8s/clusters/default/kubeconfig" >> "$GITHUB_ENV"
+
+      - name: Run integration suites
+        run: ./integration/run.sh
+
+      - name: Dump diagnostics on failure
+        if: failure()
+        run: |
+          echo "===== r8sd.log (tail) ====="
+          sudo tail -n 200 /var/lib/r8s/clusters/default/r8sd.log 2>/dev/null || true
+          echo "===== cert-manager pods ====="
+          kubectl -n cert-manager get pods -o wide 2>/dev/null || true
+          for c in controller webhook cainjector; do
+            echo "===== cert-manager $c logs (tail) ====="
+            kubectl -n cert-manager logs -l app.kubernetes.io/component=$c --tail=80 2>/dev/null || true
+          done

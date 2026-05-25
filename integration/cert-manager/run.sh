@@ -41,7 +41,10 @@ kubectl -n "$NS" wait --for=condition=Ready certificate/integration-cert --timeo
 # right CN. openssl is the universally-available x509 toolkit; if it's
 # missing we just fail loud.
 crt=$(kubectl -n "$NS" get secret integration-cert-tls -o jsonpath='{.data.tls\.crt}' | base64 -d)
-echo "$crt" | openssl x509 -noout -subject | grep -q "CN ?= ?${CN}" \
+# `-E`: the ` ?` are optional-space matchers (openssl prints `CN=x` on 1.x and
+# `CN = x` on 3.x). Without extended regex, grep treats `?` literally and the
+# match never succeeds even for a correct cert.
+echo "$crt" | openssl x509 -noout -subject | grep -qE "CN ?= ?${CN}" \
     || { echo "cert subject CN mismatch"; echo "$crt" | openssl x509 -noout -subject; exit 1; }
 
 echo "OK: certificate issued with CN=${CN}"

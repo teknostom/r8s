@@ -88,9 +88,21 @@ pub async fn invoke_mutating(
     old_object: Option<&Value>,
 ) -> Result<(), AdmissionError> {
     let matches = matching_webhooks(ctx, "mutatingwebhookconfigurations")?;
+    tracing::debug!(
+        gvr = %ctx.gvr.key_prefix(),
+        dry_run = ctx.dry_run,
+        matched = matches.len(),
+        "invoke_mutating: matched webhooks"
+    );
     for m in matches {
         match call_webhook(ctx, &m, object, old_object).await {
             Ok(resp) => {
+                tracing::debug!(
+                    webhook = %m.name,
+                    allowed = resp.allowed,
+                    has_patch = resp.patch.is_some(),
+                    "invoke_mutating: webhook responded"
+                );
                 if !resp.allowed {
                     return Err(denied_from(&m.name, resp.status));
                 }
@@ -138,10 +150,22 @@ pub async fn invoke_validating(
     old_object: Option<&Value>,
 ) -> Result<(), AdmissionError> {
     let matches = matching_webhooks(ctx, "validatingwebhookconfigurations")?;
+    tracing::debug!(
+        gvr = %ctx.gvr.key_prefix(),
+        dry_run = ctx.dry_run,
+        matched = matches.len(),
+        "invoke_validating: matched webhooks"
+    );
     let mut owned = object.clone();
     for m in matches {
         match call_webhook(ctx, &m, &mut owned, old_object).await {
             Ok(resp) => {
+                tracing::debug!(
+                    webhook = %m.name,
+                    allowed = resp.allowed,
+                    status = %resp.status.as_ref().map(|s| s.to_string()).unwrap_or_default(),
+                    "invoke_validating: webhook responded"
+                );
                 if !resp.allowed {
                     return Err(denied_from(&m.name, resp.status));
                 }
@@ -514,6 +538,26 @@ fn build_admission_review(
         "version": ctx.gvr.version,
         "resource": ctx.gvr.resource,
     });
+    // r8s has no per-request authentication yet, so callers are effectively
+    // cluster-admin. Send a concrete identity rather than an empty userInfo:
+    // webhooks that echo the requester back into the object (e.g.
+    // cert-manager's CertificateRequest mutator, which copies userInfo into
+    // spec.username/uid/groups) produce an empty, useless result otherwise —
+    // and cert-manager's startupapicheck then reports the webhook "did not
+    // mutate". When real auth lands, populating ctx.user_info overrides this.
+    let user_info = if ctx
+        .user_info
+        .as_object()
+        .map(|o| o.is_empty())
+        .unwrap_or(true)
+    {
+        json!({
+            "username": "system:admin",
+            "groups": ["system:masters", "system:authenticated"],
+        })
+    } else {
+        ctx.user_info.clone()
+    };
     json!({
         "apiVersion": "admission.k8s.io/v1",
         "kind": "AdmissionReview",
@@ -529,7 +573,7 @@ fn build_admission_review(
             "name": ctx.name,
             "namespace": ctx.namespace.unwrap_or(""),
             "operation": ctx.operation.as_str(),
-            "userInfo": ctx.user_info,
+            "userInfo": user_info,
             "object": object,
             "oldObject": old_object.cloned().unwrap_or(Value::Null),
             "dryRun": ctx.dry_run,

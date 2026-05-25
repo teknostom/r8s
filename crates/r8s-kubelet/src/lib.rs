@@ -20,6 +20,9 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 const NODE_NAME: &str = "r8s-node";
+/// Reported as `status.hostIP`/`status.hostIPs` for the downward API. r8s runs
+/// pods on the single bridge gateway host.
+const HOST_IP: &str = "10.244.0.1";
 const MAX_BACKOFF: Duration = Duration::from_secs(300);
 const INITIAL_BACKOFF: Duration = Duration::from_secs(10);
 
@@ -413,15 +416,41 @@ async fn start_containers<R: ContainerRuntime>(
             volume_paths,
         );
 
-        let mut env: Vec<(String, String)> = container_spec
-            .env
-            .as_ref()
-            .map(|envs| {
-                envs.iter()
-                    .map(|e| (e.name.clone(), e.value.clone().unwrap_or_default()))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let pod_uid = pod_value
+            .get("metadata")
+            .and_then(|m| m.get("uid"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let sa_name = spec.service_account_name.as_deref().unwrap_or("default");
+
+        // Resolve each env entry: a literal `value` (with `$(VAR)` expansion
+        // against earlier entries) or `valueFrom.fieldRef` (downward API).
+        // `secretKeyRef`/`configMapKeyRef` aren't resolved yet.
+        let mut env: Vec<(String, String)> = Vec::new();
+        if let Some(envs) = container_spec.env.as_ref() {
+            for e in envs {
+                let value = if let Some(v) = e.value.as_ref() {
+                    expand_vars(v, &env)
+                } else if let Some(src) = e.value_from.as_ref() {
+                    src.field_ref
+                        .as_ref()
+                        .and_then(|f| {
+                            resolve_field_ref(
+                                &f.field_path,
+                                pod_name,
+                                pod_ns.unwrap_or("default"),
+                                pod_uid,
+                                pod_ip,
+                                sa_name,
+                            )
+                        })
+                        .unwrap_or_default()
+                } else {
+                    String::new()
+                };
+                env.push((e.name.clone(), value));
+            }
+        }
         // Point pods at the bootstrapped `kubernetes` Service ClusterIP, not
         // the bridge gateway. nftables DNAT (synced by r8s-network from the
         // Service's Endpoints) rewrites 10.96.0.1:443 → 10.244.0.1:6443,
@@ -430,12 +459,31 @@ async fn start_containers<R: ContainerRuntime>(
         env.push(("KUBERNETES_SERVICE_PORT".into(), "443".into()));
         env.push(("KUBERNETES_SERVICE_PORT_HTTPS".into(), "443".into()));
 
+        // Expand `$(VAR)` references in command/args against the resolved env,
+        // per the k8s container-environment contract. cert-manager's webhook
+        // relies on this, e.g.
+        // `--dynamic-serving-ca-secret-namespace=$(POD_NAMESPACE)`.
+        let command: Vec<String> = container_spec
+            .command
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .map(|s| expand_vars(s, &env))
+            .collect();
+        let args: Vec<String> = container_spec
+            .args
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .map(|s| expand_vars(s, &env))
+            .collect();
+
         let config = ContainerConfig {
             name: format!("{pod_name}_{container_name}"),
             namespace: pod_ns.unwrap_or("default").to_string(),
             image: image.to_string(),
-            command: container_spec.command.clone().unwrap_or_default(),
-            args: container_spec.args.clone().unwrap_or_default(),
+            command,
+            args,
             env,
             working_dir: container_spec.working_dir.clone(),
             mounts,
@@ -903,6 +951,26 @@ async fn restart_in_place<R: ContainerRuntime>(
     tracked.restart_count = prev_restart_count + 1;
     tracked.last_restart = Some(Instant::now());
     tracked.waiting_restart = false;
+
+    // Reset readiness for the fresh container exactly as initial start does:
+    // a container with no readiness/startup probe is Ready the moment it runs.
+    // `handle_container_exit` set ready=false before the restart; without
+    // restoring it here, a probe-less container (e.g. cert-manager-cainjector,
+    // which has no readiness probe) that ever crashed stays stuck NotReady
+    // forever, since no probe loop will flip it back true.
+    let has_readiness = spec.containers.iter().any(|c| c.readiness_probe.is_some());
+    let has_startup = spec.containers.iter().any(|c| c.startup_probe.is_some());
+    tracked.started = !has_startup;
+    tracked.ready = !has_readiness && !has_startup;
+    let reset_probe = |p: Option<&mut ProbeState>| {
+        if let Some(p) = p {
+            p.last_check = Instant::now();
+            p.consecutive_failures = 0;
+        }
+    };
+    reset_probe(tracked.liveness.as_mut());
+    reset_probe(tracked.readiness.as_mut());
+    reset_probe(tracked.startup.as_mut());
 
     tracing::info!(
         "pod '{pod_name}': restarted in-place (restart_count={})",
@@ -1392,6 +1460,73 @@ fn project_secret(
     Ok(())
 }
 
+/// Resolve a `valueFrom.fieldRef` field path against the downward API. Returns
+/// `None` for paths r8s doesn't model (caller substitutes an empty string,
+/// matching how kubelet treats unknown refs in practice for our subset).
+fn resolve_field_ref(
+    field_path: &str,
+    pod_name: &str,
+    pod_ns: &str,
+    pod_uid: &str,
+    pod_ip: &str,
+    sa_name: &str,
+) -> Option<String> {
+    match field_path {
+        "metadata.name" => Some(pod_name.into()),
+        "metadata.namespace" => Some(pod_ns.into()),
+        "metadata.uid" => Some(pod_uid.into()),
+        "status.podIP" | "status.podIPs" => Some(pod_ip.into()),
+        "status.hostIP" | "status.hostIPs" => Some(HOST_IP.into()),
+        "spec.nodeName" => Some(NODE_NAME.into()),
+        "spec.serviceAccountName" => Some(sa_name.into()),
+        _ => None,
+    }
+}
+
+/// Expand `$(VAR)` references in `input` against `env`, per the k8s
+/// container-environment contract: `$(VAR)` → the value of `VAR` if defined,
+/// `$$(VAR)` → the literal `$(VAR)`, and an undefined `$(VAR)` is left as-is.
+fn expand_vars(input: &str, env: &[(String, String)]) -> String {
+    let bytes = input.as_bytes();
+    let mut out = String::with_capacity(input.len());
+    let mut i = 0;
+    let mut chunk_start = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'$' && i + 1 < bytes.len() {
+            // `$$(VAR)` -> literal `$(VAR)`
+            if bytes[i + 1] == b'$'
+                && i + 2 < bytes.len()
+                && bytes[i + 2] == b'('
+                && let Some(close) = bytes[i + 3..].iter().position(|&b| b == b')')
+            {
+                out.push_str(&input[chunk_start..i]);
+                out.push_str(&input[i + 1..i + 3 + close + 1]);
+                i += 3 + close + 1;
+                chunk_start = i;
+                continue;
+            }
+            // `$(VAR)` -> substitution
+            if bytes[i + 1] == b'('
+                && let Some(close) = bytes[i + 2..].iter().position(|&b| b == b')')
+            {
+                let name = &input[i + 2..i + 2 + close];
+                out.push_str(&input[chunk_start..i]);
+                if let Some((_, v)) = env.iter().find(|(k, _)| k == name) {
+                    out.push_str(v);
+                } else {
+                    out.push_str(&input[i..i + 2 + close + 1]);
+                }
+                i += 2 + close + 1;
+                chunk_start = i;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out.push_str(&input[chunk_start..]);
+    out
+}
+
 fn resolve_mounts(
     volume_mounts: &[VolumeMount],
     volume_paths: &FxHashMap<String, String>,
@@ -1413,5 +1548,65 @@ fn cleanup_pod_volumes(data_dir: &Path, pod_uid: &str) {
     let dir = data_dir.join("pod-data").join(pod_uid);
     if dir.exists() {
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{expand_vars, resolve_field_ref};
+
+    fn env(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn expands_defined_var() {
+        let e = env(&[("POD_NAMESPACE", "cert-manager")]);
+        assert_eq!(
+            expand_vars("--ns=$(POD_NAMESPACE)", &e),
+            "--ns=cert-manager"
+        );
+        assert_eq!(
+            expand_vars("svc.$(POD_NAMESPACE).svc", &e),
+            "svc.cert-manager.svc"
+        );
+    }
+
+    #[test]
+    fn leaves_undefined_var_literal() {
+        // k8s contract: an undefined reference passes through unchanged.
+        assert_eq!(expand_vars("$(NOPE)", &env(&[])), "$(NOPE)");
+    }
+
+    #[test]
+    fn double_dollar_escapes_to_literal() {
+        let e = env(&[("VAR", "x")]);
+        assert_eq!(expand_vars("$$(VAR)", &e), "$(VAR)");
+    }
+
+    #[test]
+    fn no_refs_passthrough_and_multiple_refs() {
+        let e = env(&[("A", "1"), ("B", "2")]);
+        assert_eq!(expand_vars("plain text", &e), "plain text");
+        assert_eq!(expand_vars("$(A)-$(B)", &e), "1-2");
+    }
+
+    #[test]
+    fn field_ref_downward_api() {
+        assert_eq!(
+            resolve_field_ref("metadata.namespace", "p", "cert-manager", "u", "10.244.0.5", "sa"),
+            Some("cert-manager".into())
+        );
+        assert_eq!(
+            resolve_field_ref("status.podIP", "p", "ns", "u", "10.244.0.5", "sa"),
+            Some("10.244.0.5".into())
+        );
+        assert_eq!(
+            resolve_field_ref("metadata.labels['x']", "p", "ns", "u", "ip", "sa"),
+            None
+        );
     }
 }

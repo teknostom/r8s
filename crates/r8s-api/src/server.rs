@@ -24,8 +24,8 @@ use crate::{
         extract_propagation_policy, get_cluster, get_impl, get_ns, get_status_cluster,
         get_status_ns, list_all_ns, list_cluster, list_impl, list_ns, patch_cluster,
         patch_impl, patch_ns, patch_status_cluster, patch_status_ns, pod_logs_ns,
-        put_status_cluster, put_status_ns, require_json, update_cluster, update_impl,
-        update_ns,
+        put_status_cluster, put_status_ns, require_json, status_put_impl, update_cluster,
+        update_impl, update_ns,
     },
     openapi_v2::get_openapi_v2,
     openapi_v3::{get_openapi_v3_core, get_openapi_v3_discovery, get_openapi_v3_group},
@@ -62,6 +62,11 @@ struct ApiPath {
     resource: String,
     namespace: Option<String>,
     name: Option<String>,
+    /// Trailing subresource segment, e.g. `status` in
+    /// `.../certificates/foo/status`. Previously dropped, which made status
+    /// writes fall through to the full-object update path (running spec
+    /// admission webhooks that don't apply to `/status`).
+    subresource: Option<String>,
 }
 
 fn parse_api_path(path: &str) -> Option<ApiPath> {
@@ -76,22 +81,26 @@ fn parse_api_path(path: &str) -> Option<ApiPath> {
         let ns = parts[4].to_string();
         let resource = parts[5].to_string();
         let name = parts.get(6).map(|s| s.to_string());
+        let subresource = parts.get(7).map(|s| s.to_string());
         Some(ApiPath {
             group,
             version,
             resource,
             namespace: Some(ns),
             name,
+            subresource,
         })
     } else {
         let resource = parts[3].to_string();
         let name = parts.get(4).map(|s| s.to_string());
+        let subresource = parts.get(5).map(|s| s.to_string());
         Some(ApiPath {
             group,
             version,
             resource,
             namespace: None,
             name,
+            subresource,
         })
     }
 }
@@ -122,6 +131,27 @@ async fn dynamic_dispatch(
     let body = axum::body::to_bytes(req.into_body(), 1024 * 1024)
         .await
         .unwrap_or_default();
+
+    // The `status` subresource is handled separately from the main object:
+    // status-only writes that do NOT run the spec admission chain. Upstream
+    // does the same — a webhook whose rules target the parent resource is not
+    // invoked for `/status`, and a status write must not touch spec. Without
+    // this, cert-manager's status updates were rejected by its own validating
+    // webhook (which r8s was wrongly invoking on `/status`).
+    if api_path.subresource.as_deref() == Some("status") {
+        let ns = api_path.namespace.as_deref();
+        return match (method, api_path.name.as_deref()) {
+            (Method::GET, Some(name)) => get_impl(&state, &ctx, ns, name, &headers),
+            (Method::PUT, Some(name)) => match require_json(&headers, &body) {
+                Ok(json) => status_put_impl(&state, &ctx, ns, name, json),
+                Err(resp) => resp,
+            },
+            (Method::PATCH, Some(name)) => {
+                patch_impl(&state, &ctx, ns, name, &headers, body, false).await
+            }
+            _ => not_found(),
+        };
+    }
 
     match (method, api_path.name) {
         (Method::GET, None) => list_impl(

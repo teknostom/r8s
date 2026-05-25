@@ -33,14 +33,45 @@ use crate::{
 fn admission_error_response(err: AdmissionError) -> Response {
     match err {
         AdmissionError::Denied {
-            webhook: _,
+            webhook,
             message,
             status,
         } => {
-            if let Some(status) = status {
-                response::json_response(StatusCode::FORBIDDEN.as_u16() as u16, &status)
-            } else {
-                response::status_error(StatusCode::FORBIDDEN, "Forbidden", &message)
+            // Two things real apiservers do that clients depend on:
+            //
+            // 1. Wrap the denial message as
+            //      admission webhook "<name>" denied the request: <message>
+            //    cert-manager's startupapicheck regex-matches exactly this to
+            //    recognize that the validating webhook rejected its test
+            //    request; the bare webhook message fails the match.
+            //
+            // 2. Return a complete metav1.Status (kind/apiVersion/status:
+            //    Failure), not the webhook's bare status fragment — otherwise
+            //    client-go can't decode it and reports a generic "unknown".
+            let wrapped =
+                format!("admission webhook \"{webhook}\" denied the request: {message}");
+            let code = status
+                .as_ref()
+                .and_then(|s| s.get("code"))
+                .and_then(|v| v.as_u64())
+                .map(|c| c as u16)
+                .unwrap_or(StatusCode::FORBIDDEN.as_u16());
+            match status {
+                Some(serde_json::Value::Object(mut obj)) => {
+                    obj.insert("kind".into(), serde_json::json!("Status"));
+                    obj.insert("apiVersion".into(), serde_json::json!("v1"));
+                    obj.insert("status".into(), serde_json::json!("Failure"));
+                    obj.entry("metadata").or_insert_with(|| serde_json::json!({}));
+                    obj.entry("reason").or_insert_with(|| serde_json::json!("Forbidden"));
+                    obj.insert("message".into(), serde_json::json!(wrapped));
+                    obj.entry("code").or_insert_with(|| serde_json::json!(code));
+                    response::json_response(code, &serde_json::Value::Object(obj))
+                }
+                _ => response::status_error(
+                    StatusCode::from_u16(code).unwrap_or(StatusCode::FORBIDDEN),
+                    "Forbidden",
+                    &wrapped,
+                ),
             }
         }
         AdmissionError::CallFailed { webhook, error } => response::status_error(
@@ -294,6 +325,38 @@ fn wants_table(headers: &HeaderMap) -> bool {
         .is_some_and(|accept| accept.contains("as=Table") && accept.contains("g=meta.k8s.io"))
 }
 
+/// True if the client asked for metadata-only objects via the Accept header,
+/// e.g. `application/json;as=PartialObjectMetadata;g=meta.k8s.io;v=v1`. This is
+/// the scheme client-go's metadata informers use; cert-manager's cainjector
+/// watches webhook configs / its CA source this way, and the watch fails to
+/// decode if we hand back full objects instead.
+fn wants_partial_metadata(headers: &HeaderMap) -> bool {
+    headers
+        .get("accept")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|accept| {
+            accept.contains("g=meta.k8s.io")
+                && (accept.contains("as=PartialObjectMetadata")
+                    || accept.contains("as=PartialObjectMetadataList"))
+        })
+}
+
+/// Strip everything but metadata and rewrite TypeMeta to `PartialObjectMetadata`
+/// so client-go's metadata-informer decoder accepts it. We answer in JSON
+/// regardless of the client's protobuf preference (we have no protobuf encoder),
+/// which client-go honors via the response Content-Type.
+fn to_partial_object_metadata(obj: &serde_json::Value) -> serde_json::Value {
+    let metadata = obj
+        .get("metadata")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    serde_json::json!({
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": metadata,
+    })
+}
+
 pub(crate) fn get_impl(
     state: &AppState,
     ctx: &RouteContext,
@@ -314,6 +377,8 @@ pub(crate) fn get_impl(
                     &obj,
                     &ctx.resource_type.gvr.resource,
                 )
+            } else if wants_partial_metadata(headers) {
+                response::object_response(&to_partial_object_metadata(&obj))
             } else {
                 response::object_response(&obj)
             }
@@ -727,7 +792,7 @@ pub async fn update_cluster(
 // view, not a separate document). We don't enforce the spec/status split with
 // validation or RBAC; just route the subresource so clients can use it.
 
-fn status_put_impl(
+pub(crate) fn status_put_impl(
     state: &AppState,
     ctx: &RouteContext,
     namespace: Option<&str>,
@@ -1390,6 +1455,15 @@ pub(crate) fn list_impl(
                     &ctx.resource_type.gvr.resource,
                     Some(result.resource_version),
                 )
+            } else if wants_partial_metadata(headers) {
+                let items: Vec<_> = result.items.iter().map(to_partial_object_metadata).collect();
+                response::list_response(
+                    "meta.k8s.io/v1",
+                    "PartialObjectMetadata",
+                    result.resource_version,
+                    result.continue_token.as_deref(),
+                    items,
+                )
             } else {
                 response::list_response(
                     &api_version(ctx),
@@ -1527,6 +1601,7 @@ fn watch_impl(
     };
 
     let as_table = wants_table(headers);
+    let as_partial = wants_partial_metadata(headers);
     let resource = ctx.resource_type.gvr.resource.clone();
     let columns = if as_table {
         Some(std::sync::Arc::new(table::columns_for(&resource)))
@@ -1537,9 +1612,12 @@ fn watch_impl(
         let columns = columns.clone();
         let resource = resource.clone();
         move |obj: &serde_json::Value| -> serde_json::Value {
-            match columns.as_ref() {
-                Some(cols) => table::watch_table_object(cols, obj, &resource),
-                None => obj.clone(),
+            if let Some(cols) = columns.as_ref() {
+                table::watch_table_object(cols, obj, &resource)
+            } else if as_partial {
+                to_partial_object_metadata(obj)
+            } else {
+                obj.clone()
             }
         }
     };

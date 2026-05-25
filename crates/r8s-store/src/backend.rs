@@ -212,6 +212,25 @@ impl Store {
             .into());
         }
 
+        // No-op update: if the incoming object is identical to what's stored
+        // (ignoring the server-managed resourceVersion), don't bump the
+        // revision or emit a watch event — matching apiserver semantics.
+        // Without this, a controller that re-Updates an unchanged object
+        // (e.g. cert-manager's cainjector rewriting the same caBundle) gets a
+        // MODIFIED event back, re-reconciles, and spins in a tight loop.
+        {
+            let strip_rv = |v: &serde_json::Value| -> serde_json::Value {
+                let mut v = v.clone();
+                if let Some(m) = v.get_mut("metadata").and_then(|m| m.as_object_mut()) {
+                    m.remove("resourceVersion");
+                }
+                v
+            };
+            if strip_rv(object) == strip_rv(&existing) {
+                return Ok(existing);
+            }
+        }
+
         let rev = self.revision.next();
 
         let mut obj = object.clone();

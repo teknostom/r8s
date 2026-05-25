@@ -10,7 +10,9 @@
 use prost::Message;
 use serde_json::{Map, Value, json};
 
+use crate::k8s_pb::admissionregistration_v1 as pbadmission;
 use crate::k8s_pb::apiextensions_v1 as pbapi;
+use crate::k8s_pb::coordination_v1 as pbcoord;
 use crate::k8s_pb::core_v1 as pbcore;
 use crate::k8s_pb::meta_v1 as pbmeta;
 use crate::k8s_pb::runtime as pbruntime;
@@ -49,6 +51,28 @@ pub fn decode_k8s_protobuf_to_json(body: &[u8]) -> Option<Value> {
         ("v1", "Secret") => {
             let secret = pbcore::Secret::decode(raw).ok()?;
             Some(secret_to_json(&secret, api_version, kind))
+        }
+        ("coordination.k8s.io/v1", "Lease") => {
+            let lease = pbcoord::Lease::decode(raw).ok()?;
+            Some(lease_to_json(&lease, api_version, kind))
+        }
+        ("admissionregistration.k8s.io/v1", "ValidatingWebhookConfiguration") => {
+            let c = pbadmission::ValidatingWebhookConfiguration::decode(raw).ok()?;
+            Some(webhook_config_to_json(
+                c.metadata.as_ref(),
+                c.webhooks.iter().map(validating_webhook_to_json).collect(),
+                api_version,
+                kind,
+            ))
+        }
+        ("admissionregistration.k8s.io/v1", "MutatingWebhookConfiguration") => {
+            let c = pbadmission::MutatingWebhookConfiguration::decode(raw).ok()?;
+            Some(webhook_config_to_json(
+                c.metadata.as_ref(),
+                c.webhooks.iter().map(mutating_webhook_to_json).collect(),
+                api_version,
+                kind,
+            ))
         }
         _ => None,
     }
@@ -98,6 +122,264 @@ fn secret_to_json(s: &pbcore::Secret, api_version: &str, kind: &str) -> Value {
         }
     }
     Value::Object(obj)
+}
+
+// ─── Lease walker ───────────────────────────────────────────────────────────
+
+// Leader-election clients (controller-runtime, client-go) write the lock
+// Lease as protobuf. The store treats Lease as opaque, so all we have to do is
+// faithfully round-trip the spec — `renewTime`/`acquireTime` in particular,
+// since holders compare them against `leaseDurationSeconds` to decide whether
+// the lease has expired.
+fn lease_to_json(l: &pbcoord::Lease, api_version: &str, kind: &str) -> Value {
+    let mut obj = Map::new();
+    obj.insert("apiVersion".into(), json!(api_version));
+    obj.insert("kind".into(), json!(kind));
+    if let Some(meta) = l.metadata.as_ref() {
+        obj.insert("metadata".into(), object_meta_to_json(meta));
+    }
+    if let Some(spec) = l.spec.as_ref() {
+        let mut s = Map::new();
+        if let Some(v) = spec.holder_identity.as_deref() {
+            s.insert("holderIdentity".into(), json!(v));
+        }
+        if let Some(v) = spec.lease_duration_seconds {
+            s.insert("leaseDurationSeconds".into(), json!(v));
+        }
+        if let Some(t) = spec.acquire_time.as_ref() {
+            s.insert("acquireTime".into(), micro_time_to_json(t));
+        }
+        if let Some(t) = spec.renew_time.as_ref() {
+            s.insert("renewTime".into(), micro_time_to_json(t));
+        }
+        if let Some(v) = spec.lease_transitions {
+            s.insert("leaseTransitions".into(), json!(v));
+        }
+        if let Some(v) = spec.strategy.as_deref() {
+            s.insert("strategy".into(), json!(v));
+        }
+        if let Some(v) = spec.preferred_holder.as_deref() {
+            s.insert("preferredHolder".into(), json!(v));
+        }
+        obj.insert("spec".into(), Value::Object(s));
+    }
+    Value::Object(obj)
+}
+
+// ─── Admission webhook config walker ────────────────────────────────────────
+
+// cert-manager's cainjector writes the webhook config's `caBundle` via a full
+// protobuf Update. We must round-trip the whole object — especially the
+// `webhooks` array (clientConfig.service, rules, selectors) that r8s's own
+// admission dispatch reads — or the Update would clobber it. Validating and
+// Mutating configs share everything except per-webhook extras, so the wrapper
+// is shared and the per-webhook converters differ.
+fn webhook_config_to_json(
+    metadata: Option<&pbmeta::ObjectMeta>,
+    webhooks: Vec<Value>,
+    api_version: &str,
+    kind: &str,
+) -> Value {
+    let mut obj = Map::new();
+    obj.insert("apiVersion".into(), json!(api_version));
+    obj.insert("kind".into(), json!(kind));
+    if let Some(meta) = metadata {
+        obj.insert("metadata".into(), object_meta_to_json(meta));
+    }
+    if !webhooks.is_empty() {
+        obj.insert("webhooks".into(), Value::Array(webhooks));
+    }
+    Value::Object(obj)
+}
+
+fn validating_webhook_to_json(w: &pbadmission::ValidatingWebhook) -> Value {
+    let mut m = Map::new();
+    insert_common_webhook_fields(
+        &mut m,
+        w.name.as_deref(),
+        w.client_config.as_ref(),
+        &w.rules,
+        w.failure_policy.as_deref(),
+        w.match_policy.as_deref(),
+        w.namespace_selector.as_ref(),
+        w.object_selector.as_ref(),
+        w.side_effects.as_deref(),
+        w.timeout_seconds,
+        &w.admission_review_versions,
+        &w.match_conditions,
+    );
+    Value::Object(m)
+}
+
+fn mutating_webhook_to_json(w: &pbadmission::MutatingWebhook) -> Value {
+    let mut m = Map::new();
+    insert_common_webhook_fields(
+        &mut m,
+        w.name.as_deref(),
+        w.client_config.as_ref(),
+        &w.rules,
+        w.failure_policy.as_deref(),
+        w.match_policy.as_deref(),
+        w.namespace_selector.as_ref(),
+        w.object_selector.as_ref(),
+        w.side_effects.as_deref(),
+        w.timeout_seconds,
+        &w.admission_review_versions,
+        &w.match_conditions,
+    );
+    if let Some(v) = w.reinvocation_policy.as_deref() {
+        m.insert("reinvocationPolicy".into(), json!(v));
+    }
+    Value::Object(m)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn insert_common_webhook_fields(
+    m: &mut Map<String, Value>,
+    name: Option<&str>,
+    client_config: Option<&pbadmission::WebhookClientConfig>,
+    rules: &[pbadmission::RuleWithOperations],
+    failure_policy: Option<&str>,
+    match_policy: Option<&str>,
+    namespace_selector: Option<&pbmeta::LabelSelector>,
+    object_selector: Option<&pbmeta::LabelSelector>,
+    side_effects: Option<&str>,
+    timeout_seconds: Option<i32>,
+    admission_review_versions: &[String],
+    match_conditions: &[pbadmission::MatchCondition],
+) {
+    if let Some(v) = name {
+        m.insert("name".into(), json!(v));
+    }
+    if let Some(cc) = client_config {
+        m.insert("clientConfig".into(), webhook_client_config_to_json(cc));
+    }
+    if !rules.is_empty() {
+        let rules: Vec<Value> = rules.iter().map(rule_with_operations_to_json).collect();
+        m.insert("rules".into(), Value::Array(rules));
+    }
+    if let Some(v) = failure_policy {
+        m.insert("failurePolicy".into(), json!(v));
+    }
+    if let Some(v) = match_policy {
+        m.insert("matchPolicy".into(), json!(v));
+    }
+    if let Some(s) = namespace_selector {
+        m.insert("namespaceSelector".into(), label_selector_to_json(s));
+    }
+    if let Some(s) = object_selector {
+        m.insert("objectSelector".into(), label_selector_to_json(s));
+    }
+    if let Some(v) = side_effects {
+        m.insert("sideEffects".into(), json!(v));
+    }
+    if let Some(v) = timeout_seconds {
+        m.insert("timeoutSeconds".into(), json!(v));
+    }
+    if !admission_review_versions.is_empty() {
+        m.insert("admissionReviewVersions".into(), json!(admission_review_versions));
+    }
+    if !match_conditions.is_empty() {
+        let mc: Vec<Value> = match_conditions
+            .iter()
+            .map(|c| {
+                let mut o = Map::new();
+                if let Some(n) = c.name.as_deref() {
+                    o.insert("name".into(), json!(n));
+                }
+                if let Some(e) = c.expression.as_deref() {
+                    o.insert("expression".into(), json!(e));
+                }
+                Value::Object(o)
+            })
+            .collect();
+        m.insert("matchConditions".into(), Value::Array(mc));
+    }
+}
+
+fn webhook_client_config_to_json(cc: &pbadmission::WebhookClientConfig) -> Value {
+    let mut o = Map::new();
+    if let Some(url) = cc.url.as_deref() {
+        o.insert("url".into(), json!(url));
+    }
+    if let Some(svc) = cc.service.as_ref() {
+        let mut s = Map::new();
+        if let Some(v) = svc.namespace.as_deref() {
+            s.insert("namespace".into(), json!(v));
+        }
+        if let Some(v) = svc.name.as_deref() {
+            s.insert("name".into(), json!(v));
+        }
+        if let Some(v) = svc.path.as_deref() {
+            s.insert("path".into(), json!(v));
+        }
+        if let Some(v) = svc.port {
+            s.insert("port".into(), json!(v));
+        }
+        o.insert("service".into(), Value::Object(s));
+    }
+    // caBundle is base64-encoded PEM in JSON — this is the field cainjector
+    // is actually setting.
+    if let Some(ca) = cc.ca_bundle.as_ref()
+        && !ca.is_empty()
+    {
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(ca);
+        o.insert("caBundle".into(), json!(b64));
+    }
+    Value::Object(o)
+}
+
+// RuleWithOperations embeds a Rule; in JSON the two are flattened into one
+// object (operations + apiGroups/apiVersions/resources/scope side by side).
+fn rule_with_operations_to_json(r: &pbadmission::RuleWithOperations) -> Value {
+    let mut o = Map::new();
+    if !r.operations.is_empty() {
+        o.insert("operations".into(), json!(r.operations));
+    }
+    if let Some(rule) = r.rule.as_ref() {
+        if !rule.api_groups.is_empty() {
+            o.insert("apiGroups".into(), json!(rule.api_groups));
+        }
+        if !rule.api_versions.is_empty() {
+            o.insert("apiVersions".into(), json!(rule.api_versions));
+        }
+        if !rule.resources.is_empty() {
+            o.insert("resources".into(), json!(rule.resources));
+        }
+        if let Some(scope) = rule.scope.as_deref() {
+            o.insert("scope".into(), json!(scope));
+        }
+    }
+    Value::Object(o)
+}
+
+fn label_selector_to_json(s: &pbmeta::LabelSelector) -> Value {
+    let mut o = Map::new();
+    if !s.match_labels.is_empty() {
+        o.insert("matchLabels".into(), string_map_to_json(&s.match_labels));
+    }
+    if !s.match_expressions.is_empty() {
+        let exprs: Vec<Value> = s
+            .match_expressions
+            .iter()
+            .map(|e| {
+                let mut m = Map::new();
+                if let Some(k) = e.key.as_deref() {
+                    m.insert("key".into(), json!(k));
+                }
+                if let Some(op) = e.operator.as_deref() {
+                    m.insert("operator".into(), json!(op));
+                }
+                if !e.values.is_empty() {
+                    m.insert("values".into(), json!(e.values));
+                }
+                Value::Object(m)
+            })
+            .collect();
+        o.insert("matchExpressions".into(), Value::Array(exprs));
+    }
+    Value::Object(o)
 }
 
 // ─── CRD walker ─────────────────────────────────────────────────────────────
@@ -618,6 +900,24 @@ fn time_to_json(t: &pbmeta::Time) -> Value {
     }
 }
 
+/// Like [`time_to_json`] but for `meta.v1.MicroTime`, which k8s serializes at
+/// microsecond precision — leader-election renewal math relies on the
+/// sub-second component, so we must not truncate it to whole seconds.
+fn micro_time_to_json(t: &pbmeta::MicroTime) -> Value {
+    use chrono::TimeZone;
+    let secs = t.seconds.unwrap_or(0);
+    let nanos = t.nanos.unwrap_or(0);
+    if secs == 0 && nanos == 0 {
+        return Value::Null;
+    }
+    match chrono::Utc.timestamp_opt(secs, nanos as u32) {
+        chrono::offset::LocalResult::Single(dt) => {
+            json!(dt.to_rfc3339_opts(chrono::SecondsFormat::Micros, true))
+        }
+        _ => Value::Null,
+    }
+}
+
 fn string_map_to_json(m: &std::collections::HashMap<String, String>) -> Value {
     let mut o = Map::new();
     for (k, v) in m {
@@ -680,4 +980,127 @@ fn read_message_field(data: &[u8], target: u32) -> Option<&[u8]> {
         pos = end;
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::k8s_pb::runtime as pbruntime;
+    use base64::Engine;
+    use prost::Message;
+
+    /// Wrap a raw resource in the k8s `Unknown` envelope (magic + TypeMeta + raw),
+    /// the exact framing client-go sends.
+    fn envelope(api_version: &str, kind: &str, raw: Vec<u8>) -> Vec<u8> {
+        let unknown = pbruntime::Unknown {
+            type_meta: Some(pbruntime::TypeMeta {
+                api_version: Some(api_version.into()),
+                kind: Some(kind.into()),
+            }),
+            raw: Some(raw),
+            ..Default::default()
+        };
+        let mut body = K8S_MAGIC.to_vec();
+        body.extend(unknown.encode_to_vec());
+        body
+    }
+
+    #[test]
+    fn decodes_validating_webhook_config_round_trip() {
+        let config = pbadmission::ValidatingWebhookConfiguration {
+            metadata: Some(pbmeta::ObjectMeta {
+                name: Some("cert-manager-webhook".into()),
+                ..Default::default()
+            }),
+            webhooks: vec![pbadmission::ValidatingWebhook {
+                name: Some("webhook.cert-manager.io".into()),
+                client_config: Some(pbadmission::WebhookClientConfig {
+                    service: Some(pbadmission::ServiceReference {
+                        namespace: Some("cert-manager".into()),
+                        name: Some("cert-manager-webhook".into()),
+                        path: Some("/validate".into()),
+                        port: Some(443),
+                    }),
+                    ca_bundle: Some(b"PEMDATA".to_vec()),
+                    url: None,
+                }),
+                rules: vec![pbadmission::RuleWithOperations {
+                    operations: vec!["CREATE".into(), "UPDATE".into()],
+                    rule: Some(pbadmission::Rule {
+                        api_groups: vec!["cert-manager.io".into()],
+                        api_versions: vec!["v1".into()],
+                        resources: vec!["certificates".into()],
+                        scope: Some("*".into()),
+                    }),
+                }],
+                side_effects: Some("None".into()),
+                ..Default::default()
+            }],
+        };
+        let body = envelope(
+            "admissionregistration.k8s.io/v1",
+            "ValidatingWebhookConfiguration",
+            config.encode_to_vec(),
+        );
+
+        let v = decode_k8s_protobuf_to_json(&body).expect("decode");
+        assert_eq!(v["kind"], "ValidatingWebhookConfiguration");
+        assert_eq!(v["metadata"]["name"], "cert-manager-webhook");
+
+        let wh = &v["webhooks"][0];
+        assert_eq!(wh["name"], "webhook.cert-manager.io");
+        assert_eq!(wh["clientConfig"]["service"]["name"], "cert-manager-webhook");
+        assert_eq!(wh["clientConfig"]["service"]["path"], "/validate");
+        assert_eq!(wh["clientConfig"]["service"]["port"], 443);
+        // The whole point: caBundle must survive (base64 of "PEMDATA").
+        let expected_ca = base64::engine::general_purpose::STANDARD.encode(b"PEMDATA");
+        assert_eq!(wh["clientConfig"]["caBundle"], expected_ca);
+        // RuleWithOperations must flatten operations + rule fields together.
+        assert_eq!(wh["rules"][0]["operations"][0], "CREATE");
+        assert_eq!(wh["rules"][0]["apiGroups"][0], "cert-manager.io");
+        assert_eq!(wh["rules"][0]["resources"][0], "certificates");
+        assert_eq!(wh["rules"][0]["scope"], "*");
+        assert_eq!(wh["sideEffects"], "None");
+    }
+
+    #[test]
+    fn decodes_mutating_webhook_reinvocation_policy() {
+        let config = pbadmission::MutatingWebhookConfiguration {
+            metadata: Some(pbmeta::ObjectMeta {
+                name: Some("cert-manager-webhook".into()),
+                ..Default::default()
+            }),
+            webhooks: vec![pbadmission::MutatingWebhook {
+                name: Some("webhook.cert-manager.io".into()),
+                reinvocation_policy: Some("Never".into()),
+                ..Default::default()
+            }],
+        };
+        let body = envelope(
+            "admissionregistration.k8s.io/v1",
+            "MutatingWebhookConfiguration",
+            config.encode_to_vec(),
+        );
+        let v = decode_k8s_protobuf_to_json(&body).expect("decode");
+        assert_eq!(v["webhooks"][0]["reinvocationPolicy"], "Never");
+    }
+
+    #[test]
+    fn decodes_lease_spec() {
+        let lease = pbcoord::Lease {
+            metadata: Some(pbmeta::ObjectMeta {
+                name: Some("cert-manager-cainjector-leader-election".into()),
+                ..Default::default()
+            }),
+            spec: Some(pbcoord::LeaseSpec {
+                holder_identity: Some("holder-1".into()),
+                lease_duration_seconds: Some(15),
+                ..Default::default()
+            }),
+        };
+        let body = envelope("coordination.k8s.io/v1", "Lease", lease.encode_to_vec());
+        let v = decode_k8s_protobuf_to_json(&body).expect("decode");
+        assert_eq!(v["spec"]["holderIdentity"], "holder-1");
+        assert_eq!(v["spec"]["leaseDurationSeconds"], 15);
+    }
 }

@@ -183,8 +183,8 @@ fn reconcile_service(store: &Store, service_value: &serde_json::Value) -> anyhow
         .iter()
         .map(|p| EndpointPort {
             port: resolve_target_port(p.target_port.as_ref(), p.port),
-            protocol: p.protocol.clone(),
-            name: p.name.clone(),
+            protocol: Some(p.protocol.clone().unwrap_or_else(|| "TCP".into())),
+            name: Some(p.name.clone().unwrap_or_default()),
             ..Default::default()
         })
         .collect();
@@ -253,8 +253,8 @@ fn reconcile_service(store: &Store, service_value: &serde_json::Value) -> anyhow
         .iter()
         .map(|p| k8s_openapi::api::discovery::v1::EndpointPort {
             port: Some(resolve_target_port(p.target_port.as_ref(), p.port)),
-            protocol: p.protocol.clone(),
-            name: p.name.clone(),
+            protocol: Some(p.protocol.clone().unwrap_or_else(|| "TCP".into())),
+            name: Some(p.name.clone().unwrap_or_default()),
             ..Default::default()
         })
         .collect();
@@ -279,6 +279,12 @@ fn reconcile_service(store: &Store, service_value: &serde_json::Value) -> anyhow
                     ready: Some(true),
                     ..Default::default()
                 }),
+                // Carry the backing-pod reference into the slice. Consumers
+                // (e.g. cert-manager's startup API check) resolve a Service's
+                // named port by walking EndpointSlice endpoints, and skip any
+                // endpoint that lacks a targetRef — so without this they can't
+                // resolve the port and report the Service as not ready.
+                target_ref: a.target_ref.clone(),
                 ..Default::default()
             })
             .collect(),
