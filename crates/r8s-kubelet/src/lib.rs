@@ -425,27 +425,34 @@ async fn start_containers<R: ContainerRuntime>(
         let sa_name = spec.service_account_name.as_deref().unwrap_or("default");
 
         // Resolve each env entry: a literal `value` (with `$(VAR)` expansion
-        // against earlier entries) or `valueFrom.fieldRef` (downward API).
-        // `secretKeyRef`/`configMapKeyRef` aren't resolved yet.
+        // against earlier entries), a `valueFrom.fieldRef` (downward API), or a
+        // `valueFrom.secretKeyRef`/`configMapKeyRef` (looked up in the pod's
+        // namespace). Resolving the key refs matters broadly: charts inject
+        // generated passwords this way and reference them as `$(VAR)` in args
+        // (argo-cd's redis: `--requirepass $(REDIS_PASSWORD)`).
         let mut env: Vec<(String, String)> = Vec::new();
         if let Some(envs) = container_spec.env.as_ref() {
             for e in envs {
                 let value = if let Some(v) = e.value.as_ref() {
                     expand_vars(v, &env)
                 } else if let Some(src) = e.value_from.as_ref() {
-                    src.field_ref
-                        .as_ref()
-                        .and_then(|f| {
-                            resolve_field_ref(
-                                &f.field_path,
-                                pod_name,
-                                pod_ns.unwrap_or("default"),
-                                pod_uid,
-                                pod_ip,
-                                sa_name,
-                            )
-                        })
+                    if let Some(f) = src.field_ref.as_ref() {
+                        resolve_field_ref(
+                            &f.field_path,
+                            pod_name,
+                            pod_ns.unwrap_or("default"),
+                            pod_uid,
+                            pod_ip,
+                            sa_name,
+                        )
                         .unwrap_or_default()
+                    } else if let Some(sk) = src.secret_key_ref.as_ref() {
+                        secret_value(store, pod_ns, &sk.name, &sk.key).unwrap_or_default()
+                    } else if let Some(ck) = src.config_map_key_ref.as_ref() {
+                        configmap_value(store, pod_ns, &ck.name, &ck.key).unwrap_or_default()
+                    } else {
+                        String::new()
+                    }
                 } else {
                     String::new()
                 };
@@ -1404,13 +1411,25 @@ fn prepare_volumes(
         } else if let Some(cm_src) = &vol.config_map {
             let dir = vol_dir(&vol.name);
             std::fs::create_dir_all(&dir)?;
-            project_configmap(store, pod_ns, &cm_src.name, &dir)?;
+            project_configmap(
+                store,
+                pod_ns,
+                &cm_src.name,
+                &dir,
+                cm_src.optional.unwrap_or(false),
+            )?;
             dir.to_string_lossy().to_string()
         } else if let Some(secret_src) = &vol.secret {
             let dir = vol_dir(&vol.name);
             std::fs::create_dir_all(&dir)?;
             let secret_name = secret_src.secret_name.as_deref().unwrap_or_default();
-            project_secret(store, pod_ns, secret_name, &dir)?;
+            project_secret(
+                store,
+                pod_ns,
+                secret_name,
+                &dir,
+                secret_src.optional.unwrap_or(false),
+            )?;
             dir.to_string_lossy().to_string()
         } else if let Some(pvc_src) = &vol.persistent_volume_claim {
             // Resolve PVC -> bound PV -> hostPath. An unbound claim or missing
@@ -1474,6 +1493,7 @@ fn project_configmap(
     namespace: Option<&str>,
     name: &str,
     dir: &Path,
+    optional: bool,
 ) -> anyhow::Result<()> {
     let gvr = GroupVersionResource::configmaps();
     let resource_ref = ResourceRef {
@@ -1481,9 +1501,14 @@ fn project_configmap(
         namespace,
         name,
     };
-    let cm = store
-        .get(&resource_ref)?
-        .ok_or_else(|| anyhow::anyhow!("configmap '{name}' not found"))?;
+    let cm = match store.get(&resource_ref)? {
+        Some(cm) => cm,
+        // An `optional: true` source that doesn't exist is mounted empty, not
+        // an error — matching k8s. Without this, charts that reference
+        // not-yet-created TLS/config secrets (argo-cd) never start their pods.
+        None if optional => return Ok(()),
+        None => anyhow::bail!("configmap '{name}' not found"),
+    };
     if let Some(data) = cm.get("data").and_then(|v| v.as_object()) {
         for (key, value) in data {
             if let Some(s) = value.as_str() {
@@ -1499,6 +1524,7 @@ fn project_secret(
     namespace: Option<&str>,
     name: &str,
     dir: &Path,
+    optional: bool,
 ) -> anyhow::Result<()> {
     let gvr = GroupVersionResource::secrets();
     let resource_ref = ResourceRef {
@@ -1506,9 +1532,15 @@ fn project_secret(
         namespace,
         name,
     };
-    let secret = store
-        .get(&resource_ref)?
-        .ok_or_else(|| anyhow::anyhow!("secret '{name}' not found"))?;
+    let secret = match store.get(&resource_ref)? {
+        Some(secret) => secret,
+        // An `optional: true` source that doesn't exist is mounted empty, not
+        // an error — matching k8s. argo-cd's server/repo-server mount optional
+        // TLS secrets that only get created later, so failing here would wedge
+        // every such pod in Pending.
+        None if optional => return Ok(()),
+        None => anyhow::bail!("secret '{name}' not found"),
+    };
     if let Some(data) = secret.get("data").and_then(|v| v.as_object()) {
         for (key, value) in data {
             if let Some(b64) = value.as_str() {
@@ -1520,6 +1552,50 @@ fn project_secret(
         }
     }
     Ok(())
+}
+
+/// Look up `valueFrom.secretKeyRef`: read `key` from the named Secret in the
+/// pod's namespace and base64-decode it. `None` (→ empty value) if the secret,
+/// key, or decode is missing — best-effort, matching the downward-API path.
+fn secret_value(
+    store: &Store,
+    namespace: Option<&str>,
+    name: &str,
+    key: &str,
+) -> Option<String> {
+    let gvr = GroupVersionResource::secrets();
+    let secret = store
+        .get(&ResourceRef {
+            gvr: &gvr,
+            namespace,
+            name,
+        })
+        .ok()??;
+    let b64 = secret.get("data").and_then(|d| d.get(key)).and_then(|v| v.as_str())?;
+    let bytes = base64::engine::general_purpose::STANDARD.decode(b64).ok()?;
+    String::from_utf8(bytes).ok()
+}
+
+/// Look up `valueFrom.configMapKeyRef`: read `key` from the named ConfigMap in
+/// the pod's namespace. `None` (→ empty value) if absent.
+fn configmap_value(
+    store: &Store,
+    namespace: Option<&str>,
+    name: &str,
+    key: &str,
+) -> Option<String> {
+    let gvr = GroupVersionResource::configmaps();
+    let cm = store
+        .get(&ResourceRef {
+            gvr: &gvr,
+            namespace,
+            name,
+        })
+        .ok()??;
+    cm.get("data")
+        .and_then(|d| d.get(key))
+        .and_then(|v| v.as_str())
+        .map(String::from)
 }
 
 /// Resolve a `valueFrom.fieldRef` field path against the downward API. Returns
