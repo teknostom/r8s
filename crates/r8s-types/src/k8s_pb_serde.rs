@@ -52,6 +52,10 @@ pub fn decode_k8s_protobuf_to_json(body: &[u8]) -> Option<Value> {
             let secret = pbcore::Secret::decode(raw).ok()?;
             Some(secret_to_json(&secret, api_version, kind))
         }
+        ("v1", "ConfigMap") => {
+            let cm = pbcore::ConfigMap::decode(raw).ok()?;
+            Some(configmap_to_json(&cm, api_version, kind))
+        }
         ("coordination.k8s.io/v1", "Lease") => {
             let lease = pbcoord::Lease::decode(raw).ok()?;
             Some(lease_to_json(&lease, api_version, kind))
@@ -74,7 +78,186 @@ pub fn decode_k8s_protobuf_to_json(body: &[u8]) -> Option<Value> {
                 kind,
             ))
         }
-        _ => None,
+        // Everything else: decode generically from the embedded descriptor set.
+        // The hand walkers above stay because they're tested and handle a few
+        // shapes (e.g. Secret.stringData folding) we want to keep exact; the
+        // generic path covers the long tail (Service, StatefulSet, ...).
+        _ => generic::decode(api_version, kind, raw),
+    }
+}
+
+// ─── Generic decoder (descriptor-set driven) ─────────────────────────────────
+//
+// Decodes any compiled k8s message from the embedded FileDescriptorSet, so r8s
+// accepts protobuf request bodies for kinds without a hand-written walker.
+// k8s's "scalar-ish" wrapper messages (IntOrString, Quantity, Time, …) don't
+// follow proto3 JSON mapping, so they're special-cased here.
+mod generic {
+    use std::sync::OnceLock;
+
+    use base64::Engine;
+    use prost_reflect::{DescriptorPool, DynamicMessage, MapKey, ReflectMessage, Value as PbValue};
+    use serde_json::{Map, Value, json};
+
+    static POOL: OnceLock<DescriptorPool> = OnceLock::new();
+
+    fn pool() -> &'static DescriptorPool {
+        POOL.get_or_init(|| {
+            let bytes: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/k8s_fds.bin"));
+            DescriptorPool::decode(bytes).expect("embedded k8s descriptor set is valid")
+        })
+    }
+
+    /// (apiVersion, kind) → fully-qualified protobuf message name. Only groups
+    /// whose `.proto` is compiled in are mappable; others return None and the
+    /// caller surfaces a 415.
+    fn message_name(api_version: &str, kind: &str) -> Option<String> {
+        let pkg = match api_version {
+            "v1" => "k8s.io.api.core.v1",
+            "apps/v1" => "k8s.io.api.apps.v1",
+            "coordination.k8s.io/v1" => "k8s.io.api.coordination.v1",
+            "admissionregistration.k8s.io/v1" => "k8s.io.api.admissionregistration.v1",
+            _ => return None,
+        };
+        Some(format!("{pkg}.{kind}"))
+    }
+
+    pub fn decode(api_version: &str, kind: &str, raw: &[u8]) -> Option<Value> {
+        let name = message_name(api_version, kind)?;
+        let desc = pool().get_message_by_name(&name)?;
+        let msg = DynamicMessage::decode(desc, raw).ok()?;
+        let Value::Object(mut obj) = message_to_json(&msg) else {
+            return None;
+        };
+        // The protobuf body carries no TypeMeta; clients expect it echoed back.
+        obj.insert("apiVersion".into(), json!(api_version));
+        obj.insert("kind".into(), json!(kind));
+        Some(Value::Object(obj))
+    }
+
+    fn message_to_json(msg: &DynamicMessage) -> Value {
+        match msg.descriptor().full_name() {
+            "k8s.io.apimachinery.pkg.util.intstr.IntOrString" => return int_or_string(msg),
+            "k8s.io.apimachinery.pkg.api.resource.Quantity"
+            | "k8s.io.apimachinery.pkg.api.resource.QuantityValue" => {
+                return string_field(msg, "string");
+            }
+            "k8s.io.apimachinery.pkg.apis.meta.v1.Time"
+            | "k8s.io.apimachinery.pkg.apis.meta.v1.MicroTime" => return time(msg),
+            "k8s.io.apimachinery.pkg.runtime.RawExtension" => return raw_extension(msg),
+            _ => {}
+        }
+        let mut obj = Map::new();
+        for (field, value) in msg.fields() {
+            let jname = field.json_name();
+            // gogoproto `(embed)=true` fields are inlined in k8s JSON: their
+            // sub-fields appear directly on the parent, with no wrapper key.
+            // The big one is `Volume.volumeSource` — without inlining, a
+            // Volume's `secret`/`configMap`/`emptyDir` ends up nested under
+            // `volumeSource`, the typed parse finds no source, and the mount is
+            // silently dropped.
+            if INLINE_FIELDS.contains(&jname)
+                && let PbValue::Message(inner) = value
+                && let Value::Object(inner_obj) = message_to_json(inner)
+            {
+                obj.extend(inner_obj);
+                continue;
+            }
+            obj.insert(jname.to_string(), value_to_json(value));
+        }
+        Value::Object(obj)
+    }
+
+    /// json_names of embedded (`gogoproto.embed`) message fields that k8s
+    /// inlines into the parent object rather than nesting.
+    const INLINE_FIELDS: &[&str] = &["volumeSource", "persistentVolumeSource"];
+
+    fn value_to_json(v: &PbValue) -> Value {
+        match v {
+            PbValue::Bool(b) => json!(*b),
+            PbValue::I32(n) => json!(*n),
+            PbValue::I64(n) => json!(*n),
+            PbValue::U32(n) => json!(*n),
+            PbValue::U64(n) => json!(*n),
+            PbValue::F32(n) => json!(*n),
+            PbValue::F64(n) => json!(*n),
+            PbValue::String(s) => json!(s),
+            PbValue::Bytes(b) => json!(base64::engine::general_purpose::STANDARD.encode(b)),
+            PbValue::EnumNumber(n) => json!(*n),
+            PbValue::Message(m) => message_to_json(m),
+            PbValue::List(items) => Value::Array(items.iter().map(value_to_json).collect()),
+            PbValue::Map(map) => {
+                let mut obj = Map::new();
+                for (k, val) in map {
+                    obj.insert(map_key(k), value_to_json(val));
+                }
+                Value::Object(obj)
+            }
+        }
+    }
+
+    fn map_key(k: &MapKey) -> String {
+        match k {
+            MapKey::String(s) => s.clone(),
+            MapKey::Bool(b) => b.to_string(),
+            MapKey::I32(n) => n.to_string(),
+            MapKey::I64(n) => n.to_string(),
+            MapKey::U32(n) => n.to_string(),
+            MapKey::U64(n) => n.to_string(),
+        }
+    }
+
+    fn int_or_string(msg: &DynamicMessage) -> Value {
+        // type: 0 = Int, 1 = String.
+        let is_string = msg
+            .get_field_by_name("type")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0)
+            == 1;
+        if is_string {
+            json!(
+                msg.get_field_by_name("strVal")
+                    .and_then(|v| v.as_str().map(str::to_string))
+                    .unwrap_or_default()
+            )
+        } else {
+            // intVal is int32 → as_i32 (as_i64 only matches an I64 value).
+            json!(
+                msg.get_field_by_name("intVal")
+                    .and_then(|v| v.as_i32())
+                    .unwrap_or(0)
+            )
+        }
+    }
+
+    fn string_field(msg: &DynamicMessage, field: &str) -> Value {
+        json!(
+            msg.get_field_by_name(field)
+                .and_then(|v| v.as_str().map(str::to_string))
+                .unwrap_or_default()
+        )
+    }
+
+    fn time(msg: &DynamicMessage) -> Value {
+        let secs = msg
+            .get_field_by_name("seconds")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let nanos = msg
+            .get_field_by_name("nanos")
+            .and_then(|v| v.as_i32())
+            .unwrap_or(0) as u32;
+        match chrono::DateTime::from_timestamp(secs, nanos) {
+            Some(dt) => json!(dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
+            None => Value::Null,
+        }
+    }
+
+    fn raw_extension(msg: &DynamicMessage) -> Value {
+        msg.get_field_by_name("raw")
+            .and_then(|v| v.as_bytes().map(|b| b.to_vec()))
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or(Value::Null)
     }
 }
 
@@ -120,6 +303,40 @@ fn secret_to_json(s: &pbcore::Secret, api_version: &str, kind: &str) -> Value {
                 data_obj.insert(k.clone(), json!(b64.encode(v.as_bytes())));
             }
         }
+    }
+    Value::Object(obj)
+}
+
+// ─── ConfigMap walker ────────────────────────────────────────────────────────
+//
+// controller-runtime clients (the prometheus-operator among them) write
+// ConfigMaps as protobuf. `data` is plain UTF-8 strings; `binaryData` is raw
+// bytes that the JSON form base64-encodes.
+fn configmap_to_json(c: &pbcore::ConfigMap, api_version: &str, kind: &str) -> Value {
+    let mut obj = Map::new();
+    obj.insert("apiVersion".into(), json!(api_version));
+    obj.insert("kind".into(), json!(kind));
+    if let Some(meta) = c.metadata.as_ref() {
+        obj.insert("metadata".into(), object_meta_to_json(meta));
+    }
+    if let Some(im) = c.immutable {
+        obj.insert("immutable".into(), json!(im));
+    }
+    if !c.data.is_empty() {
+        let mut data = Map::new();
+        for (k, v) in &c.data {
+            data.insert(k.clone(), json!(v));
+        }
+        obj.insert("data".into(), Value::Object(data));
+    }
+    if !c.binary_data.is_empty() {
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let mut bin = Map::new();
+        for (k, v) in &c.binary_data {
+            bin.insert(k.clone(), json!(b64.encode(v)));
+        }
+        obj.insert("binaryData".into(), Value::Object(bin));
     }
     Value::Object(obj)
 }
@@ -1061,6 +1278,134 @@ mod tests {
         assert_eq!(wh["rules"][0]["resources"][0], "certificates");
         assert_eq!(wh["rules"][0]["scope"], "*");
         assert_eq!(wh["sideEffects"], "None");
+    }
+
+    #[test]
+    fn generic_decodes_service_with_intorstring() {
+        use crate::k8s_pb::{core_v1 as pbcore, intstr};
+
+        let svc = pbcore::Service {
+            metadata: Some(pbmeta::ObjectMeta {
+                name: Some("prometheus-operated".into()),
+                ..Default::default()
+            }),
+            spec: Some(pbcore::ServiceSpec {
+                r#type: Some("ClusterIP".into()),
+                cluster_ip: Some("None".into()),
+                selector: [("app".to_string(), "prometheus".to_string())]
+                    .into_iter()
+                    .collect(),
+                ports: vec![
+                    pbcore::ServicePort {
+                        name: Some("web".into()),
+                        port: Some(9090),
+                        // Int targetPort.
+                        target_port: Some(intstr::IntOrString {
+                            r#type: Some(0),
+                            int_val: Some(9090),
+                            str_val: None,
+                        }),
+                        ..Default::default()
+                    },
+                    pbcore::ServicePort {
+                        name: Some("named".into()),
+                        port: Some(80),
+                        // String targetPort.
+                        target_port: Some(intstr::IntOrString {
+                            r#type: Some(1),
+                            int_val: None,
+                            str_val: Some("http".into()),
+                        }),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }),
+            status: None,
+        };
+        let body = envelope("v1", "Service", svc.encode_to_vec());
+
+        // Service has no hand walker — this exercises the generic descriptor path.
+        let v = decode_k8s_protobuf_to_json(&body).expect("decode");
+        assert_eq!(v["kind"], "Service");
+        assert_eq!(v["apiVersion"], "v1");
+        assert_eq!(v["metadata"]["name"], "prometheus-operated");
+        // Field names come straight from the proto json_name, so caps survive.
+        assert_eq!(v["spec"]["type"], "ClusterIP");
+        assert_eq!(v["spec"]["clusterIP"], "None");
+        assert_eq!(v["spec"]["selector"]["app"], "prometheus");
+        // The crux: IntOrString must collapse to a bare int or string, not the
+        // {type,intVal,strVal} message — or every targetPort breaks.
+        assert_eq!(v["spec"]["ports"][0]["targetPort"], json!(9090));
+        assert_eq!(v["spec"]["ports"][1]["targetPort"], json!("http"));
+        assert_eq!(v["spec"]["ports"][0]["port"], json!(9090));
+    }
+
+    #[test]
+    fn generic_inlines_volume_source() {
+        use crate::k8s_pb::core_v1 as pbcore;
+
+        let pod = pbcore::Pod {
+            metadata: Some(pbmeta::ObjectMeta {
+                name: Some("p".into()),
+                ..Default::default()
+            }),
+            spec: Some(pbcore::PodSpec {
+                volumes: vec![pbcore::Volume {
+                    name: Some("config".into()),
+                    volume_source: Some(pbcore::VolumeSource {
+                        secret: Some(pbcore::SecretVolumeSource {
+                            secret_name: Some("my-secret".into()),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                }],
+                ..Default::default()
+            }),
+            status: None,
+        };
+        let body = envelope("v1", "Pod", pod.encode_to_vec());
+
+        let v = decode_k8s_protobuf_to_json(&body).expect("decode");
+        // The secret source must be inlined directly onto the volume; if it
+        // stays nested under `volumeSource`, the typed Volume parse finds no
+        // source and the kubelet silently drops the mount.
+        assert_eq!(v["spec"]["volumes"][0]["name"], "config");
+        assert_eq!(v["spec"]["volumes"][0]["secret"]["secretName"], "my-secret");
+        assert!(
+            v["spec"]["volumes"][0]["volumeSource"].is_null(),
+            "the volumeSource wrapper must be gone (inlined)"
+        );
+    }
+
+    #[test]
+    fn decodes_configmap_round_trip() {
+        let cm = pbcore::ConfigMap {
+            metadata: Some(pbmeta::ObjectMeta {
+                name: Some("prometheus-rulefiles-0".into()),
+                ..Default::default()
+            }),
+            data: [("rules.yaml".to_string(), "groups: []".to_string())]
+                .into_iter()
+                .collect(),
+            binary_data: [("blob".to_string(), vec![0u8, 1u8, 2u8])]
+                .into_iter()
+                .collect(),
+            immutable: Some(true),
+        };
+        let body = envelope("v1", "ConfigMap", cm.encode_to_vec());
+
+        let v = decode_k8s_protobuf_to_json(&body).expect("decode");
+        assert_eq!(v["kind"], "ConfigMap");
+        assert_eq!(v["metadata"]["name"], "prometheus-rulefiles-0");
+        // `data` stays plain UTF-8; this is what the prometheus-operator writes
+        // (the rule files), and dropping it leaves Prometheus with no rules.
+        assert_eq!(v["data"]["rules.yaml"], "groups: []");
+        assert_eq!(v["immutable"], true);
+        // `binaryData` is base64-encoded in the JSON form.
+        let expected = base64::engine::general_purpose::STANDARD.encode([0u8, 1u8, 2u8]);
+        assert_eq!(v["binaryData"]["blob"], expected);
     }
 
     #[test]

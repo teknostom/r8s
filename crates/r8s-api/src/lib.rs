@@ -13,6 +13,7 @@ pub mod patch;
 pub mod protobuf;
 pub mod response;
 pub mod scale;
+pub mod schema_default;
 pub mod schema_validate;
 pub mod server;
 pub mod table;

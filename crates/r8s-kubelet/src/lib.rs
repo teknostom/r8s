@@ -11,9 +11,9 @@ use base64::Engine;
 use r8s_runtime::{ContainerConfig, ContainerId, ContainerRuntime, Mount, RegistryAuth};
 use r8s_store::{Store, backend::ResourceRef, watch::WatchEventType};
 use r8s_types::{
-    ContainerState, ContainerStateRunning, ContainerStateTerminated, ContainerStateWaiting,
-    ContainerStatus, GroupVersionResource, Pod, PodCondition, PodIP, PodSpec, PodStatus, Time,
-    Volume, VolumeMount,
+    Container, ContainerState, ContainerStateRunning, ContainerStateTerminated,
+    ContainerStateWaiting, ContainerStatus, GroupVersionResource, Pod, PodCondition, PodIP, PodSpec,
+    PodStatus, Time, Volume, VolumeMount,
 };
 use rustc_hash::FxHashMap;
 use tokio::sync::{Mutex, broadcast};
@@ -300,6 +300,26 @@ async fn reconcile_pod<R: ContainerRuntime>(
     };
     let pod_ip = format!("10.244.0.{ip_num}");
 
+    // Init containers run to completion (in order) before the main containers.
+    if run_init_containers(
+        runtime,
+        store,
+        pod_name,
+        pod_ns,
+        pod_value,
+        spec,
+        &volume_paths,
+        &pod_ip,
+    )
+    .await
+    .is_err()
+    {
+        state.release_ip(ip_num).await;
+        cleanup_pod_volumes(data_dir, &pod_uid);
+        tracing::warn!("pod '{pod_name}': init containers failed, will retry next tick");
+        return;
+    }
+
     let container_ids = match start_containers(
         runtime,
         store,
@@ -386,134 +406,23 @@ async fn start_containers<R: ContainerRuntime>(
 
     for container_spec in &spec.containers {
         let container_name = &container_spec.name;
-        let image = container_spec.image.as_deref().unwrap_or("unknown");
 
-        let pull_policy = container_spec.image_pull_policy.as_deref().unwrap_or(
-            if image.ends_with(":latest") || !image.contains(':') {
-                "Always"
-            } else {
-                "IfNotPresent"
-            },
-        );
-
-        let should_pull = match pull_policy {
-            "Never" => false,
-            "IfNotPresent" => !runtime.has_image(image).await,
-            _ => true,
-        };
-
-        if should_pull {
-            let auth = resolve_image_auth(store, pod_ns, pod_value, image);
-            if let Err(e) = runtime.pull_image(image, auth.as_ref()).await {
-                tracing::error!("pod '{pod_name}': failed to pull image '{image}': {e}");
-                return Err(container_ids);
-            }
-        } else if pull_policy == "IfNotPresent" {
-            tracing::info!("pod '{pod_name}': image '{image}' present locally, skipping pull");
+        if let Err(e) = ensure_image(runtime, store, pod_name, pod_ns, pod_value, container_spec).await
+        {
+            tracing::error!("pod '{pod_name}': {e}");
+            return Err(container_ids);
         }
 
-        let mounts = resolve_mounts(
-            container_spec.volume_mounts.as_deref().unwrap_or_default(),
+        let config = build_container_config(
+            store,
+            pod_name,
+            pod_ns,
+            pod_value,
+            spec,
+            container_spec,
             volume_paths,
+            pod_ip,
         );
-
-        let pod_uid = pod_value
-            .get("metadata")
-            .and_then(|m| m.get("uid"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let sa_name = spec.service_account_name.as_deref().unwrap_or("default");
-
-        // Resolve each env entry: a literal `value` (with `$(VAR)` expansion
-        // against earlier entries), a `valueFrom.fieldRef` (downward API), or a
-        // `valueFrom.secretKeyRef`/`configMapKeyRef` (looked up in the pod's
-        // namespace). Resolving the key refs matters broadly: charts inject
-        // generated passwords this way and reference them as `$(VAR)` in args
-        // (argo-cd's redis: `--requirepass $(REDIS_PASSWORD)`).
-        let mut env: Vec<(String, String)> = Vec::new();
-        if let Some(envs) = container_spec.env.as_ref() {
-            for e in envs {
-                let value = if let Some(v) = e.value.as_ref() {
-                    expand_vars(v, &env)
-                } else if let Some(src) = e.value_from.as_ref() {
-                    if let Some(f) = src.field_ref.as_ref() {
-                        resolve_field_ref(
-                            &f.field_path,
-                            pod_name,
-                            pod_ns.unwrap_or("default"),
-                            pod_uid,
-                            pod_ip,
-                            sa_name,
-                        )
-                        .unwrap_or_default()
-                    } else if let Some(sk) = src.secret_key_ref.as_ref() {
-                        secret_value(store, pod_ns, &sk.name, &sk.key).unwrap_or_default()
-                    } else if let Some(ck) = src.config_map_key_ref.as_ref() {
-                        configmap_value(store, pod_ns, &ck.name, &ck.key).unwrap_or_default()
-                    } else {
-                        String::new()
-                    }
-                } else {
-                    String::new()
-                };
-                env.push((e.name.clone(), value));
-            }
-        }
-        // Point pods at the bootstrapped `kubernetes` Service ClusterIP, not
-        // the bridge gateway. nftables DNAT (synced by r8s-network from the
-        // Service's Endpoints) rewrites 10.96.0.1:443 → 10.244.0.1:6443,
-        // where the API server listens on 0.0.0.0:6443.
-        env.push(("KUBERNETES_SERVICE_HOST".into(), "10.96.0.1".into()));
-        env.push(("KUBERNETES_SERVICE_PORT".into(), "443".into()));
-        env.push(("KUBERNETES_SERVICE_PORT_HTTPS".into(), "443".into()));
-
-        // Expand `$(VAR)` references in command/args against the resolved env,
-        // per the k8s container-environment contract. cert-manager's webhook
-        // relies on this, e.g.
-        // `--dynamic-serving-ca-secret-namespace=$(POD_NAMESPACE)`.
-        let command: Vec<String> = container_spec
-            .command
-            .as_deref()
-            .unwrap_or_default()
-            .iter()
-            .map(|s| expand_vars(s, &env))
-            .collect();
-        let args: Vec<String> = container_spec
-            .args
-            .as_deref()
-            .unwrap_or_default()
-            .iter()
-            .map(|s| expand_vars(s, &env))
-            .collect();
-
-        // securityContext.runAsUser/runAsGroup: container-level wins, else the
-        // pod-level default. Without honoring these r8s runs everything as
-        // root, which breaks images that expect to run as a fixed UID (e.g.
-        // ingress-nginx as 101, whose nginx workers then can't read files the
-        // root-run controller wrote).
-        let csc = container_spec.security_context.as_ref();
-        let psc = spec.security_context.as_ref();
-        let run_as_user = csc
-            .and_then(|c| c.run_as_user)
-            .or_else(|| psc.and_then(|p| p.run_as_user))
-            .map(|u| u as u32);
-        let run_as_group = csc
-            .and_then(|c| c.run_as_group)
-            .or_else(|| psc.and_then(|p| p.run_as_group))
-            .map(|g| g as u32);
-
-        let config = ContainerConfig {
-            name: format!("{pod_name}_{container_name}"),
-            namespace: pod_ns.unwrap_or("default").to_string(),
-            image: image.to_string(),
-            command,
-            args,
-            env,
-            working_dir: container_spec.working_dir.clone(),
-            mounts,
-            run_as_user,
-            run_as_group,
-        };
 
         let container_id = match runtime.create_container(&config).await {
             Ok(id) => id,
@@ -561,6 +470,225 @@ async fn start_containers<R: ContainerRuntime>(
     }
 
     Ok(container_ids)
+}
+
+/// Pull a container's image per its `imagePullPolicy` (defaulting Always for
+/// `:latest`/untagged, else IfNotPresent). Returns an error string on failure.
+async fn ensure_image<R: ContainerRuntime>(
+    runtime: &R,
+    store: &Store,
+    pod_name: &str,
+    pod_ns: Option<&str>,
+    pod_value: &serde_json::Value,
+    container_spec: &Container,
+) -> Result<(), String> {
+    let image = container_spec.image.as_deref().unwrap_or("unknown");
+    let pull_policy = container_spec.image_pull_policy.as_deref().unwrap_or(
+        if image.ends_with(":latest") || !image.contains(':') {
+            "Always"
+        } else {
+            "IfNotPresent"
+        },
+    );
+    let should_pull = match pull_policy {
+        "Never" => false,
+        "IfNotPresent" => !runtime.has_image(image).await,
+        _ => true,
+    };
+    if should_pull {
+        let auth = resolve_image_auth(store, pod_ns, pod_value, image);
+        runtime
+            .pull_image(image, auth.as_ref())
+            .await
+            .map_err(|e| format!("failed to pull image '{image}': {e}"))?;
+    } else if pull_policy == "IfNotPresent" {
+        tracing::info!("pod '{pod_name}': image '{image}' present locally, skipping pull");
+    }
+    Ok(())
+}
+
+/// Build the runtime config for one container: resolve env (literals with
+/// `$(VAR)` expansion, downward-API fieldRefs, secret/configMap keyRefs),
+/// command/args expansion, mounts, and securityContext UID/GID. Shared by both
+/// init and main containers.
+fn build_container_config(
+    store: &Store,
+    pod_name: &str,
+    pod_ns: Option<&str>,
+    pod_value: &serde_json::Value,
+    spec: &PodSpec,
+    container_spec: &Container,
+    volume_paths: &FxHashMap<String, String>,
+    pod_ip: &str,
+) -> ContainerConfig {
+    let container_name = &container_spec.name;
+    let image = container_spec.image.as_deref().unwrap_or("unknown");
+
+    let mounts = resolve_mounts(
+        container_spec.volume_mounts.as_deref().unwrap_or_default(),
+        volume_paths,
+    );
+
+    let pod_uid = pod_value
+        .get("metadata")
+        .and_then(|m| m.get("uid"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let sa_name = spec.service_account_name.as_deref().unwrap_or("default");
+
+    let mut env: Vec<(String, String)> = Vec::new();
+    if let Some(envs) = container_spec.env.as_ref() {
+        for e in envs {
+            let value = if let Some(v) = e.value.as_ref() {
+                expand_vars(v, &env)
+            } else if let Some(src) = e.value_from.as_ref() {
+                if let Some(f) = src.field_ref.as_ref() {
+                    resolve_field_ref(
+                        &f.field_path,
+                        pod_name,
+                        pod_ns.unwrap_or("default"),
+                        pod_uid,
+                        pod_ip,
+                        sa_name,
+                    )
+                    .unwrap_or_default()
+                } else if let Some(sk) = src.secret_key_ref.as_ref() {
+                    secret_value(store, pod_ns, &sk.name, &sk.key).unwrap_or_default()
+                } else if let Some(ck) = src.config_map_key_ref.as_ref() {
+                    configmap_value(store, pod_ns, &ck.name, &ck.key).unwrap_or_default()
+                } else {
+                    String::new()
+                }
+            } else {
+                String::new()
+            };
+            env.push((e.name.clone(), value));
+        }
+    }
+    // Point pods at the bootstrapped `kubernetes` Service ClusterIP, not the
+    // bridge gateway. nftables DNAT rewrites 10.96.0.1:443 → 10.244.0.1:6443.
+    env.push(("KUBERNETES_SERVICE_HOST".into(), "10.96.0.1".into()));
+    env.push(("KUBERNETES_SERVICE_PORT".into(), "443".into()));
+    env.push(("KUBERNETES_SERVICE_PORT_HTTPS".into(), "443".into()));
+
+    let command: Vec<String> = container_spec
+        .command
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .map(|s| expand_vars(s, &env))
+        .collect();
+    let args: Vec<String> = container_spec
+        .args
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .map(|s| expand_vars(s, &env))
+        .collect();
+
+    let csc = container_spec.security_context.as_ref();
+    let psc = spec.security_context.as_ref();
+    let run_as_user = csc
+        .and_then(|c| c.run_as_user)
+        .or_else(|| psc.and_then(|p| p.run_as_user))
+        .map(|u| u as u32);
+    let run_as_group = csc
+        .and_then(|c| c.run_as_group)
+        .or_else(|| psc.and_then(|p| p.run_as_group))
+        .map(|g| g as u32);
+
+    ContainerConfig {
+        name: format!("{pod_name}_{container_name}"),
+        namespace: pod_ns.unwrap_or("default").to_string(),
+        image: image.to_string(),
+        command,
+        args,
+        env,
+        working_dir: container_spec.working_dir.clone(),
+        mounts,
+        run_as_user,
+        run_as_group,
+    }
+}
+
+/// Run the pod's init containers in order, each to completion, before the main
+/// containers start. A non-zero exit fails the pod (caller retries with
+/// backoff). Init containers share the pod's volumes (the emptyDir host dirs
+/// are created once per pod), so an init container can stage files a main
+/// container later reads — which is exactly how prometheus's config-reloader
+/// expands its config Secret into the shared `config_out` dir.
+async fn run_init_containers<R: ContainerRuntime>(
+    runtime: &R,
+    store: &Store,
+    pod_name: &str,
+    pod_ns: Option<&str>,
+    pod_value: &serde_json::Value,
+    spec: &PodSpec,
+    volume_paths: &FxHashMap<String, String>,
+    pod_ip: &str,
+) -> Result<(), ()> {
+    let inits = match spec.init_containers.as_deref() {
+        Some(c) if !c.is_empty() => c,
+        _ => return Ok(()),
+    };
+
+    for container_spec in inits {
+        let name = &container_spec.name;
+        if let Err(e) = ensure_image(runtime, store, pod_name, pod_ns, pod_value, container_spec).await
+        {
+            tracing::error!("pod '{pod_name}': init '{name}': {e}");
+            return Err(());
+        }
+        let config =
+            build_container_config(store, pod_name, pod_ns, pod_value, spec, container_spec, volume_paths, pod_ip);
+
+        let id = match runtime.create_container(&config).await {
+            Ok(id) => id,
+            Err(e) => {
+                tracing::error!("pod '{pod_name}': init '{name}': create failed: {e}");
+                return Err(());
+            }
+        };
+        if runtime.prepare_task(&id).await.is_err() || runtime.start_container(&id).await.is_err() {
+            tracing::error!("pod '{pod_name}': init '{name}': failed to start");
+            let _ = runtime.stop_container(&id, Duration::from_secs(5)).await;
+            let _ = runtime.remove_container(&id).await;
+            return Err(());
+        }
+
+        // Wait for the init container to exit. Init containers run to
+        // completion; main containers don't start until they all succeed.
+        let deadline = Instant::now() + Duration::from_secs(300);
+        let failed = loop {
+            match runtime.container_status(&id).await {
+                Ok(st) if !st.running => {
+                    let code = st.exit_code.unwrap_or(0);
+                    if code != 0 {
+                        tracing::warn!("pod '{pod_name}': init '{name}' exited code={code}");
+                    } else {
+                        tracing::info!("pod '{pod_name}': init '{name}' completed");
+                    }
+                    break code != 0;
+                }
+                Ok(_) => {
+                    if Instant::now() > deadline {
+                        tracing::warn!("pod '{pod_name}': init '{name}' timed out");
+                        break true;
+                    }
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+                // Task already gone (fast exit before first poll): treat as done.
+                Err(_) => break false,
+            }
+        };
+
+        let _ = runtime.stop_container(&id, Duration::from_secs(5)).await;
+        let _ = runtime.remove_container(&id).await;
+        if failed {
+            return Err(());
+        }
+    }
+    Ok(())
 }
 
 fn update_pod_status(store: &Store, tracked: &TrackedPod) {
@@ -1672,9 +1800,18 @@ fn resolve_mounts(
     volume_mounts
         .iter()
         .filter_map(|vm| {
-            let host_path = volume_paths.get(&vm.name)?;
+            let base = volume_paths.get(&vm.name)?;
+            // `subPath` mounts a single file/dir from within the volume at the
+            // mountPath, rather than the whole volume. Without honoring it, a
+            // file-subPath mount (e.g. prometheus's web-config.yaml from a
+            // Secret) bind-mounts the whole secret directory onto the file
+            // path, so the target reads as a directory.
+            let host_path = match vm.sub_path.as_deref().filter(|s| !s.is_empty()) {
+                Some(sub) => Path::new(base).join(sub).to_string_lossy().into_owned(),
+                None => base.clone(),
+            };
             Some(Mount {
-                host_path: host_path.clone(),
+                host_path,
                 container_path: vm.mount_path.clone(),
                 readonly: vm.read_only.unwrap_or(false),
             })

@@ -29,6 +29,7 @@ fn main() {
         "k8s.io/apimachinery/pkg/apis/meta/v1/generated.proto",
         "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1/generated.proto",
         "k8s.io/api/core/v1/generated.proto",
+        "k8s.io/api/apps/v1/generated.proto",
         "k8s.io/api/coordination/v1/generated.proto",
         "k8s.io/api/admissionregistration/v1/generated.proto",
     ];
@@ -48,6 +49,13 @@ fn main() {
     // full nested `mod k8s::io::...` hierarchy, so prost's cross-package
     // `super::super::...` references resolve correctly.
     cfg.include_file("k8s_pb.rs");
+    // Also emit a FileDescriptorSet so the API server can decode protobuf
+    // request bodies for *any* compiled k8s type generically (via prost-reflect)
+    // instead of needing a hand-written walker per kind. controller-runtime
+    // clients (prometheus-operator, etc.) write every built-in type as
+    // protobuf, so the per-kind approach doesn't scale.
+    let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR set by cargo"));
+    cfg.file_descriptor_set_path(out_dir.join("k8s_fds.bin"));
     cfg.compile_protos(
         &k8s_protos
             .iter()

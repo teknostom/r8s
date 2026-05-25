@@ -467,6 +467,22 @@ fn default_service_ports(ctx: &RouteContext, body: &mut serde_json::Value) {
     }
 }
 
+/// For CRDs, fill in `default` values from the openAPIV3Schema for any absent
+/// field. Skipped for built-ins (same rationale as `validate_cr` — their
+/// vendored schemas are handled separately). Operators depend on this: the
+/// prometheus-operator reads `spec.scrapeInterval` expecting the CRD default
+/// `30s`, and emits an invalid `scrape_interval: ""` without it.
+fn default_cr(ctx: &RouteContext, body: &mut serde_json::Value) {
+    if r8s_types::openapi::spec_bytes_for(&ctx.resource_type.gvr.group, &ctx.resource_type.gvr.version)
+        .is_some()
+    {
+        return;
+    }
+    if let Some(schema) = ctx.resource_type.schema.as_ref() {
+        crate::schema_default::apply_defaults(body, schema);
+    }
+}
+
 /// For CRDs, validate the incoming object against the CRD's openAPIV3Schema.
 /// Skipped for built-in resources (their vendored schemas are very strict and
 /// we don't currently want to reject otherwise-valid input there).
@@ -536,6 +552,7 @@ pub(crate) async fn create_impl(
 
     maybe_allocate_cluster_ip(state, ctx, &mut body);
     default_service_ports(ctx, &mut body);
+    default_cr(ctx, &mut body);
     if ctx.resource_type.gvr.resource == "pods" {
         r8s_controllers::pod_admission::inject_sa_token(&state.store, &mut body);
     }
@@ -639,6 +656,18 @@ pub(crate) async fn update_impl(
         namespace,
         name,
     };
+    // Normalize metadata.name/namespace to the request path, like create_impl.
+    // The apiserver always derives these from the URL; trusting the body breaks
+    // for protobuf clients (controller-runtime) whose gogo-encoded ObjectMeta
+    // carries a present-but-empty `namespace`, which would otherwise overwrite
+    // the real namespace with "" and orphan child objects (e.g. a StatefulSet's
+    // pods get created with an empty namespace).
+    if let Some(meta) = body.get_mut("metadata").and_then(|v| v.as_object_mut()) {
+        meta.insert("name".to_string(), serde_json::json!(name));
+        if let Some(ns) = namespace {
+            meta.insert("namespace".to_string(), serde_json::json!(ns));
+        }
+    }
     let old_object = match state.store.get(&resource_ref) {
         Ok(v) => v,
         Err(err) => return response::anyhow_error_response(err),
@@ -1356,6 +1385,7 @@ pub(crate) async fn patch_impl(
             }
             maybe_allocate_cluster_ip(state, ctx, &mut body);
     default_service_ports(ctx, &mut body);
+            default_cr(ctx, &mut body);
             let admission_ctx = AdmissionCtx {
                 store: &state.store,
                 gvr: &ctx.resource_type.gvr,

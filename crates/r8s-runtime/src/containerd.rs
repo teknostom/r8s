@@ -373,10 +373,16 @@ fn build_oci_spec(
         .chain(config.env.iter().map(|(k, v)| format!("{k}={v}")))
         .collect();
 
+    // An empty `workingDir` means "unset" (default to `/`), not a literal empty
+    // Cwd — runc rejects "" with `Cwd property must not be empty`. Protobuf
+    // clients (controller-runtime) send the field as present-but-empty because
+    // k8s's gogo-proto marshals non-nullable fields even when zero, so we can't
+    // rely on `None` here the way the JSON path does.
     let cwd = config
         .working_dir
         .as_deref()
-        .or(image.working_dir.as_deref())
+        .filter(|s| !s.is_empty())
+        .or(image.working_dir.as_deref().filter(|s| !s.is_empty()))
         .unwrap_or("/");
 
     // Docker-default capabilities
