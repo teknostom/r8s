@@ -550,6 +550,33 @@ pub(crate) async fn create_impl(
         meta.insert("namespace".to_string(), serde_json::json!(ns));
     }
 
+    // NamespaceLifecycle admission: a namespaced resource can only be created
+    // in a namespace that exists. Without this, r8s stores objects keyed by a
+    // namespace string that was never created — masking setup errors and
+    // orphaning resources (a StatefulSet whose namespace is missing strands its
+    // pods). Cluster-scoped resources (namespace == None) and Namespaces
+    // themselves are naturally exempt; bootstrap writes go straight to the
+    // store and bypass this path.
+    if let Some(ns) = namespace.filter(|n| !n.is_empty()) {
+        let ns_gvr = r8s_types::GroupVersionResource::namespaces();
+        let ns_ref = ResourceRef {
+            gvr: &ns_gvr,
+            namespace: None,
+            name: ns,
+        };
+        match state.store.get(&ns_ref) {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                return status_error(
+                    StatusCode::NOT_FOUND,
+                    "NotFound",
+                    &format!("namespaces \"{ns}\" not found"),
+                );
+            }
+            Err(err) => return response::anyhow_error_response(err),
+        }
+    }
+
     maybe_allocate_cluster_ip(state, ctx, &mut body);
     default_service_ports(ctx, &mut body);
     default_cr(ctx, &mut body);

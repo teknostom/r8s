@@ -184,6 +184,7 @@ pub async fn run_with_config<R: ContainerRuntime + 'static>(
                 let data_dir = data_dir.clone();
                 tokio::spawn(async move {
                     check_health(&store, &*runtime, &state, &data_dir).await;
+                    reap_orphans(&store, &*runtime, &state, &data_dir).await;
                 });
             }
             event = rx.recv() => {
@@ -207,6 +208,7 @@ pub async fn run_with_config<R: ContainerRuntime + 'static>(
                     Err(broadcast::error::RecvError::Lagged(_)) => {
                         tracing::warn!("kubelet lagged, re-syncing");
                         reconcile_all(&store, &*runtime, &state, &data_dir).await;
+                        reap_orphans(&store, &*runtime, &state, &data_dir).await;
                     }
                     Err(broadcast::error::RecvError::Closed) => return Ok(()),
                 }
@@ -230,6 +232,81 @@ async fn reconcile_all<R: ContainerRuntime>(
     };
     for pod in &result.items {
         reconcile_pod(store, runtime, state, pod, data_dir).await;
+    }
+}
+
+/// Reap pods we're tracking whose backing object has vanished from the store.
+/// `reconcile_all` only ever *creates*, so a delete the watch never delivered
+/// (broadcast overflow during a mass uninstall, or a delete between daemon
+/// restarts) would otherwise leak its containers forever — the root of the CI
+/// "context deadline exceeded" failures.
+///
+/// This is scoped strictly to pods in our own in-memory `state`, so it can
+/// never touch another cluster's containers that share the global containerd
+/// namespace. Because container ids are name-derived, a pod recreated under the
+/// same name (e.g. a StatefulSet's `web-0`) reuses ids and the pod network of
+/// the orphan we're cleaning up; we guard against clobbering the live successor
+/// by skipping any id or pod-network a currently-live pod still owns.
+async fn reap_orphans<R: ContainerRuntime>(
+    store: &Store,
+    runtime: &R,
+    state: &PodState,
+    data_dir: &Path,
+) {
+    let result = match store.list(&GroupVersionResource::pods(), None, None, None, None, None) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("kubelet reap list error: {e}");
+            return;
+        }
+    };
+    let live_pods: Vec<Pod> = result
+        .items
+        .iter()
+        .filter_map(|v| serde_json::from_value::<Pod>(v.clone()).ok())
+        .collect();
+    let live_uids: std::collections::HashSet<&str> = live_pods
+        .iter()
+        .filter_map(|p| p.metadata.uid.as_deref())
+        .collect();
+    let live_names: std::collections::HashSet<&str> = live_pods
+        .iter()
+        .filter_map(|p| p.metadata.name.as_deref())
+        .collect();
+    let live_cids: std::collections::HashSet<String> = live_pods
+        .iter()
+        .flat_map(|p| {
+            let name = p.metadata.name.clone().unwrap_or_default();
+            container_ids_from_spec(p, &name).into_iter().map(|c| c.0)
+        })
+        .collect();
+
+    for (uid, _) in state.snapshot().await {
+        if live_uids.contains(uid.as_str()) {
+            continue;
+        }
+        let Some(pod_arc) = state.remove(&uid).await else {
+            continue;
+        };
+        let tracked = pod_arc.lock().await;
+        let mut reaped = 0;
+        for cid in &tracked.container_ids {
+            if live_cids.contains(&cid.0) {
+                continue; // a live same-named pod owns this id — leave it alone
+            }
+            let _ = runtime.stop_container(cid, Duration::from_secs(10)).await;
+            let _ = runtime.remove_container(cid).await;
+            reaped += 1;
+        }
+        state.release_ip(tracked.ip_num).await;
+        if !live_names.contains(tracked.name.as_str()) {
+            r8s_network::bridge::teardown_pod_network(&tracked.name);
+        }
+        cleanup_pod_volumes(data_dir, &uid);
+        tracing::info!(
+            "pod '{}': reaped orphan gone from store ({reaped} containers)",
+            tracked.name,
+        );
     }
 }
 
@@ -886,24 +963,51 @@ async fn handle_delete<R: ContainerRuntime>(
         .unwrap_or("unknown")
         .to_string();
 
-    let pod_arc = match state.remove(&pod_uid).await {
-        Some(a) => a,
-        None => return,
+    // Prefer the tracked container ids (authoritative), but if the pod isn't in
+    // our in-memory state — a delete that arrived after a daemon restart, or a
+    // watch that lagged and dropped the Added — fall back to ids derived from
+    // the pod spec. Container ids are deterministic (`<pod>_<container>`), so
+    // either path reaps the right containers; without the fallback an untracked
+    // delete leaks the containers entirely.
+    let (container_ids, ip_num) = match state.remove(&pod_uid).await {
+        Some(pod_arc) => {
+            let tracked = pod_arc.lock().await;
+            (tracked.container_ids.clone(), Some(tracked.ip_num))
+        }
+        None => (container_ids_from_spec(&pod, &pod_name), None),
     };
-    let tracked = pod_arc.lock().await;
 
-    for cid in &tracked.container_ids {
+    for cid in &container_ids {
         let _ = runtime.stop_container(cid, Duration::from_secs(10)).await;
         let _ = runtime.remove_container(cid).await;
     }
-    state.release_ip(tracked.ip_num).await;
+    if let Some(ip) = ip_num {
+        state.release_ip(ip).await;
+    }
     r8s_network::bridge::teardown_pod_network(&pod_name);
     cleanup_pod_volumes(data_dir, &pod_uid);
     tracing::info!(
-        "pod '{pod_name}': cleaned up {} containers, released IP 10.244.0.{}",
-        tracked.container_ids.len(),
-        tracked.ip_num
+        "pod '{pod_name}': cleaned up {} containers",
+        container_ids.len(),
     );
+}
+
+/// Derive a pod's container ids from its spec. Container ids are deterministic
+/// (`<pod_name>_<container_name>`, see `build_container_config`), so this lets
+/// us reap a pod's containers even when it isn't in our in-memory state — e.g.
+/// a delete event for a pod created before the daemon last restarted, or whose
+/// Added event was dropped by a lagging watch.
+fn container_ids_from_spec(pod: &Pod, pod_name: &str) -> Vec<ContainerId> {
+    let Some(spec) = pod.spec.as_ref() else {
+        return Vec::new();
+    };
+    spec.init_containers
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .chain(spec.containers.iter())
+        .map(|c| ContainerId(format!("{pod_name}_{}", c.name)))
+        .collect()
 }
 
 async fn check_health<R: ContainerRuntime>(
@@ -1828,7 +1932,43 @@ fn cleanup_pod_volumes(data_dir: &Path, pod_uid: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{expand_vars, resolve_field_ref};
+    use super::{container_ids_from_spec, expand_vars, resolve_field_ref};
+
+    #[test]
+    fn container_ids_from_spec_covers_init_then_main() {
+        // The untracked-delete and orphan-sweep paths reap by these derived ids,
+        // so they must match exactly what `build_container_config` would create:
+        // `<pod>_<container>`, init containers first.
+        let pod: r8s_types::Pod = serde_json::from_value(serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": { "name": "web-0", "namespace": "default", "uid": "u1" },
+            "spec": {
+                "initContainers": [{ "name": "init-db", "image": "busybox" }],
+                "containers": [
+                    { "name": "app", "image": "nginx" },
+                    { "name": "sidecar", "image": "envoy" }
+                ]
+            }
+        }))
+        .unwrap();
+        let ids: Vec<String> = container_ids_from_spec(&pod, "web-0")
+            .into_iter()
+            .map(|c| c.0)
+            .collect();
+        assert_eq!(ids, ["web-0_init-db", "web-0_app", "web-0_sidecar"]);
+    }
+
+    #[test]
+    fn container_ids_from_spec_empty_without_spec() {
+        let pod: r8s_types::Pod = serde_json::from_value(serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": { "name": "x" }
+        }))
+        .unwrap();
+        assert!(container_ids_from_spec(&pod, "x").is_empty());
+    }
 
     fn env(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
         pairs
