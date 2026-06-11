@@ -1484,6 +1484,7 @@ dependencies = [
  "r8s-store",
  "rustc-hash",
  "serde",
+ "serde_json",
  "toml",
 ]
 

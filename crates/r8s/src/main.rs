@@ -298,35 +298,102 @@ fn ctr_list(resource: &str) -> Vec<String> {
         .collect()
 }
 
-fn cleanup_containerd() {
-    let tasks = ctr_list("tasks");
-    for id in &tasks {
+/// Sweep every backend resource owned by `cluster` and drop it. Same contract
+/// the kubelet uses on every tick (enumerate the backend, filter by ownership
+/// label), so the offline path doesn't drift from the online one:
+///   * containers — `ctr containers info` inspected for `io.r8s.cluster=<c>`
+///     and killed/removed if it matches. Cluster label survives across r8sd
+///     crashes, so this finds leaks the daemon never wrote down.
+///   * nft table  — `r8s_<sanitized-cluster>` deleted (no-op if absent).
+///   * veths      — `/sys/class/net/r8s0/brif/*` whose `ifalias` carries our
+///     cluster tag get `ip link delete`-d.
+///
+/// Images are NOT touched: the containerd `r8s` namespace is shared across
+/// every r8s environment on the host, and images are shared content, not
+/// cluster-owned. Nuking them here used to break sibling clusters.
+fn cleanup_environment(cluster: &str) {
+    let label_match = format!("\"io.r8s.cluster\": \"{cluster}\"");
+    let mut owned_ids: Vec<String> = Vec::new();
+    for id in ctr_list("containers") {
+        let info = Command::new("ctr")
+            .args(["-n", "r8s", "containers", "info", &id])
+            .output();
+        let owned = match info {
+            Ok(o) if o.status.success() => {
+                let out = String::from_utf8_lossy(&o.stdout);
+                container_owned_by(&out, cluster).unwrap_or_else(|| out.contains(&label_match))
+            }
+            _ => false,
+        };
+        if owned {
+            owned_ids.push(id);
+        }
+    }
+
+    for id in &owned_ids {
         let _ = Command::new("ctr")
             .args(["-n", "r8s", "tasks", "kill", "-s", "9", id])
             .output();
     }
-    if !tasks.is_empty() {
+    if !owned_ids.is_empty() {
         std::thread::sleep(Duration::from_millis(500));
     }
-    for id in &tasks {
+    for id in &owned_ids {
         let _ = Command::new("ctr")
             .args(["-n", "r8s", "tasks", "rm", id])
             .output();
-    }
-
-    for id in &ctr_list("containers") {
         let _ = Command::new("ctr")
             .args(["-n", "r8s", "containers", "rm", id])
             .output();
     }
 
-    for id in &ctr_list("images") {
-        let _ = Command::new("ctr")
-            .args(["-n", "r8s", "images", "rm", id])
-            .output();
+    let table = nft_table_name(cluster);
+    let _ = Command::new("nft")
+        .args(["delete", "table", "ip", &table])
+        .output();
+
+    let mut veth_count = 0;
+    let alias_prefix = format!("r8s:cluster={cluster};");
+    let brif = Path::new("/sys/class/net/r8s0/brif");
+    if let Ok(entries) = std::fs::read_dir(brif) {
+        for entry in entries.flatten() {
+            let dev = entry.file_name().to_string_lossy().to_string();
+            let alias_path = Path::new("/sys/class/net").join(&dev).join("ifalias");
+            let alias = std::fs::read_to_string(&alias_path).unwrap_or_default();
+            if alias.trim().starts_with(&alias_prefix) {
+                let _ = Command::new("ip")
+                    .args(["link", "delete", &dev])
+                    .output();
+                veth_count += 1;
+            }
+        }
     }
 
-    println!("Cleaned up containerd resources.");
+    println!(
+        "Cleaned up environment '{cluster}': {} container(s), {veth_count} veth(s), nft table '{table}'.",
+        owned_ids.len(),
+    );
+}
+
+/// Try to parse `ctr containers info <id>` JSON output and return whether the
+/// container is owned by `cluster`. Returns None if the JSON shape isn't what
+/// we expect (older containerd, etc.) so the caller can fall back to a string
+/// match.
+fn container_owned_by(info_json: &str, cluster: &str) -> Option<bool> {
+    let v: serde_json::Value = serde_json::from_str(info_json).ok()?;
+    let labels = v.get("Labels")?.as_object()?;
+    let got = labels.get("io.r8s.cluster")?.as_str()?;
+    Some(got == cluster)
+}
+
+/// Must match `r8s_network::proxy::nft_table_name` — kept in sync by hand to
+/// avoid pulling tokio/hyper into the CLI just for one identifier sanitizer.
+fn nft_table_name(cluster: &str) -> String {
+    let sanitized: String = cluster
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    format!("r8s_{sanitized}")
 }
 
 fn tail_follow(path: &Path) -> anyhow::Result<()> {
@@ -595,8 +662,44 @@ fn env_nuke(config: PathBuf) -> anyhow::Result<()> {
     }
 
     stop_daemon(&dir)?;
-    cleanup_containerd();
+    cleanup_environment(&name);
     std::fs::remove_dir_all(&dir)?;
     println!("Environment '{name}' nuked.");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nft_table_name_matches_runtime_sanitizer() {
+        assert_eq!(nft_table_name("default"), "r8s_default");
+        assert_eq!(nft_table_name("my-cluster.1"), "r8s_my_cluster_1");
+    }
+
+    #[test]
+    fn container_owned_by_matches_label() {
+        let json = r#"{
+            "ID": "abc123",
+            "Labels": {
+                "io.r8s.cluster": "alpha",
+                "io.r8s.pod-uid": "uid-1",
+                "io.r8s.pod-name": "web-0"
+            }
+        }"#;
+        assert_eq!(container_owned_by(json, "alpha"), Some(true));
+        assert_eq!(container_owned_by(json, "beta"), Some(false));
+    }
+
+    #[test]
+    fn container_owned_by_handles_missing_labels() {
+        let json = r#"{"ID": "abc123"}"#;
+        assert_eq!(container_owned_by(json, "alpha"), None);
+    }
+
+    #[test]
+    fn container_owned_by_returns_none_on_garbage() {
+        assert_eq!(container_owned_by("not json", "alpha"), None);
+    }
 }
