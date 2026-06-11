@@ -108,7 +108,17 @@ async fn main() -> anyhow::Result<()> {
                 );
             }
             tracing::info!(socket, "using containerd runtime");
-            let runtime = Arc::new(ContainerdRuntime::new(&socket, data_dir.clone()).await?);
+            // The cluster name (last component of the data dir, e.g.
+            // /var/lib/r8s/clusters/<name>) scopes container ownership labels so
+            // teardown never reaps another cluster's containers in the shared
+            // containerd namespace.
+            let cluster = data_dir
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("default")
+                .to_string();
+            let runtime =
+                Arc::new(ContainerdRuntime::new(&socket, data_dir.clone(), cluster).await?);
             exec_handle = Some(Arc::new(runtime.exec_handle()));
             // Kubelet resource-metrics server (/metrics/resource) so
             // metrics-server has a node to scrape. Containerd only — it reads

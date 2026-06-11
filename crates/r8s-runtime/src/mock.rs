@@ -125,6 +125,18 @@ impl ContainerRuntime for MockRuntime {
         anyhow::bail!("mock runtime has no container PIDs")
     }
 
+    async fn list_owned_containers(&self) -> anyhow::Result<Vec<OwnedContainer>> {
+        let containers = self.containers.lock().expect("mock lock poisoned");
+        Ok(containers
+            .iter()
+            .map(|(id, c)| OwnedContainer {
+                id: ContainerId(id.clone()),
+                pod_uid: c.config.pod_uid.clone(),
+                pod_name: c.config.pod_name.clone(),
+            })
+            .collect())
+    }
+
     async fn exec_sync(
         &self,
         _id: &ContainerId,

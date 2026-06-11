@@ -58,7 +58,19 @@ impl ControllerManager {
             }};
         }
 
-        spawn_controller_with_ca!("namespace", super::namespace::run);
+        // Namespace controller needs the CA (to publish kube-root-ca.crt) and
+        // the registry (to cascade-delete a namespace's contents on deletion).
+        {
+            let store = self.store.clone();
+            let token = self.shutdown.clone();
+            let ca_pem = self.ca_pem.clone();
+            let registry = self.registry.clone();
+            self.handles.push(tokio::spawn(async move {
+                if let Err(e) = super::namespace::run(store, token, ca_pem, registry).await {
+                    tracing::error!("namespace controller error: {e}");
+                }
+            }));
+        }
         spawn_controller_with_ca!("serviceaccount", super::serviceaccount::run);
         spawn_controller!("replicaset", super::replicaset::run);
         spawn_controller!("replicationcontroller", super::replicationcontroller::run);

@@ -7,5 +7,5 @@ pub mod traits;
 pub use mock::MockRuntime;
 pub use traits::{
     ContainerConfig, ContainerId, ContainerRuntime, ContainerStatus, ExecConfig, ExecRuntime,
-    ExecStreams, ImageId, Mount, RegistryAuth,
+    ExecStreams, ImageId, Mount, OwnedContainer, RegistryAuth,
 };

@@ -51,25 +51,28 @@ cleanup_suite() {
     local chart_dir="$1" name="$2"
     echo "  ---- cleanup: $name ----"
 
-    # 1. Uninstall every helm release that appeared during this suite, and
-    #    remember the namespaces they lived in.
-    local ns_seen=""
+    # 1. Uninstall every helm release that appeared during this suite. This
+    #    also removes the cluster-scoped objects helm owns (ClusterRoles,
+    #    webhooks, APIServices) that a namespace delete wouldn't reach.
     while read -r rel ns; do
         [[ -z "$rel" ]] && continue
         grep -qxF "$rel" <<<"$BASELINE_RELEASES" && continue
         echo "  cleanup: helm uninstall $rel -n $ns"
         helm uninstall "$rel" -n "$ns" --wait --timeout 3m || true
-        ns_seen+=" $ns"
     done < <(helm ls -A 2>/dev/null | awk 'NR>1{print $1" "$2}')
 
-    # 2. Suite-specific stragglers helm doesn't remove (CRDs, retained PVCs/PVs).
+    # 2. Suite-specific stragglers helm doesn't remove (cluster-scoped CRDs,
+    #    retained PVs).
     if [[ -f "$chart_dir/delete.sh" ]]; then
         echo "  cleanup: $name delete.sh (stragglers)"
         bash "$chart_dir/delete.sh" || true
     fi
 
-    # 3. Remove the suite's namespaces (never the shared/system ones).
-    for ns in $ns_seen; do
+    # 3. Delete every non-system namespace — the suite's own namespaces plus any
+    #    the workload test created (e.g. argocd's "guestbook", the ingress
+    #    "echo" namespace), which helm knows nothing about. Namespace deletion
+    #    cascades, so this also drains the pods still inside them.
+    for ns in $(kubectl get ns -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
         [[ "$PROTECTED_NS" == *" $ns "* ]] && continue
         kubectl delete namespace "$ns" --wait=false --ignore-not-found >/dev/null 2>&1 || true
     done

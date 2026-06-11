@@ -20,10 +20,30 @@ pub struct Mount {
     pub readonly: bool,
 }
 
+/// A backend container tagged as belonging to this cluster, discovered by
+/// querying the runtime's ownership labels rather than our store. Returned by
+/// [`ContainerRuntime::list_owned_containers`] so teardown can reap orphans by
+/// enumerating what actually exists — robust to a crash that left the store or
+/// in-memory state incomplete.
+#[derive(Debug, Clone)]
+pub struct OwnedContainer {
+    pub id: ContainerId,
+    pub pod_uid: String,
+    pub pod_name: String,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ContainerConfig {
     pub name: String,
     pub namespace: String,
+    /// Pod uid, stamped as an ownership label on the backend container so it
+    /// can be reaped by querying the runtime, not by replaying our store.
+    pub pod_uid: String,
+    /// Pod name — ownership label, and used to tear down the pod network when
+    /// reaping a container discovered from the backend.
+    pub pod_name: String,
+    /// Container name within the pod (`spec.containers[].name`).
+    pub container_name: String,
     pub image: String,
     pub command: Vec<String>,
     pub args: Vec<String>,
@@ -119,6 +139,16 @@ pub trait ContainerRuntime: Send + Sync {
     ) -> impl Future<Output = anyhow::Result<ContainerStatus>> + Send;
 
     fn container_pid(&self, id: &ContainerId) -> impl Future<Output = anyhow::Result<u32>> + Send;
+
+    /// List the containers this cluster owns, discovered from backend ownership
+    /// labels (`io.r8s.cluster`) rather than from our store. Lets teardown reap
+    /// orphans by enumerating what actually exists — a container is labeled the
+    /// instant it's created, so this finds leaks a crash left out of the store
+    /// or in-memory state, and the cluster filter keeps it from touching other
+    /// clusters that share the runtime.
+    fn list_owned_containers(
+        &self,
+    ) -> impl Future<Output = anyhow::Result<Vec<OwnedContainer>>> + Send;
 
     /// Run a command inside a running container and return its exit code. Used
     /// by exec-style probes. Unlike a host-side `nsenter`, this runs with the

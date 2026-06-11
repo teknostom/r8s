@@ -235,77 +235,77 @@ async fn reconcile_all<R: ContainerRuntime>(
     }
 }
 
-/// Reap pods we're tracking whose backing object has vanished from the store.
-/// `reconcile_all` only ever *creates*, so a delete the watch never delivered
-/// (broadcast overflow during a mass uninstall, or a delete between daemon
-/// restarts) would otherwise leak its containers forever — the root of the CI
-/// "context deadline exceeded" failures.
+/// Reap containers whose pod no longer exists in the store. Discovers them by
+/// asking the runtime for everything tagged as ours (`list_owned_containers`)
+/// rather than by replaying our in-memory `state`: a container is labeled the
+/// instant it's created, so this catches leaks a crash left out of `state`, and
+/// `reconcile_all` only ever *creates* — a delete the watch never delivered
+/// (broadcast overflow during a mass uninstall, or a delete across a daemon
+/// restart) would otherwise leak forever. This was the root of the CI "context
+/// deadline exceeded" failures.
 ///
-/// This is scoped strictly to pods in our own in-memory `state`, so it can
-/// never touch another cluster's containers that share the global containerd
-/// namespace. Because container ids are name-derived, a pod recreated under the
-/// same name (e.g. a StatefulSet's `web-0`) reuses ids and the pod network of
-/// the orphan we're cleaning up; we guard against clobbering the live successor
-/// by skipping any id or pod-network a currently-live pod still owns.
+/// The runtime filters by the cluster ownership label, so this can never touch
+/// another cluster's containers in the shared containerd namespace. Containers
+/// carry their pod uid, so a pod recreated under the same name gets a fresh
+/// uid: the old container's uid is absent from the store and reaped, the new
+/// one's uid is present and kept — no name-collision guard needed.
 async fn reap_orphans<R: ContainerRuntime>(
     store: &Store,
     runtime: &R,
     state: &PodState,
     data_dir: &Path,
 ) {
-    let result = match store.list(&GroupVersionResource::pods(), None, None, None, None, None) {
-        Ok(r) => r,
+    // What *should* exist: live pod uids in the store.
+    let live_uids: std::collections::HashSet<String> =
+        match store.list(&GroupVersionResource::pods(), None, None, None, None, None) {
+            Ok(r) => r
+                .items
+                .iter()
+                .filter_map(|v| serde_json::from_value::<Pod>(v.clone()).ok())
+                .filter_map(|p| p.metadata.uid)
+                .collect(),
+            Err(e) => {
+                tracing::warn!("kubelet reap list error: {e}");
+                return;
+            }
+        };
+
+    // What *does* exist: containers the backend says we own.
+    let owned = match runtime.list_owned_containers().await {
+        Ok(o) => o,
         Err(e) => {
-            tracing::warn!("kubelet reap list error: {e}");
+            tracing::warn!("kubelet reap: list_owned_containers failed: {e}");
             return;
         }
     };
-    let live_pods: Vec<Pod> = result
-        .items
-        .iter()
-        .filter_map(|v| serde_json::from_value::<Pod>(v.clone()).ok())
-        .collect();
-    let live_uids: std::collections::HashSet<&str> = live_pods
-        .iter()
-        .filter_map(|p| p.metadata.uid.as_deref())
-        .collect();
-    let live_names: std::collections::HashSet<&str> = live_pods
-        .iter()
-        .filter_map(|p| p.metadata.name.as_deref())
-        .collect();
-    let live_cids: std::collections::HashSet<String> = live_pods
-        .iter()
-        .flat_map(|p| {
-            let name = p.metadata.name.clone().unwrap_or_default();
-            container_ids_from_spec(p, &name).into_iter().map(|c| c.0)
-        })
-        .collect();
 
-    for (uid, _) in state.snapshot().await {
-        if live_uids.contains(uid.as_str()) {
+    // Group container ids by their pod (uid + name).
+    let mut by_pod: FxHashMap<(String, String), Vec<ContainerId>> = FxHashMap::default();
+    for c in owned {
+        by_pod.entry((c.pod_uid, c.pod_name)).or_default().push(c.id);
+    }
+
+    for ((uid, name), cids) in by_pod {
+        // Empty uid = a container we can't attribute (e.g. created before
+        // labeling); leave it for the operator rather than guess. A live pod
+        // keeps its containers.
+        if uid.is_empty() || live_uids.contains(&uid) {
             continue;
         }
-        let Some(pod_arc) = state.remove(&uid).await else {
-            continue;
-        };
-        let tracked = pod_arc.lock().await;
-        let mut reaped = 0;
-        for cid in &tracked.container_ids {
-            if live_cids.contains(&cid.0) {
-                continue; // a live same-named pod owns this id — leave it alone
-            }
+        for cid in &cids {
             let _ = runtime.stop_container(cid, Duration::from_secs(10)).await;
             let _ = runtime.remove_container(cid).await;
-            reaped += 1;
         }
-        state.release_ip(tracked.ip_num).await;
-        if !live_names.contains(tracked.name.as_str()) {
-            r8s_network::bridge::teardown_pod_network(&tracked.name);
+        // Drop in-memory tracking + release the IP if we still held it.
+        if let Some(pod_arc) = state.remove(&uid).await {
+            let tracked = pod_arc.lock().await;
+            state.release_ip(tracked.ip_num).await;
         }
+        r8s_network::bridge::teardown_pod_network(&name);
         cleanup_pod_volumes(data_dir, &uid);
         tracing::info!(
-            "pod '{}': reaped orphan gone from store ({reaped} containers)",
-            tracked.name,
+            "reaped orphan pod '{name}' (uid={uid}): {} containers gone from store",
+            cids.len(),
         );
     }
 }
@@ -677,6 +677,9 @@ fn build_container_config(
     ContainerConfig {
         name: format!("{pod_name}_{container_name}"),
         namespace: pod_ns.unwrap_or("default").to_string(),
+        pod_uid: pod_uid.to_string(),
+        pod_name: pod_name.to_string(),
+        container_name: container_name.to_string(),
         image: image.to_string(),
         command,
         args,
@@ -1968,6 +1971,65 @@ mod tests {
         }))
         .unwrap();
         assert!(container_ids_from_spec(&pod, "x").is_empty());
+    }
+
+    #[tokio::test]
+    async fn reap_orphans_reaps_dead_pod_keeps_live_pod() {
+        use super::{PodState, reap_orphans};
+        use r8s_runtime::{ContainerConfig, ContainerRuntime, MockRuntime};
+        use r8s_store::{Store, backend::ResourceRef};
+        use r8s_types::GroupVersionResource;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(&dir.path().join("s.db")).unwrap();
+        let runtime = MockRuntime::new();
+        let state = PodState::new();
+        let pods = GroupVersionResource::pods();
+
+        let cfg = |pod: &str, uid: &str| ContainerConfig {
+            name: format!("{pod}_main"),
+            pod_uid: uid.to_string(),
+            pod_name: pod.to_string(),
+            container_name: "main".to_string(),
+            ..Default::default()
+        };
+
+        // A live pod: present in the store, with its container in the backend.
+        // The store assigns the uid on create (as the API server does), and the
+        // kubelet labels the container with that same uid — so read it back.
+        let created = store
+            .create(
+                ResourceRef { gvr: &pods, namespace: Some("default"), name: "live" },
+                &serde_json::json!({
+                    "apiVersion": "v1", "kind": "Pod",
+                    "metadata": { "name": "live", "namespace": "default" },
+                    "spec": { "containers": [{ "name": "main", "image": "nginx" }] }
+                }),
+            )
+            .unwrap();
+        let live_uid = created
+            .get("metadata")
+            .and_then(|m| m.get("uid"))
+            .and_then(|v| v.as_str())
+            .unwrap()
+            .to_string();
+        let live_cid = runtime.create_container(&cfg("live", &live_uid)).await.unwrap();
+
+        // An orphan: its container exists in the backend but no Pod object does
+        // — exactly the crash/dropped-delete leak the sweep must catch.
+        let dead_cid = runtime.create_container(&cfg("dead", "uid-dead")).await.unwrap();
+
+        reap_orphans(&store, &runtime, &state, dir.path()).await;
+
+        assert!(
+            runtime.container_status(&dead_cid).await.is_err(),
+            "orphaned pod's container must be reaped"
+        );
+        assert!(
+            runtime.container_status(&live_cid).await.is_ok(),
+            "live pod's container must survive"
+        );
     }
 
     fn env(pairs: &[(&str, &str)]) -> Vec<(String, String)> {

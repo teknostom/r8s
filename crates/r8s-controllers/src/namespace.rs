@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use r8s_store::{Store, backend::ResourceRef, watch::WatchEventType};
-use r8s_types::{GroupVersionResource, ObjectMeta, ServiceAccount};
+use r8s_types::{GroupVersionResource, ObjectMeta, ServiceAccount, registry::ResourceRegistry};
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
@@ -10,7 +10,12 @@ use tokio_util::sync::CancellationToken;
 /// BeforeEach on this object showing up (see `WaitForKubeRootCAInNamespace`).
 const KUBE_ROOT_CA_CONFIGMAP: &str = "kube-root-ca.crt";
 
-pub async fn run(store: Store, shutdown: CancellationToken, ca_pem: String) -> anyhow::Result<()> {
+pub async fn run(
+    store: Store,
+    shutdown: CancellationToken,
+    ca_pem: String,
+    registry: ResourceRegistry,
+) -> anyhow::Result<()> {
     tracing::info!("namespace controller started");
     let ns_gvr = GroupVersionResource::namespaces();
     let sa_gvr = GroupVersionResource::service_accounts();
@@ -34,6 +39,15 @@ pub async fn run(store: Store, shutdown: CancellationToken, ca_pem: String) -> a
                         {
                             ensure_default_sa(&store, &sa_gvr, name);
                             ensure_kube_root_ca(&store, &cm_gvr, name, &ca_pem);
+                        }
+                    }
+                    Ok(event) if matches!(event.event_type, WatchEventType::Deleted) => {
+                        let ns: Result<r8s_types::Namespace, _> =
+                            serde_json::from_value(event.object);
+                        if let Ok(ns) = ns
+                            && let Some(name) = ns.metadata.name.as_deref()
+                        {
+                            cascade_delete(&store, &registry, name);
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -67,6 +81,46 @@ fn reconcile_all(
             ensure_default_sa(store, sa_gvr, name);
             ensure_kube_root_ca(store, cm_gvr, name, ca_pem);
         }
+    }
+}
+
+/// Delete every namespaced object remaining in `namespace`. Mirrors the
+/// kube-controller-manager namespace controller: when a namespace goes away,
+/// everything inside it must too. Without this, objects in a deleted namespace
+/// are orphaned — the API forgets the namespace but pods keep their containers
+/// running on the kubelet, and `kubectl delete namespace` silently leaks. We
+/// delete pods directly (not just their controllers) so the kubelet sees the
+/// Deleted event and reaps promptly; absent-owner GC mops up anything missed.
+fn cascade_delete(store: &Store, registry: &ResourceRegistry, namespace: &str) {
+    let mut deleted = 0u32;
+    for rt in registry.iter() {
+        if !rt.namespaced {
+            continue;
+        }
+        let items = match store.list(&rt.gvr, Some(namespace), None, None, None, None) {
+            Ok(r) => r.items,
+            Err(_) => continue,
+        };
+        for item in &items {
+            let Some(name) = item
+                .get("metadata")
+                .and_then(|m| m.get("name"))
+                .and_then(|v| v.as_str())
+            else {
+                continue;
+            };
+            let rref = ResourceRef {
+                gvr: &rt.gvr,
+                namespace: Some(namespace),
+                name,
+            };
+            if matches!(store.delete(&rref), Ok(Some(_))) {
+                deleted += 1;
+            }
+        }
+    }
+    if deleted > 0 {
+        tracing::info!("namespace '{namespace}' deleted: cascaded {deleted} objects");
     }
 }
 
@@ -141,5 +195,53 @@ fn ensure_kube_root_ca(
             }
         }
         Err(e) => tracing::warn!("failed to check {KUBE_ROOT_CA_CONFIGMAP} in '{namespace}': {e}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cascade_delete;
+    use r8s_store::{Store, backend::ResourceRef};
+    use r8s_types::{GroupVersionResource, registry::ResourceRegistry};
+    use tempfile::TempDir;
+
+    fn pod(name: &str, namespace: &str) -> serde_json::Value {
+        serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": { "name": name, "namespace": namespace },
+            "spec": { "containers": [{ "name": "main", "image": "nginx" }] }
+        })
+    }
+
+    #[test]
+    fn cascade_delete_removes_only_target_namespace() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(&dir.path().join("test.db")).unwrap();
+        let registry = ResourceRegistry::default_mvp();
+        let pods = GroupVersionResource::new("", "v1", "pods");
+
+        let mk = |ns: &str, name: &str| {
+            store
+                .create(
+                    ResourceRef { gvr: &pods, namespace: Some(ns), name },
+                    &pod(name, ns),
+                )
+                .unwrap();
+        };
+        mk("doomed", "a");
+        mk("doomed", "b");
+        mk("keep", "c");
+
+        cascade_delete(&store, &registry, "doomed");
+
+        let doomed = store
+            .list(&pods, Some("doomed"), None, None, None, None)
+            .unwrap();
+        let keep = store
+            .list(&pods, Some("keep"), None, None, None, None)
+            .unwrap();
+        assert_eq!(doomed.items.len(), 0, "target namespace contents must be cascaded");
+        assert_eq!(keep.items.len(), 1, "a bystander namespace must be untouched");
     }
 }

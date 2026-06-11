@@ -29,19 +29,35 @@ use sha2::{Digest, Sha256};
 const NAMESPACE: &str = "r8s";
 const SNAPSHOTTER: &str = "overlayfs";
 
+// Ownership labels stamped on every container so teardown can enumerate the
+// backend ("destroy everything tagged mine whose pod is gone") instead of
+// replaying our store. The containerd namespace is shared across all r8s
+// clusters, so the cluster label is what scopes a reap to our own containers.
+const LABEL_CLUSTER: &str = "io.r8s.cluster";
+const LABEL_POD_UID: &str = "io.r8s.pod-uid";
+const LABEL_POD_NAME: &str = "io.r8s.pod-name";
+const LABEL_CONTAINER: &str = "io.r8s.container";
+
 pub struct ContainerdRuntime {
     channel: Channel,
     data_dir: std::path::PathBuf,
+    /// This cluster's name, stamped into the `io.r8s.cluster` ownership label.
+    cluster: String,
     // Serializes image pulls across all callers (matches kubelet's
     // --serialize-image-pulls=true default).
     pull_lock: tokio::sync::Mutex<()>,
 }
 
 impl ContainerdRuntime {
-    pub async fn new(socket_path: &str, data_dir: std::path::PathBuf) -> anyhow::Result<Self> {
+    pub async fn new(
+        socket_path: &str,
+        data_dir: std::path::PathBuf,
+        cluster: String,
+    ) -> anyhow::Result<Self> {
         Ok(Self {
             channel: connect(socket_path).await?,
             data_dir,
+            cluster,
             pull_lock: tokio::sync::Mutex::new(()),
         })
     }
@@ -583,6 +599,12 @@ impl ContainerRuntime for ContainerdRuntime {
             value: spec_json,
         };
 
+        let labels = std::collections::HashMap::from([
+            (LABEL_CLUSTER.to_string(), self.cluster.clone()),
+            (LABEL_POD_UID.to_string(), config.pod_uid.clone()),
+            (LABEL_POD_NAME.to_string(), config.pod_name.clone()),
+            (LABEL_CONTAINER.to_string(), config.container_name.clone()),
+        ]);
         let container = Container {
             id: config.name.clone(),
             image: image_ref,
@@ -593,6 +615,7 @@ impl ContainerRuntime for ContainerdRuntime {
             spec: Some(spec),
             snapshotter: SNAPSHOTTER.to_string(),
             snapshot_key,
+            labels,
             ..Default::default()
         };
         let req = CreateContainerRequest {
@@ -789,6 +812,29 @@ impl ContainerRuntime for ContainerdRuntime {
             .process
             .ok_or_else(|| anyhow::anyhow!("no process info"))?;
         Ok(process.pid)
+    }
+
+    async fn list_owned_containers(&self) -> anyhow::Result<Vec<OwnedContainer>> {
+        // Server-side filter to this cluster's containers — the containerd
+        // namespace is shared, so without it we'd see (and could reap) other
+        // clusters' containers.
+        let req = ListContainersRequest {
+            filters: vec![format!("labels.\"{LABEL_CLUSTER}\"==\"{}\"", self.cluster)],
+        };
+        let resp = ContainersClient::new(self.channel.clone())
+            .list(with_namespace!(req, NAMESPACE))
+            .await?
+            .into_inner();
+        let owned = resp
+            .containers
+            .into_iter()
+            .map(|c| OwnedContainer {
+                id: ContainerId(c.id),
+                pod_uid: c.labels.get(LABEL_POD_UID).cloned().unwrap_or_default(),
+                pod_name: c.labels.get(LABEL_POD_NAME).cloned().unwrap_or_default(),
+            })
+            .collect();
+        Ok(owned)
     }
 
     async fn exec_sync(
