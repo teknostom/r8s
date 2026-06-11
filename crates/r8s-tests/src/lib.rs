@@ -71,6 +71,7 @@ impl TestCluster {
                     runtime,
                     shutdown,
                     data_dir,
+                    "test".to_string(),
                     Duration::from_millis(500),
                 )
                 .await

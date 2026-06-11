@@ -1,9 +1,11 @@
+use std::path::Path;
 use std::process::Command;
 
 const BRIDGE_NAME: &str = "r8s0";
 const BRIDGE_CIDR: &str = "10.244.0.1/24";
+const VETH_ALIAS_PREFIX: &str = "r8s:";
 
-pub fn setup_bridge(data_dir: &std::path::Path) -> anyhow::Result<()> {
+pub fn setup_bridge(data_dir: &Path) -> anyhow::Result<()> {
     std::fs::create_dir_all(data_dir)?;
 
     let host_resolv = std::fs::read_to_string("/etc/resolv.conf").unwrap_or_default();
@@ -33,21 +35,27 @@ pub fn setup_bridge(data_dir: &std::path::Path) -> anyhow::Result<()> {
     let _ = run("ip", &["link", "set", "r8s-svc", "up"]);
     let _ = run("ip", &["addr", "add", "10.96.0.0/16", "dev", "r8s-svc"]);
 
-    // Docker sets the FORWARD chain policy to DROP
-    let _ = run(
-        "iptables",
-        &["-I", "FORWARD", "1", "-i", BRIDGE_NAME, "-j", "ACCEPT"],
-    );
-    let _ = run(
-        "iptables",
-        &["-I", "FORWARD", "1", "-o", BRIDGE_NAME, "-j", "ACCEPT"],
-    );
+    // Docker sets the FORWARD chain policy to DROP. -C checks for existence
+    // first so repeated r8sd starts don't stack duplicate rules.
+    ensure_iptables_forward("-i");
+    ensure_iptables_forward("-o");
 
     tracing::info!("bridge {BRIDGE_NAME} ready");
     Ok(())
 }
 
-pub fn setup_pod_network(pid: u32, pod_ip: &str, pod_name: &str) -> anyhow::Result<()> {
+/// Configure the host-side veth and its peer inside the pod's netns.
+///
+/// `cluster` and `pod_uid` are written into the host-side veth's interface
+/// alias so `list_owned_veths` can sweep stale links after a crash without
+/// needing to trust the store.
+pub fn setup_pod_network(
+    pid: u32,
+    pod_ip: &str,
+    pod_name: &str,
+    cluster: &str,
+    pod_uid: &str,
+) -> anyhow::Result<()> {
     let veth_host = veth_name(pod_name);
     let veth_peer = format!("{veth_host}p");
     let pid_str = pid.to_string();
@@ -58,6 +66,13 @@ pub fn setup_pod_network(pid: u32, pod_ip: &str, pod_name: &str) -> anyhow::Resu
             "link", "add", &veth_host, "type", "veth", "peer", "name", &veth_peer,
         ],
     )?;
+
+    // Tag the host-side veth with cluster+pod ownership before any further
+    // setup, so even a mid-create crash leaves a sweepable link.
+    let alias = format_alias(cluster, pod_uid, pod_name);
+    if let Err(e) = run("ip", &["link", "set", &veth_host, "alias", &alias]) {
+        tracing::warn!(pod_name, "failed to set veth alias: {e}");
+    }
 
     run("ip", &["link", "set", &veth_peer, "netns", &pid_str])?;
     nsenter(pid, &["ip", "link", "set", &veth_peer, "name", "eth0"])?;
@@ -82,6 +97,71 @@ pub fn teardown_pod_network(pod_name: &str) {
     }
 }
 
+/// A host-side veth attached to the r8s bridge and tagged with our ownership
+/// alias. Returned by `list_owned_veths`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnedVeth {
+    pub link: String,
+    pub pod_uid: String,
+    pub pod_name: String,
+}
+
+/// Enumerate veth devices currently attached to the r8s bridge and return
+/// those whose alias carries our cluster tag. This is the network-side mirror
+/// of `ContainerRuntime::list_owned_containers`: teardown reads the live
+/// kernel state rather than replaying what the store thinks exists.
+///
+/// Returns an empty vec if the bridge is gone (cluster never came up, or
+/// already torn down) — never an error in that case.
+pub fn list_owned_veths(cluster: &str) -> anyhow::Result<Vec<OwnedVeth>> {
+    let brif_dir = Path::new("/sys/class/net").join(BRIDGE_NAME).join("brif");
+    let entries = match std::fs::read_dir(&brif_dir) {
+        Ok(e) => e,
+        Err(_) => return Ok(Vec::new()),
+    };
+
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let alias_path = Path::new("/sys/class/net").join(&name).join("ifalias");
+        let alias = std::fs::read_to_string(&alias_path).unwrap_or_default();
+        if let Some(owned) = parse_alias(&name, alias.trim(), cluster) {
+            out.push(owned);
+        }
+    }
+    Ok(out)
+}
+
+fn format_alias(cluster: &str, pod_uid: &str, pod_name: &str) -> String {
+    format!("{VETH_ALIAS_PREFIX}cluster={cluster};uid={pod_uid};pod={pod_name}")
+}
+
+fn parse_alias(link: &str, alias: &str, want_cluster: &str) -> Option<OwnedVeth> {
+    let rest = alias.strip_prefix(VETH_ALIAS_PREFIX)?;
+    let mut cluster = "";
+    let mut uid = String::new();
+    let mut pod = String::new();
+    for kv in rest.split(';') {
+        let Some((k, v)) = kv.split_once('=') else {
+            continue;
+        };
+        match k {
+            "cluster" => cluster = v,
+            "uid" => uid = v.to_string(),
+            "pod" => pod = v.to_string(),
+            _ => {}
+        }
+    }
+    if cluster != want_cluster {
+        return None;
+    }
+    Some(OwnedVeth {
+        link: link.to_string(),
+        pod_uid: uid,
+        pod_name: pod,
+    })
+}
+
 pub fn cleanup() {
     let _ = run(
         "iptables",
@@ -103,6 +183,19 @@ fn veth_name(pod_name: &str) -> String {
     pod_name.hash(&mut hasher);
     let hash = hasher.finish();
     format!("veth{hash:010x}", hash = hash & 0xff_ffff_ffff)
+}
+
+fn ensure_iptables_forward(direction: &str) {
+    let check = Command::new("iptables")
+        .args(["-C", "FORWARD", direction, BRIDGE_NAME, "-j", "ACCEPT"])
+        .output();
+    let present = matches!(check, Ok(o) if o.status.success());
+    if !present {
+        let _ = run(
+            "iptables",
+            &["-I", "FORWARD", "1", direction, BRIDGE_NAME, "-j", "ACCEPT"],
+        );
+    }
 }
 
 fn run(cmd: &str, args: &[&str]) -> anyhow::Result<()> {
@@ -130,4 +223,35 @@ fn nsenter(pid: u32, cmd_args: &[&str]) -> anyhow::Result<()> {
     let mut args = vec!["-t", &pid_str, "-n", "--"];
     args.extend_from_slice(cmd_args);
     run("nsenter", &args)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn alias_round_trips() {
+        let a = format_alias("alpha", "uid-1", "web-0");
+        let parsed = parse_alias("veth0", &a, "alpha").expect("alpha cluster matches");
+        assert_eq!(
+            parsed,
+            OwnedVeth {
+                link: "veth0".to_string(),
+                pod_uid: "uid-1".to_string(),
+                pod_name: "web-0".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn alias_filters_foreign_cluster() {
+        let a = format_alias("alpha", "uid-1", "web-0");
+        assert!(parse_alias("veth0", &a, "beta").is_none());
+    }
+
+    #[test]
+    fn alias_rejects_unowned_link() {
+        assert!(parse_alias("veth0", "some other alias", "alpha").is_none());
+        assert!(parse_alias("veth0", "", "alpha").is_none());
+    }
 }

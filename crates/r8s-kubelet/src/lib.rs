@@ -142,8 +142,17 @@ pub async fn run<R: ContainerRuntime + 'static>(
     runtime: Arc<R>,
     shutdown: CancellationToken,
     data_dir: PathBuf,
+    cluster: String,
 ) -> anyhow::Result<()> {
-    run_with_config(store, runtime, shutdown, data_dir, Duration::from_secs(10)).await
+    run_with_config(
+        store,
+        runtime,
+        shutdown,
+        data_dir,
+        cluster,
+        Duration::from_secs(10),
+    )
+    .await
 }
 
 pub async fn run_with_config<R: ContainerRuntime + 'static>(
@@ -151,13 +160,14 @@ pub async fn run_with_config<R: ContainerRuntime + 'static>(
     runtime: Arc<R>,
     shutdown: CancellationToken,
     data_dir: PathBuf,
+    cluster: String,
     health_interval: Duration,
 ) -> anyhow::Result<()> {
     tracing::info!("kubelet started for node '{NODE_NAME}'");
 
     let state = Arc::new(PodState::new());
 
-    reconcile_all(&store, &*runtime, &state, &data_dir).await;
+    reconcile_all(&store, &*runtime, &state, &data_dir, &cluster).await;
 
     let mut rx = store.watch(&GroupVersionResource::pods());
     let mut ticker = tokio::time::interval(health_interval);
@@ -182,9 +192,10 @@ pub async fn run_with_config<R: ContainerRuntime + 'static>(
                 let runtime = runtime.clone();
                 let store = store.clone();
                 let data_dir = data_dir.clone();
+                let cluster = cluster.clone();
                 tokio::spawn(async move {
-                    check_health(&store, &*runtime, &state, &data_dir).await;
-                    reap_orphans(&store, &*runtime, &state, &data_dir).await;
+                    check_health(&store, &*runtime, &state, &data_dir, &cluster).await;
+                    reap_orphans(&store, &*runtime, &state, &data_dir, &cluster).await;
                 });
             }
             event = rx.recv() => {
@@ -194,10 +205,11 @@ pub async fn run_with_config<R: ContainerRuntime + 'static>(
                         let store = store.clone();
                         let runtime = runtime.clone();
                         let data_dir = data_dir.clone();
+                        let cluster = cluster.clone();
                         tokio::spawn(async move {
                             match event.event_type {
                                 WatchEventType::Added | WatchEventType::Modified => {
-                                    reconcile_pod(&store, &*runtime, &state, &event.object, &data_dir).await;
+                                    reconcile_pod(&store, &*runtime, &state, &event.object, &data_dir, &cluster).await;
                                 }
                                 WatchEventType::Deleted => {
                                     handle_delete(&*runtime, &state, &event.object, &data_dir).await;
@@ -207,8 +219,8 @@ pub async fn run_with_config<R: ContainerRuntime + 'static>(
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => {
                         tracing::warn!("kubelet lagged, re-syncing");
-                        reconcile_all(&store, &*runtime, &state, &data_dir).await;
-                        reap_orphans(&store, &*runtime, &state, &data_dir).await;
+                        reconcile_all(&store, &*runtime, &state, &data_dir, &cluster).await;
+                        reap_orphans(&store, &*runtime, &state, &data_dir, &cluster).await;
                     }
                     Err(broadcast::error::RecvError::Closed) => return Ok(()),
                 }
@@ -222,6 +234,7 @@ async fn reconcile_all<R: ContainerRuntime>(
     runtime: &R,
     state: &PodState,
     data_dir: &Path,
+    cluster: &str,
 ) {
     let result = match store.list(&GroupVersionResource::pods(), None, None, None, None, None) {
         Ok(r) => r,
@@ -231,7 +244,7 @@ async fn reconcile_all<R: ContainerRuntime>(
         }
     };
     for pod in &result.items {
-        reconcile_pod(store, runtime, state, pod, data_dir).await;
+        reconcile_pod(store, runtime, state, pod, data_dir, cluster).await;
     }
 }
 
@@ -254,6 +267,7 @@ async fn reap_orphans<R: ContainerRuntime>(
     runtime: &R,
     state: &PodState,
     data_dir: &Path,
+    cluster: &str,
 ) {
     // What *should* exist: live pod uids in the store.
     let live_uids: std::collections::HashSet<String> =
@@ -270,7 +284,7 @@ async fn reap_orphans<R: ContainerRuntime>(
             }
         };
 
-    // What *does* exist: containers the backend says we own.
+    // What *does* exist on the container backend.
     let owned = match runtime.list_owned_containers().await {
         Ok(o) => o,
         Err(e) => {
@@ -279,16 +293,35 @@ async fn reap_orphans<R: ContainerRuntime>(
         }
     };
 
-    // Group container ids by their pod (uid + name).
-    let mut by_pod: FxHashMap<(String, String), Vec<ContainerId>> = FxHashMap::default();
+    // What *does* exist on the network backend: every host-side veth on the
+    // r8s bridge whose alias carries our cluster tag. A crash between veth
+    // create and container create leaves a labeled link with no container,
+    // which the container-side enumeration alone cannot see.
+    let owned_veths = r8s_network::bridge::list_owned_veths(cluster).unwrap_or_default();
+
+    // Group by pod (uid + name). The pod name is used for teardown_pod_network
+    // (it hashes pod_name -> veth name) and for log lines.
+    let mut by_pod: FxHashMap<(String, String), (Vec<ContainerId>, Vec<String>)> =
+        FxHashMap::default();
     for c in owned {
-        by_pod.entry((c.pod_uid, c.pod_name)).or_default().push(c.id);
+        by_pod
+            .entry((c.pod_uid, c.pod_name))
+            .or_default()
+            .0
+            .push(c.id);
+    }
+    for v in owned_veths {
+        by_pod
+            .entry((v.pod_uid, v.pod_name))
+            .or_default()
+            .1
+            .push(v.link);
     }
 
-    for ((uid, name), cids) in by_pod {
-        // Empty uid = a container we can't attribute (e.g. created before
+    for ((uid, name), (cids, veths)) in by_pod {
+        // Empty uid = a resource we can't attribute (e.g. created before
         // labeling); leave it for the operator rather than guess. A live pod
-        // keeps its containers.
+        // keeps everything.
         if uid.is_empty() || live_uids.contains(&uid) {
             continue;
         }
@@ -301,11 +334,21 @@ async fn reap_orphans<R: ContainerRuntime>(
             let tracked = pod_arc.lock().await;
             state.release_ip(tracked.ip_num).await;
         }
+        // teardown_pod_network deletes the veth by name-hash. If a veth label
+        // pointed at a different host-side link name (shouldn't happen, but a
+        // pod_name collision across cluster restarts could in theory), nuke
+        // the labeled links too.
         r8s_network::bridge::teardown_pod_network(&name);
+        for link in &veths {
+            let _ = std::process::Command::new("ip")
+                .args(["link", "delete", link])
+                .output();
+        }
         cleanup_pod_volumes(data_dir, &uid);
         tracing::info!(
-            "reaped orphan pod '{name}' (uid={uid}): {} containers gone from store",
+            "reaped orphan pod '{name}' (uid={uid}): {} container(s), {} veth(s)",
             cids.len(),
+            veths.len(),
         );
     }
 }
@@ -316,6 +359,7 @@ async fn reconcile_pod<R: ContainerRuntime>(
     state: &PodState,
     pod_value: &serde_json::Value,
     data_dir: &Path,
+    cluster: &str,
 ) {
     let pod: Pod = match serde_json::from_value(pod_value.clone()) {
         Ok(p) => p,
@@ -406,6 +450,8 @@ async fn reconcile_pod<R: ContainerRuntime>(
         spec,
         &volume_paths,
         &pod_ip,
+        cluster,
+        &pod_uid,
     )
     .await
     {
@@ -477,6 +523,8 @@ async fn start_containers<R: ContainerRuntime>(
     spec: &PodSpec,
     volume_paths: &FxHashMap<String, String>,
     pod_ip: &str,
+    cluster: &str,
+    pod_uid: &str,
 ) -> Result<Vec<ContainerId>, Vec<ContainerId>> {
     let mut container_ids: Vec<ContainerId> = Vec::new();
     let mut network_ready = false;
@@ -526,7 +574,9 @@ async fn start_containers<R: ContainerRuntime>(
         if !network_ready {
             match runtime.container_pid(&container_id).await {
                 Ok(pid) => {
-                    if let Err(e) = r8s_network::bridge::setup_pod_network(pid, pod_ip, pod_name) {
+                    if let Err(e) = r8s_network::bridge::setup_pod_network(
+                        pid, pod_ip, pod_name, cluster, pod_uid,
+                    ) {
                         tracing::warn!("pod '{pod_name}': network setup failed: {e}");
                     }
                 }
@@ -1018,6 +1068,7 @@ async fn check_health<R: ContainerRuntime>(
     runtime: &R,
     state: &PodState,
     data_dir: &Path,
+    cluster: &str,
 ) {
     let snap = state.snapshot().await;
     let mut crashed: Vec<(String, Option<i32>)> = Vec::new();
@@ -1051,10 +1102,10 @@ async fn check_health<R: ContainerRuntime>(
     }
 
     for (pod_uid, exit_code) in crashed {
-        handle_crash(store, runtime, state, data_dir, &pod_uid, exit_code).await;
+        handle_crash(store, runtime, state, data_dir, &pod_uid, exit_code, cluster).await;
     }
 
-    run_probes(store, runtime, state, data_dir).await;
+    run_probes(store, runtime, state, data_dir, cluster).await;
 }
 
 async fn handle_crash<R: ContainerRuntime>(
@@ -1064,6 +1115,7 @@ async fn handle_crash<R: ContainerRuntime>(
     data_dir: &Path,
     pod_uid: &str,
     exit_code: Option<i32>,
+    cluster: &str,
 ) {
     let pod_arc = match state.get(pod_uid).await {
         Some(a) => a,
@@ -1109,7 +1161,7 @@ async fn handle_crash<R: ContainerRuntime>(
             tracked.ready = false;
             update_pod_status(store, &tracked);
         }
-        restart_in_place(store, runtime, state, data_dir, pod_uid).await;
+        restart_in_place(store, runtime, state, data_dir, pod_uid, cluster).await;
     } else {
         terminate_pod(store, runtime, state, data_dir, pod_uid, exit_code).await;
     }
@@ -1121,6 +1173,7 @@ async fn restart_in_place<R: ContainerRuntime>(
     state: &PodState,
     data_dir: &Path,
     pod_uid: &str,
+    cluster: &str,
 ) {
     let pod_arc = match state.get(pod_uid).await {
         Some(a) => a,
@@ -1193,6 +1246,8 @@ async fn restart_in_place<R: ContainerRuntime>(
         spec,
         &volume_paths,
         &pod_ip,
+        cluster,
+        pod_uid,
     )
     .await
     {
@@ -1326,6 +1381,7 @@ async fn run_probes<R: ContainerRuntime>(
     runtime: &R,
     state: &PodState,
     data_dir: &Path,
+    cluster: &str,
 ) {
     let now = Instant::now();
     let mut liveness_failures: Vec<String> = Vec::new();
@@ -1472,7 +1528,7 @@ async fn run_probes<R: ContainerRuntime>(
 
     // Handle liveness failures — restart those pods
     for pod_uid in liveness_failures {
-        restart_in_place(store, runtime, state, data_dir, &pod_uid).await;
+        restart_in_place(store, runtime, state, data_dir, &pod_uid, cluster).await;
     }
 
     // Handle readiness changes
@@ -2020,7 +2076,7 @@ mod tests {
         // — exactly the crash/dropped-delete leak the sweep must catch.
         let dead_cid = runtime.create_container(&cfg("dead", "uid-dead")).await.unwrap();
 
-        reap_orphans(&store, &runtime, &state, dir.path()).await;
+        reap_orphans(&store, &runtime, &state, dir.path(), "test").await;
 
         assert!(
             runtime.container_status(&dead_cid).await.is_err(),

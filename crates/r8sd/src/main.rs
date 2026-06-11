@@ -47,6 +47,17 @@ async fn main() -> anyhow::Result<()> {
     let shutdown = CancellationToken::new();
     let registry = ResourceRegistry::default_mvp();
 
+    // The cluster name (last component of the data dir, e.g.
+    // /var/lib/r8s/clusters/<name>) scopes ownership labels on every backend
+    // resource — containers, nft tables, veth aliases — so teardown can
+    // enumerate the backend and reap by tag without ever touching another
+    // cluster's state on the same host.
+    let cluster = data_dir
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("default")
+        .to_string();
+
     // Controllers must subscribe to watches before the API server
     // accepts mutations, so start them first.
     let mut controller_manager = ControllerManager::new(
@@ -59,7 +70,7 @@ async fn main() -> anyhow::Result<()> {
     controller_manager.start();
 
     r8s_network::bridge::setup_bridge(&data_dir)?;
-    r8s_network::proxy::setup_nat_table()?;
+    r8s_network::proxy::setup_nat_table(&cluster)?;
 
     let mut tasks: Vec<JoinHandle<()>> = Vec::new();
 
@@ -81,7 +92,7 @@ async fn main() -> anyhow::Result<()> {
     spawn(
         &mut tasks,
         "service-proxy",
-        run_service_proxy(store.clone(), shutdown.clone()),
+        run_service_proxy(store.clone(), shutdown.clone(), cluster.clone()),
     );
 
     // Exec backend for the API server's `kubectl exec` endpoint. Only the
@@ -95,7 +106,13 @@ async fn main() -> anyhow::Result<()> {
             spawn(
                 &mut tasks,
                 "kubelet",
-                r8s_kubelet::run(store.clone(), runtime, shutdown.clone(), data_dir.clone()),
+                r8s_kubelet::run(
+                    store.clone(),
+                    runtime,
+                    shutdown.clone(),
+                    data_dir.clone(),
+                    cluster.clone(),
+                ),
             );
         }
         _ => {
@@ -108,17 +125,9 @@ async fn main() -> anyhow::Result<()> {
                 );
             }
             tracing::info!(socket, "using containerd runtime");
-            // The cluster name (last component of the data dir, e.g.
-            // /var/lib/r8s/clusters/<name>) scopes container ownership labels so
-            // teardown never reaps another cluster's containers in the shared
-            // containerd namespace.
-            let cluster = data_dir
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("default")
-                .to_string();
-            let runtime =
-                Arc::new(ContainerdRuntime::new(&socket, data_dir.clone(), cluster).await?);
+            let runtime = Arc::new(
+                ContainerdRuntime::new(&socket, data_dir.clone(), cluster.clone()).await?,
+            );
             exec_handle = Some(Arc::new(runtime.exec_handle()));
             // Kubelet resource-metrics server (/metrics/resource) so
             // metrics-server has a node to scrape. Containerd only — it reads
@@ -136,7 +145,13 @@ async fn main() -> anyhow::Result<()> {
             spawn(
                 &mut tasks,
                 "kubelet",
-                r8s_kubelet::run(store.clone(), runtime, shutdown.clone(), data_dir.clone()),
+                r8s_kubelet::run(
+                    store.clone(),
+                    runtime,
+                    shutdown.clone(),
+                    data_dir.clone(),
+                    cluster.clone(),
+                ),
             );
         }
     }
@@ -161,7 +176,7 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("r8sd shutting down");
     shutdown.cancel();
     r8s_network::bridge::cleanup();
-    r8s_network::proxy::cleanup();
+    r8s_network::proxy::cleanup(&cluster);
     controller_manager.shutdown().await;
     for handle in tasks {
         let _ = handle.await;
@@ -195,12 +210,16 @@ fn spawn(
     }));
 }
 
-async fn run_service_proxy(store: Store, shutdown: CancellationToken) -> anyhow::Result<()> {
+async fn run_service_proxy(
+    store: Store,
+    shutdown: CancellationToken,
+    cluster: String,
+) -> anyhow::Result<()> {
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => return Ok(()),
             _ = tokio::time::sleep(Duration::from_secs(5)) => {
-                if let Err(e) = r8s_network::proxy::sync_service_rules(&store) {
+                if let Err(e) = r8s_network::proxy::sync_service_rules(&store, &cluster) {
                     tracing::warn!("service proxy sync: {e}");
                 }
             }
