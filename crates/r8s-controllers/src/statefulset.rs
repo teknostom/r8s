@@ -128,7 +128,16 @@ fn reconcile_sts(store: &Store, sts_value: &serde_json::Value) -> anyhow::Result
         let mut ordinal = 0u64;
         while created < desired - current_count {
             if !existing_ordinals.contains(&ordinal) {
-                create_pod(store, sts_name, current_uid, sts_ns, template, vcts, ordinal)?;
+                create_pod(
+                    store,
+                    sts_name,
+                    current_uid,
+                    sts_ns,
+                    template,
+                    vcts,
+                    ordinal,
+                    &current_spec.service_name,
+                )?;
                 created += 1;
             }
             ordinal += 1;
@@ -181,6 +190,7 @@ fn pod_ordinal(pod: &Pod) -> u64 {
         .unwrap_or(u64::MAX)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn create_pod(
     store: &Store,
     sts_name: &str,
@@ -189,6 +199,7 @@ fn create_pod(
     template: &PodTemplateSpec,
     volume_claim_templates: &[PersistentVolumeClaim],
     ordinal: u64,
+    service_name: &str,
 ) -> anyhow::Result<()> {
     let pod_name = format!("{sts_name}-{ordinal}");
     let mut labels = template
@@ -201,11 +212,25 @@ fn create_pod(
         pod_name.clone(),
     );
 
+    let mut spec = template.spec.clone();
+
+    // Stable network identity, mirroring the real StatefulSet controller: the
+    // pod becomes addressable as `<pod>.<serviceName>.<ns>.svc.cluster.local`.
+    // The endpoints controller only publishes a per-pod hostname when the
+    // pod's `subdomain` names the Service, so both fields are needed for the
+    // DNS record to exist — and that record is how StatefulSet peers find each
+    // other (e.g. redis replicas dialing `redis-master-0.redis-headless...`).
+    if let Some(spec) = spec.as_mut() {
+        spec.hostname = Some(pod_name.clone());
+        if !service_name.is_empty() {
+            spec.subdomain = Some(service_name.to_string());
+        }
+    }
+
     // Each volumeClaimTemplate gets a per-ordinal PVC (`<tmpl>-<sts>-<ordinal>`)
     // and a matching `persistentVolumeClaim` volume injected into the pod. The
     // PVCs are intentionally *not* owned by the StatefulSet, so they (and their
     // data) outlive pod deletion — that's what makes the data stable.
-    let mut spec = template.spec.clone();
     for vct in volume_claim_templates {
         let Some(tmpl_name) = vct.metadata.name.as_deref() else {
             continue;

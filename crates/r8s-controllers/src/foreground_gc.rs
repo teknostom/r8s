@@ -31,6 +31,14 @@ pub async fn run(
 ) -> anyhow::Result<()> {
     tracing::info!("foreground-gc controller started");
     let mut tick = tokio::time::interval(Duration::from_millis(250));
+    // Absent-owner GC (pass 2 of `reconcile`) only reaps an object once it has
+    // been seen orphaned in two consecutive passes. During an install storm a
+    // child (RS/pod) can be listed a beat before its just-created owner
+    // (Deployment/RS) lands in our `alive_uids` snapshot — which would
+    // otherwise make us reap a perfectly healthy object as a false orphan,
+    // cascading into deleted pods and wiped volumes. Requiring two consecutive
+    // sightings (~250ms apart) lets that transient creation race settle first.
+    let mut prev_orphans: std::collections::HashSet<String> = Default::default();
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => {
@@ -38,13 +46,17 @@ pub async fn run(
                 return Ok(());
             }
             _ = tick.tick() => {
-                reconcile(&store, &registry);
+                prev_orphans = reconcile(&store, &registry, &prev_orphans);
             }
         }
     }
 }
 
-fn reconcile(store: &Store, registry: &ResourceRegistry) {
+fn reconcile(
+    store: &Store,
+    registry: &ResourceRegistry,
+    prev_orphans: &std::collections::HashSet<String>,
+) -> std::collections::HashSet<String> {
     let gvrs: Vec<GroupVersionResource> = registry
         .iter()
         .iter()
@@ -87,6 +99,15 @@ fn reconcile(store: &Store, registry: &ResourceRegistry) {
     // is non-empty and EVERY listed owner is missing, the object is no
     // longer owned by anything and should be reaped — this is the path
     // that breaks dependency cycles once the seed has been deleted.
+    //
+    // We DON'T reap on first sight: `alive_uids` above is a non-atomic snapshot
+    // stitched from one `list` per GVR, so a freshly-created owner can be
+    // absent from it while its child is already present (the child is always
+    // created after its owner). Reaping then would delete a healthy object.
+    // Instead we collect this pass's candidates and only delete the ones that
+    // were ALSO candidates last pass — a real orphan stays absent-owner across
+    // passes, a creation-race artifact resolves within one tick.
+    let mut orphans: std::collections::HashSet<String> = Default::default();
     for gvr in &gvrs {
         let items = match store.list(gvr, None, None, None, None, None) {
             Ok(r) => r.items,
@@ -110,6 +131,22 @@ fn reconcile(store: &Store, registry: &ResourceRegistry) {
             if any_alive {
                 continue;
             }
+            // No UID means we can't debounce safely across passes — skip rather
+            // than risk reaping on a single racy sighting.
+            let uid = match item
+                .get("metadata")
+                .and_then(|m| m.get("uid"))
+                .and_then(|v| v.as_str())
+            {
+                Some(u) => u.to_string(),
+                None => continue,
+            };
+            if !prev_orphans.contains(&uid) {
+                // First sighting — remember it so a still-orphaned object is
+                // reaped next pass, but don't delete yet.
+                orphans.insert(uid);
+                continue;
+            }
             let name = item
                 .get("metadata")
                 .and_then(|m| m.get("name"))
@@ -126,9 +163,17 @@ fn reconcile(store: &Store, registry: &ResourceRegistry) {
                 namespace: ns.as_deref(),
                 name: &name,
             };
-            let _ = store.delete(&rref);
+            if matches!(store.delete(&rref), Ok(Some(_))) {
+                tracing::info!(
+                    "foreground-gc: reaped orphan {}/{} (all {} owner(s) absent for 2 passes)",
+                    gvr.resource,
+                    name,
+                    refs.len(),
+                );
+            }
         }
     }
+    orphans
 }
 
 fn is_foreground_pending(obj: &Value) -> bool {
@@ -306,4 +351,102 @@ fn reconcile_one(
     }
     // Now actually delete.
     let _ = store.delete(&rref);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::reconcile;
+    use r8s_store::{Store, backend::ResourceRef};
+    use r8s_types::{GroupVersionResource, registry::ResourceRegistry};
+    use std::collections::HashSet;
+    use tempfile::TempDir;
+
+    fn rs_with_owner(store: &Store, name: &str, owner_uid: &str) -> String {
+        let gvr = GroupVersionResource::replica_sets();
+        let rref = ResourceRef {
+            gvr: &gvr,
+            namespace: Some("argocd"),
+            name,
+        };
+        let obj = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "ReplicaSet",
+            "metadata": {
+                "name": name,
+                "namespace": "argocd",
+                "ownerReferences": [{
+                    "apiVersion": "apps/v1",
+                    "kind": "Deployment",
+                    "name": "argocd-redis",
+                    "uid": owner_uid,
+                    "controller": true,
+                }],
+            },
+            "spec": { "replicas": 1 },
+        });
+        let created = store.create(rref, &obj).unwrap();
+        created["metadata"]["uid"].as_str().unwrap().to_string()
+    }
+
+    fn exists(store: &Store, name: &str) -> bool {
+        let gvr = GroupVersionResource::replica_sets();
+        store
+            .get(&ResourceRef { gvr: &gvr, namespace: Some("argocd"), name })
+            .unwrap()
+            .is_some()
+    }
+
+    // The regression: during an install storm the owner Deployment can be
+    // missing from the `alive_uids` snapshot while its RS is already present.
+    // The RS must survive the first pass (it's a race artifact, not a real
+    // orphan) and only be reaped if it's STILL orphaned the next pass.
+    #[test]
+    fn absent_owner_child_is_not_reaped_on_first_sighting() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(&dir.path().join("s.db")).unwrap();
+        let registry = ResourceRegistry::default_mvp();
+
+        let rs_uid = rs_with_owner(&store, "argocd-redis-abc", "owner-not-yet-visible");
+
+        // First pass: flagged but not deleted.
+        let orphans = reconcile(&store, &registry, &HashSet::new());
+        assert!(exists(&store, "argocd-redis-abc"), "must survive first pass");
+        assert!(orphans.contains(&rs_uid), "should be flagged as a candidate");
+
+        // Second pass, still orphaned: now it's reaped.
+        let orphans2 = reconcile(&store, &registry, &orphans);
+        assert!(!exists(&store, "argocd-redis-abc"), "confirmed orphan is reaped");
+        assert!(!orphans2.contains(&rs_uid), "deleted object drops out of the set");
+    }
+
+    // If the owner becomes visible before the second pass, the child is never
+    // reaped — exactly what saves a healthy RS whose Deployment landed a beat
+    // late in the snapshot.
+    #[test]
+    fn child_survives_when_owner_appears_next_pass() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(&dir.path().join("s.db")).unwrap();
+        let registry = ResourceRegistry::default_mvp();
+
+        // Create the owner Deployment first so it's in `alive_uids`.
+        let dep_gvr = GroupVersionResource::deployments();
+        let dep = store
+            .create(
+                ResourceRef { gvr: &dep_gvr, namespace: Some("argocd"), name: "argocd-redis" },
+                &serde_json::json!({
+                    "apiVersion": "apps/v1", "kind": "Deployment",
+                    "metadata": { "name": "argocd-redis", "namespace": "argocd" },
+                    "spec": {},
+                }),
+            )
+            .unwrap();
+        let dep_uid = dep["metadata"]["uid"].as_str().unwrap().to_string();
+
+        rs_with_owner(&store, "argocd-redis-def", &dep_uid);
+
+        let orphans = reconcile(&store, &registry, &HashSet::new());
+        let orphans2 = reconcile(&store, &registry, &orphans);
+        assert!(exists(&store, "argocd-redis-def"), "owned RS is never reaped");
+        assert!(orphans.is_empty() && orphans2.is_empty());
+    }
 }

@@ -85,6 +85,23 @@ impl IpPool {
 struct PodState {
     pods: Mutex<FxHashMap<String, SharedPod>>,
     ip_pool: Mutex<IpPool>,
+    /// UIDs of untracked pods a reconcile is currently driving through start-up.
+    /// A plain std mutex (held only for the insert/remove) so [`StartGuard`] can
+    /// release it on drop across the `.await`s in `reconcile_pod`.
+    starting: std::sync::Mutex<rustc_hash::FxHashSet<String>>,
+}
+
+/// Released on drop, clearing the pod's UID from [`PodState::starting`] so a
+/// later tick can retry a start that failed (e.g. an unbound PVC).
+struct StartGuard<'a> {
+    starting: &'a std::sync::Mutex<rustc_hash::FxHashSet<String>>,
+    uid: String,
+}
+
+impl Drop for StartGuard<'_> {
+    fn drop(&mut self) {
+        self.starting.lock().expect("starting poisoned").remove(&self.uid);
+    }
 }
 
 impl PodState {
@@ -92,7 +109,21 @@ impl PodState {
         Self {
             pods: Mutex::new(FxHashMap::default()),
             ip_pool: Mutex::new(IpPool::new()),
+            starting: std::sync::Mutex::new(rustc_hash::FxHashSet::default()),
         }
+    }
+
+    /// Claim the right to start `uid`. Returns `None` if another reconcile is
+    /// already starting it, so callers return without racing in the runtime.
+    fn try_begin_start(&self, uid: &str) -> Option<StartGuard<'_>> {
+        let mut set = self.starting.lock().expect("starting poisoned");
+        if !set.insert(uid.to_string()) {
+            return None;
+        }
+        Some(StartGuard {
+            starting: &self.starting,
+            uid: uid.to_string(),
+        })
     }
 
     async fn get(&self, uid: &str) -> Option<SharedPod> {
@@ -194,6 +225,14 @@ pub async fn run_with_config<R: ContainerRuntime + 'static>(
                 let data_dir = data_dir.clone();
                 let cluster = cluster.clone();
                 tokio::spawn(async move {
+                    // Retry pods scheduled here that haven't started yet — e.g.
+                    // one whose first reconcile lost the race against the
+                    // provisioner binding its PVC. check_health only inspects
+                    // already-tracked pods, so without this periodic resync a
+                    // transient prepare_volumes failure wedges the pod in
+                    // Pending forever. The per-pod start guard keeps this safe
+                    // even if a slow start spills across ticks.
+                    reconcile_all(&store, &*runtime, &state, &data_dir, &cluster).await;
                     check_health(&store, &*runtime, &state, &data_dir, &cluster).await;
                     reap_orphans(&store, &*runtime, &state, &data_dir, &cluster).await;
                 });
@@ -402,6 +441,17 @@ async fn reconcile_pod<R: ContainerRuntime>(
         tracing::warn!("pod '{pod_name}' has no containers in spec");
         return;
     }
+
+    // Only one reconcile may drive an untracked pod through start-up at a time.
+    // The periodic pending-resync and a watch event can both fire for the same
+    // pod; without this guard they race in start_containers and the loser hits
+    // "container already exists", wedging the pod. The guard releases on drop,
+    // so an attempt that bails early (e.g. a not-yet-bound PVC) is retried on a
+    // later tick.
+    let _start_guard = match state.try_begin_start(&pod_uid) {
+        Some(g) => g,
+        None => return,
+    };
 
     let volumes = spec.volumes.as_deref().unwrap_or_default();
     let volume_paths = match prepare_volumes(store, data_dir, &pod_uid, pod_ns, volumes) {
@@ -1708,6 +1758,7 @@ fn prepare_volumes(
                 &cm_src.name,
                 &dir,
                 cm_src.optional.unwrap_or(false),
+                cm_src.default_mode,
             )?;
             dir.to_string_lossy().to_string()
         } else if let Some(secret_src) = &vol.secret {
@@ -1720,6 +1771,7 @@ fn prepare_volumes(
                 secret_name,
                 &dir,
                 secret_src.optional.unwrap_or(false),
+                secret_src.default_mode,
             )?;
             dir.to_string_lossy().to_string()
         } else if let Some(pvc_src) = &vol.persistent_volume_claim {
@@ -1785,6 +1837,7 @@ fn project_configmap(
     name: &str,
     dir: &Path,
     optional: bool,
+    default_mode: Option<i32>,
 ) -> anyhow::Result<()> {
     let gvr = GroupVersionResource::configmaps();
     let resource_ref = ResourceRef {
@@ -1803,11 +1856,24 @@ fn project_configmap(
     if let Some(data) = cm.get("data").and_then(|v| v.as_object()) {
         for (key, value) in data {
             if let Some(s) = value.as_str() {
-                std::fs::write(dir.join(key), s)?;
+                let path = dir.join(key);
+                std::fs::write(&path, s)?;
+                set_projected_mode(&path, default_mode)?;
             }
         }
     }
     Ok(())
+}
+
+/// Apply a volume source's `defaultMode` to a projected file. Kubernetes
+/// defaults to 0644; the mode matters because charts mount entrypoint and
+/// probe scripts from ConfigMaps with `defaultMode: 0755` (bitnami redis runs
+/// `/opt/bitnami/scripts/start-scripts/start-master.sh` straight from such a
+/// mount) — without the exec bit those containers can't even start.
+fn set_projected_mode(path: &Path, mode: Option<i32>) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = mode.unwrap_or(0o644) as u32 & 0o7777;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
 }
 
 fn project_secret(
@@ -1816,6 +1882,7 @@ fn project_secret(
     name: &str,
     dir: &Path,
     optional: bool,
+    default_mode: Option<i32>,
 ) -> anyhow::Result<()> {
     let gvr = GroupVersionResource::secrets();
     let resource_ref = ResourceRef {
@@ -1838,7 +1905,9 @@ fn project_secret(
                 let bytes = base64::engine::general_purpose::STANDARD
                     .decode(b64)
                     .unwrap_or_else(|_| b64.as_bytes().to_vec());
-                std::fs::write(dir.join(key), bytes)?;
+                let path = dir.join(key);
+                std::fs::write(&path, bytes)?;
+                set_projected_mode(&path, default_mode)?;
             }
         }
     }
@@ -1970,7 +2039,21 @@ fn resolve_mounts(
             // Secret) bind-mounts the whole secret directory onto the file
             // path, so the target reads as a directory.
             let host_path = match vm.sub_path.as_deref().filter(|s| !s.is_empty()) {
-                Some(sub) => Path::new(base).join(sub).to_string_lossy().into_owned(),
+                Some(sub) => {
+                    let joined = Path::new(base).join(sub);
+                    // A subPath into a directory-backed volume (emptyDir / PVC /
+                    // hostPath) must already exist on the host or runc fails the
+                    // bind mount ("no such file or directory"); k8s materializes
+                    // it on demand. Create it only when missing, so a subPath
+                    // that targets an already-projected configMap/secret *file*
+                    // is mounted as that file instead of being shadowed by a new
+                    // directory. Best-effort: a failure here surfaces as the same
+                    // runc mount error it does today.
+                    if !joined.exists() {
+                        let _ = std::fs::create_dir_all(&joined);
+                    }
+                    joined.to_string_lossy().into_owned()
+                }
                 None => base.clone(),
             };
             Some(Mount {
@@ -2141,5 +2224,85 @@ mod tests {
             resolve_field_ref("metadata.labels['x']", "p", "ns", "u", "ip", "sa"),
             None
         );
+    }
+
+    #[test]
+    fn start_guard_blocks_concurrent_starts_and_releases_on_drop() {
+        use super::PodState;
+        let state = PodState::new();
+
+        // First claim succeeds; a second claim for the same pod is refused
+        // while the first guard is alive — this is what stops a tick resync and
+        // a watch event from both driving the same pod into start_containers.
+        let g1 = state.try_begin_start("uid-a");
+        assert!(g1.is_some());
+        assert!(state.try_begin_start("uid-a").is_none());
+        // A different pod is independent.
+        assert!(state.try_begin_start("uid-b").is_some());
+
+        // Dropping the guard releases the claim so a later tick can retry.
+        drop(g1);
+        assert!(
+            state.try_begin_start("uid-a").is_some(),
+            "claim must be retryable after the guard drops"
+        );
+    }
+
+    #[test]
+    fn subpath_mount_creates_missing_directory() {
+        // bitnami/postgresql mounts one emptyDir at several mountPaths via
+        // subPath (tmp-dir, app-conf-dir, ...). The subdir doesn't exist until
+        // we make it, and runc refuses to bind-mount a missing source — which
+        // wedged the pod in Pending. resolve_mounts must materialize it.
+        use super::resolve_mounts;
+        use rustc_hash::FxHashMap;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let base = dir.path().join("empty-dir");
+        std::fs::create_dir_all(&base).unwrap();
+
+        let mut paths: FxHashMap<String, String> = FxHashMap::default();
+        paths.insert("empty-dir".into(), base.to_string_lossy().into_owned());
+
+        let vms: Vec<r8s_types::VolumeMount> = serde_json::from_value(serde_json::json!([
+            { "name": "empty-dir", "mountPath": "/tmp", "subPath": "tmp-dir" }
+        ]))
+        .unwrap();
+
+        let mounts = resolve_mounts(&vms, &paths);
+        let expected = base.join("tmp-dir");
+        assert!(expected.is_dir(), "subPath dir should be created on the host");
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(mounts[0].host_path, expected.to_string_lossy());
+        assert_eq!(mounts[0].container_path, "/tmp");
+    }
+
+    #[test]
+    fn subpath_mount_preserves_existing_file() {
+        // A subPath that targets an already-projected configMap/secret *file*
+        // (e.g. prometheus's web-config.yaml) must bind-mount that file, not be
+        // shadowed by a freshly-created directory.
+        use super::resolve_mounts;
+        use rustc_hash::FxHashMap;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let base = dir.path().join("secret-vol");
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(base.join("web-config.yaml"), b"tls: {}").unwrap();
+
+        let mut paths: FxHashMap<String, String> = FxHashMap::default();
+        paths.insert("secret-vol".into(), base.to_string_lossy().into_owned());
+
+        let vms: Vec<r8s_types::VolumeMount> = serde_json::from_value(serde_json::json!([
+            { "name": "secret-vol", "mountPath": "/etc/web-config.yaml", "subPath": "web-config.yaml" }
+        ]))
+        .unwrap();
+
+        let mounts = resolve_mounts(&vms, &paths);
+        let target = base.join("web-config.yaml");
+        assert!(target.is_file(), "existing file subPath must remain a file");
+        assert_eq!(mounts[0].host_path, target.to_string_lossy());
     }
 }

@@ -410,9 +410,13 @@ pub async fn get_cluster(
     get_impl(&state, &ctx, None, &name, &headers)
 }
 
-/// Real k8s allocates a ClusterIP for every `Service` with a real (non-`None`)
-/// `clusterIP` that doesn't already have one — including `LoadBalancer` and
-/// `NodePort` types. Called from both POST and server-side-apply create paths.
+/// Real k8s allocates a ClusterIP for every `Service` that doesn't specify one
+/// — including `LoadBalancer` and `NodePort` types. An explicit `clusterIP`
+/// blocks allocation, and that includes the literal string `"None"`: that is
+/// how headless Services are declared, and overwriting it would silently turn
+/// them into ClusterIP Services (DNS would then serve one virtual IP instead
+/// of the per-pod records StatefulSet charts rely on). Called from both POST
+/// and server-side-apply create paths.
 fn maybe_allocate_cluster_ip(state: &AppState, ctx: &RouteContext, body: &mut serde_json::Value) {
     if ctx.resource_type.gvr.resource != "services" {
         return;
@@ -426,7 +430,7 @@ fn maybe_allocate_cluster_ip(state: &AppState, ctx: &RouteContext, body: &mut se
         .get("spec")
         .and_then(|s| s.get("clusterIP"))
         .and_then(|v| v.as_str())
-        .is_some_and(|ip| !ip.is_empty() && ip != "None");
+        .is_some_and(|ip| !ip.is_empty());
     if !matches!(svc_type, "ClusterIP" | "LoadBalancer" | "NodePort") || has_cluster_ip {
         return;
     }

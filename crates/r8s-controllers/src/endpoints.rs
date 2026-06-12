@@ -163,8 +163,18 @@ fn reconcile_service(store: &Store, service_value: &serde_json::Value) -> anyhow
             }
             let pod_name = pod.metadata.name.as_deref()?;
             let pod_ns = pod.metadata.namespace.as_deref().unwrap_or("default");
+            // Publish the pod's hostname only when its subdomain names this
+            // Service — upstream k8s's gate. This is what scopes per-pod DNS
+            // records (`<hostname>.<svc>.<ns>.svc.cluster.local`) to the
+            // governing headless Service instead of every Service that happens
+            // to select the pod.
+            let hostname = pod.spec.as_ref().and_then(|s| {
+                let hostname = s.hostname.as_deref()?;
+                (s.subdomain.as_deref() == Some(svc_name)).then(|| hostname.to_string())
+            });
             Some(EndpointAddress {
                 ip: pod_ip.to_string(),
+                hostname,
                 target_ref: Some(ObjectReference {
                     kind: Some("Pod".into()),
                     name: Some(pod_name.into()),
@@ -285,6 +295,7 @@ fn reconcile_service(store: &Store, service_value: &serde_json::Value) -> anyhow
                 // endpoint that lacks a targetRef — so without this they can't
                 // resolve the port and report the Service as not ready.
                 target_ref: a.target_ref.clone(),
+                hostname: a.hostname.clone(),
                 ..Default::default()
             })
             .collect(),

@@ -83,6 +83,11 @@ tempfile = "3"
 
 # TLS
 rcgen = { version = "0.13", features = ["x509-parser"] }
+# Pin-only: time 0.3.48 introduced a coherence change that breaks rcgen's blanket
+# `From<T: Into<String>>` impls (E0119), fails on stable too. Not used directly;
+# declared so `cargo install`/`cargo update` can't pull 0.3.48. Remove once rcgen
+# ships a version compatible with time >=0.3.48. See time-rs/time & rustls/rcgen.
+time = "=0.3.47"
 rustls = "0.23"
 rustls-pemfile = "2"
 tokio-rustls = { version = "0.26", default-features = false }
