@@ -368,3 +368,103 @@ async fn api_duplicate_create_returns_409() {
 
     cluster.shutdown().await;
 }
+
+#[tokio::test]
+async fn api_apply_patch_merges_webhooks_by_name() {
+    let cluster = TestCluster::start().await;
+    let app = cluster.api_router();
+    let uri = "/apis/admissionregistration.k8s.io/v1/validatingwebhookconfigurations";
+
+    let rules = serde_json::json!([{
+        "apiGroups": ["example.test"],
+        "apiVersions": ["v1"],
+        "operations": ["CREATE"],
+        "resources": ["widgets"]
+    }]);
+    let config = serde_json::json!({
+        "apiVersion": "admissionregistration.k8s.io/v1",
+        "kind": "ValidatingWebhookConfiguration",
+        "metadata": {"name": "apply-vwc"},
+        "webhooks": [
+            {
+                "name": "a.example.test",
+                "rules": rules,
+                "clientConfig": {"service": {"name": "svc", "namespace": "default"}},
+                "sideEffects": "None",
+                "admissionReviewVersions": ["v1"]
+            },
+            {
+                "name": "b.example.test",
+                "rules": rules,
+                "clientConfig": {"service": {"name": "svc", "namespace": "default"}},
+                "sideEffects": "None",
+                "admissionReviewVersions": ["v1"]
+            }
+        ]
+    });
+    let resp = app
+        .clone()
+        .oneshot(json_request("POST", uri, Some(config)))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+
+    // cainjector-style apply: only the CA bundle for one webhook.
+    let patch = serde_json::json!({
+        "apiVersion": "admissionregistration.k8s.io/v1",
+        "kind": "ValidatingWebhookConfiguration",
+        "metadata": {"name": "apply-vwc"},
+        "webhooks": [{"name": "a.example.test", "clientConfig": {"caBundle": "Q0E="}}]
+    });
+    let req = axum::http::Request::builder()
+        .method("PATCH")
+        .uri(format!(
+            "{uri}/apply-vwc?fieldManager=cainjector&force=true"
+        ))
+        .header("content-type", "application/apply-patch+yaml")
+        .body(Body::from(serde_json::to_vec(&patch).unwrap()))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let got = response_json(
+        app.clone()
+            .oneshot(json_request("GET", &format!("{uri}/apply-vwc"), None))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let webhooks = got["webhooks"].as_array().unwrap();
+    assert_eq!(webhooks.len(), 2, "partial list must not drop webhooks");
+    assert_eq!(webhooks[0]["name"], "a.example.test");
+    assert_eq!(webhooks[0]["rules"], rules);
+    assert_eq!(webhooks[0]["clientConfig"]["service"]["name"], "svc");
+    assert_eq!(webhooks[0]["clientConfig"]["caBundle"], "Q0E=");
+    assert_eq!(webhooks[1]["name"], "b.example.test");
+    assert_eq!(webhooks[1]["rules"], rules);
+    assert!(webhooks[1]["clientConfig"].get("caBundle").is_none());
+}
+
+#[tokio::test]
+async fn api_apply_patch_creates_when_missing() {
+    let cluster = TestCluster::start().await;
+    let app = cluster.api_router();
+
+    let body = serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "ConfigMap",
+        "metadata": {"name": "applied", "namespace": "default"},
+        "data": {"k": "v", "dropped": null}
+    });
+    let req = axum::http::Request::builder()
+        .method("PATCH")
+        .uri("/api/v1/namespaces/default/configmaps/applied?fieldManager=kubectl")
+        .header("content-type", "application/apply-patch+yaml")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), 201);
+    let created = response_json(resp).await;
+    assert_eq!(created["data"], serde_json::json!({"k": "v"}));
+    assert!(created["metadata"]["uid"].as_str().is_some());
+}

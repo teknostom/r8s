@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
+use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 
 use clap::Parser;
 use r8s_api::{
@@ -92,7 +92,7 @@ async fn main() -> anyhow::Result<()> {
     spawn(
         &mut tasks,
         "service-proxy",
-        run_service_proxy(store.clone(), shutdown.clone(), cluster.clone()),
+        r8s_network::proxy::run(store.clone(), shutdown.clone(), cluster.clone()),
     );
 
     // Exec backend for the API server's `kubectl exec` endpoint. Only the
@@ -125,9 +125,8 @@ async fn main() -> anyhow::Result<()> {
                 );
             }
             tracing::info!(socket, "using containerd runtime");
-            let runtime = Arc::new(
-                ContainerdRuntime::new(&socket, data_dir.clone(), cluster.clone()).await?,
-            );
+            let runtime =
+                Arc::new(ContainerdRuntime::new(&socket, data_dir.clone(), cluster.clone()).await?);
             exec_handle = Some(Arc::new(runtime.exec_handle()));
             // Kubelet resource-metrics server (/metrics/resource) so
             // metrics-server has a node to scrape. Containerd only — it reads
@@ -208,21 +207,4 @@ fn spawn<E: std::fmt::Display>(
             tracing::error!("{name} error: {e}");
         }
     }));
-}
-
-async fn run_service_proxy(
-    store: Store,
-    shutdown: CancellationToken,
-    cluster: String,
-) -> anyhow::Result<()> {
-    loop {
-        tokio::select! {
-            _ = shutdown.cancelled() => return Ok(()),
-            _ = tokio::time::sleep(Duration::from_secs(5)) => {
-                if let Err(e) = r8s_network::proxy::sync_service_rules(&store, &cluster) {
-                    tracing::warn!("service proxy sync: {e}");
-                }
-            }
-        }
-    }
 }

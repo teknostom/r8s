@@ -12,8 +12,6 @@
 //!   default for client-go-based clients like Helm)
 //! - Other Accept-only headers → 406
 
-use std::sync::OnceLock;
-
 use axum::{
     body::Body,
     extract::State,
@@ -41,20 +39,8 @@ const PROTO_OPENAPI_V2_ACCEPT: &str = "application/com.github.proto-openapi.spec
 const PROTO_OPENAPI_V2_CONTENT_TYPE: &str =
     "application/com.github.proto-openapi.spec.v2.v1.0+protobuf";
 
-static BASE_V2: OnceLock<Value> = OnceLock::new();
-
 fn base_v2() -> &'static Value {
-    BASE_V2.get_or_init(|| {
-        serde_json::from_slice(r8s_types::openapi::SWAGGER_V2_JSON).unwrap_or_else(|e| {
-            tracing::error!("failed to parse vendored swagger.json: {e}");
-            serde_json::json!({
-                "swagger": "2.0",
-                "info": {"title": "r8s", "version": "v1.32.0-r8s"},
-                "definitions": {},
-                "paths": {},
-            })
-        })
-    })
+    r8s_types::openapi::swagger_v2()
 }
 
 /// GET /openapi/v2 — composed Swagger 2.0 doc covering built-ins + CRDs.

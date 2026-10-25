@@ -1311,6 +1311,14 @@ pub async fn delete_cluster(
     delete_impl(&state, &ctx, None, &name, policy, dry_run).await
 }
 
+/// Root schema for a server-side apply merge: the vendored definition for a
+/// built-in, else the CRD's structural schema.
+fn apply_schema(ctx: &RouteContext) -> Option<&serde_json::Value> {
+    let rt = &ctx.resource_type;
+    r8s_types::openapi::definition_for(&rt.gvr.group, &rt.gvr.version, &rt.kind)
+        .or(rt.schema.as_ref())
+}
+
 pub(crate) async fn patch_impl(
     state: &AppState,
     ctx: &RouteContext,
@@ -1333,8 +1341,10 @@ pub(crate) async fn patch_impl(
     // (and strategic-merge-patch, which we don't yet differentiate) sends an
     // object. kubectl uses json-patch+json for CRD version renames and other
     // structural edits — treating that body as a merge patch would replace
-    // the whole resource with the array.
+    // the whole resource with the array. Apply bodies merge list-maps by key
+    // (`crate::apply`).
     let is_json_patch = content_type.contains("json-patch+json");
+    let is_apply = content_type.contains("apply-patch");
     let patch: serde_json::Value = match serde_json::from_slice(&bytes) {
         Ok(v) => v,
         Err(e) => {
@@ -1369,6 +1379,8 @@ pub(crate) async fn patch_impl(
                         &format!("json patch failed: {e}"),
                     );
                 }
+            } else if is_apply {
+                crate::apply::apply(&mut current, &patch, apply_schema(ctx));
             } else {
                 json_merge_patch(&mut current, &patch);
             }
@@ -1417,7 +1429,13 @@ pub(crate) async fn patch_impl(
                 );
             }
             // Server-side apply: create if not found
-            let mut body = patch;
+            let mut body = if is_apply {
+                let mut fresh = serde_json::Value::Null;
+                crate::apply::apply(&mut fresh, &patch, apply_schema(ctx));
+                fresh
+            } else {
+                patch
+            };
             if let Some(meta) = body.get_mut("metadata").and_then(|v| v.as_object_mut()) {
                 meta.insert("name".to_string(), serde_json::json!(name));
                 if let Some(ns) = namespace {

@@ -126,7 +126,7 @@ fn resolve_backends(
         .into_iter()
         // The endpoint's own port wins when present; otherwise the Service port
         // named in the Ingress rule is assumed to reach the pod directly.
-        .map(|a| SocketAddr::new(a.ip.into(), a.port.unwrap_or(service_port)))
+        .map(|a| SocketAddr::new(a.ip.into(), a.port().unwrap_or(service_port)))
         .collect()
 }
 
