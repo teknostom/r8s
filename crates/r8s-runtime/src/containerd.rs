@@ -1,3 +1,4 @@
+use crate::error::RuntimeError;
 use crate::traits::*;
 use containerd_client::{
     connect,
@@ -30,9 +31,8 @@ const NAMESPACE: &str = "r8s";
 const SNAPSHOTTER: &str = "overlayfs";
 
 // Ownership labels stamped on every container so teardown can enumerate the
-// backend ("destroy everything tagged mine whose pod is gone") instead of
-// replaying our store. The containerd namespace is shared across all r8s
-// clusters, so the cluster label is what scopes a reap to our own containers.
+// backend instead of replaying our store. The containerd namespace is shared
+// across r8s clusters; the cluster label scopes a reap to our own containers.
 const LABEL_CLUSTER: &str = "io.r8s.cluster";
 const LABEL_POD_UID: &str = "io.r8s.pod-uid";
 const LABEL_POD_NAME: &str = "io.r8s.pod-name";
@@ -43,8 +43,7 @@ pub struct ContainerdRuntime {
     data_dir: std::path::PathBuf,
     /// This cluster's name, stamped into the `io.r8s.cluster` ownership label.
     cluster: String,
-    // Serializes image pulls across all callers (matches kubelet's
-    // --serialize-image-pulls=true default).
+    // Serializes image pulls across all callers.
     pull_lock: tokio::sync::Mutex<()>,
 }
 
@@ -63,7 +62,6 @@ impl ContainerdRuntime {
     }
 
     /// A `kubectl exec` backend sharing this runtime's containerd connection.
-    /// Handed to the API server so it can exec into running containers.
     pub fn exec_handle(&self) -> crate::exec::ContainerdExec {
         crate::exec::ContainerdExec::new(self.channel.clone(), self.data_dir.clone())
     }
@@ -217,10 +215,8 @@ fn json_string_array(value: &serde_json::Value) -> Vec<String> {
 }
 
 fn normalize_image_ref(image: &str) -> String {
-    // Docker Hub's official images live under `library/`; the Docker CLI inserts
-    // it automatically for bare names, but containerd's resolver doesn't.
-    // Match that behavior here so charts that say `docker.io/traefik:v3.7.1`
-    // (or just `traefik:v3.7.1`) resolve to `docker.io/library/traefik:v3.7.1`.
+    // Docker Hub official images live under `library/`; containerd's resolver
+    // doesn't insert it for bare names, so match the Docker CLI and do it here.
     let with_registry = if let Some(rest) = image.strip_prefix("docker.io/") {
         if rest.contains('/') {
             image.to_string()
@@ -228,13 +224,9 @@ fn normalize_image_ref(image: &str) -> String {
             format!("docker.io/library/{rest}")
         }
     } else {
-        // Docker's reference-normalization rule for the component before the
-        // first `/`: it's a registry only if it looks like a host — contains a
-        // `.` or `:` (port), or is `localhost`. Otherwise it's a Docker Hub
-        // namespace and the ref is implicitly under docker.io. So a bare
-        // `traefik` → docker.io/library/traefik, a namespaced
-        // `hashicorp/http-echo` → docker.io/hashicorp/http-echo, while
-        // `quay.io/jetstack/x` and `localhost:5000/x` are left alone.
+        // The component before the first `/` is a registry only if it looks like
+        // a host (contains `.` or `:`, or is `localhost`); otherwise it's a
+        // Docker Hub namespace under docker.io.
         match image.split_once('/') {
             Some((first, _))
                 if first.contains('.') || first.contains(':') || first == "localhost" =>
@@ -266,6 +258,16 @@ fn current_oci_arch() -> &'static str {
     }
 }
 
+/// Map a task-lookup gRPC error: containerd returns `NotFound` once the task is
+/// gone, which callers treat as terminal rather than a transient backend error.
+fn task_lookup_err(id: &str, status: containerd_client::tonic::Status) -> RuntimeError {
+    if status.code() == containerd_client::tonic::Code::NotFound {
+        RuntimeError::NotFound(id.to_string())
+    } else {
+        RuntimeError::Other(status.into())
+    }
+}
+
 /// chain_id[0] = diff_id[0]
 /// chain_id[i] = sha256(chain_id[i-1] + " " + diff_id[i])
 fn compute_chain_id(diff_ids: &[String]) -> anyhow::Result<String> {
@@ -288,15 +290,12 @@ fn build_container_mounts(
     data_dir: &std::path::Path,
 ) -> anyhow::Result<Vec<OciMount>> {
     let mut mounts = get_default_mounts();
-    let pod_name = config
-        .name
-        .rsplit_once('_')
-        .map(|(p, _)| p)
-        .unwrap_or(&config.name);
+    let pod_name = config.pod_name.as_str();
 
     let resolv_dir = data_dir.join("resolv");
     std::fs::create_dir_all(&resolv_dir)?;
     let resolv_path = resolv_dir.join(format!("{}.conf", config.name));
+    // 10.244.0.1 = r8s_types::NODE_INTERNAL_IP, inlined to avoid the dep.
     std::fs::write(
         &resolv_path,
         format!(
@@ -313,7 +312,7 @@ fn build_container_mounts(
             .build()?,
     );
 
-    // /etc/hosts maps the pod hostname to localhost for InetAddress.getLocalHost() compatibility
+    // /etc/hosts: map localhost and the pod hostname.
     let hosts_dir = data_dir.join("hosts");
     std::fs::create_dir_all(&hosts_dir)?;
     let hosts_path = hosts_dir.join(format!("{}.hosts", config.name));
@@ -389,11 +388,8 @@ fn build_oci_spec(
         .chain(config.env.iter().map(|(k, v)| format!("{k}={v}")))
         .collect();
 
-    // An empty `workingDir` means "unset" (default to `/`), not a literal empty
-    // Cwd — runc rejects "" with `Cwd property must not be empty`. Protobuf
-    // clients (controller-runtime) send the field as present-but-empty because
-    // k8s's gogo-proto marshals non-nullable fields even when zero, so we can't
-    // rely on `None` here the way the JSON path does.
+    // Empty `workingDir` means unset (→ `/`); runc rejects a literal "" Cwd.
+    // Protobuf clients send the field present-but-empty, so `None` isn't enough.
     let cwd = config
         .working_dir
         .as_deref()
@@ -420,16 +416,13 @@ fn build_oci_spec(
     ]
     .into_iter()
     .collect::<std::collections::HashSet<_>>();
-    // Ambient caps survive the switch to a non-root user. A container that
-    // sets runAsUser != 0 (e.g. ingress-nginx as uid 101) still needs e.g.
-    // NET_BIND_SERVICE to bind :80/:443, which only carries over if it's in
-    // the ambient set. For root, ambient is irrelevant.
-    let ambient: std::collections::HashSet<Capability> =
-        if config.run_as_user.unwrap_or(0) != 0 {
-            default_caps.clone()
-        } else {
-            Default::default()
-        };
+    // Ambient caps survive the switch to a non-root user — a runAsUser != 0
+    // process needs them to keep e.g. NET_BIND_SERVICE. Irrelevant for root.
+    let ambient: std::collections::HashSet<Capability> = if config.run_as_user.unwrap_or(0) != 0 {
+        default_caps.clone()
+    } else {
+        Default::default()
+    };
     let capabilities = LinuxCapabilitiesBuilder::default()
         .bounding(default_caps.clone())
         .effective(default_caps.clone())
@@ -438,11 +431,7 @@ fn build_oci_spec(
         .ambient(ambient)
         .build()?;
 
-    let hostname = config
-        .name
-        .rsplit_once('_')
-        .map(|(p, _)| p)
-        .unwrap_or(&config.name);
+    let hostname = config.pod_name.as_str();
     let mounts = build_container_mounts(config, data_dir)?;
 
     let spec = SpecBuilder::default()
@@ -514,7 +503,7 @@ impl ContainerRuntime for ContainerdRuntime {
         &self,
         image: &str,
         auth: Option<&RegistryAuth>,
-    ) -> anyhow::Result<ImageId> {
+    ) -> Result<ImageId, RuntimeError> {
         let _pull_guard = self.pull_lock.lock().await;
         let full_image_ref = normalize_image_ref(image);
         let resolver = auth.map(|a| {
@@ -558,7 +547,10 @@ impl ContainerRuntime for ContainerdRuntime {
         Ok(ImageId(full_image_ref))
     }
 
-    async fn create_container(&self, config: &ContainerConfig) -> anyhow::Result<ContainerId> {
+    async fn create_container(
+        &self,
+        config: &ContainerConfig,
+    ) -> Result<ContainerId, RuntimeError> {
         let image_ref = normalize_image_ref(&config.image);
         let image_info = self.image_info(&image_ref).await?;
         self.cleanup_stale(&config.name).await;
@@ -577,10 +569,11 @@ impl ContainerRuntime for ContainerdRuntime {
                     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                 }
                 Err(e) => {
-                    anyhow::bail!(
+                    return Err(anyhow::anyhow!(
                         "image snapshot '{}' not ready after 10s: {e}",
                         image_info.chain_id
-                    );
+                    )
+                    .into());
                 }
             }
         }
@@ -599,6 +592,8 @@ impl ContainerRuntime for ContainerdRuntime {
             value: spec_json,
         };
 
+        // `Container.labels` is a protobuf map → std HashMap, not FxHashMap.
+        #[allow(clippy::disallowed_types)]
         let labels = std::collections::HashMap::from([
             (LABEL_CLUSTER.to_string(), self.cluster.clone()),
             (LABEL_POD_UID.to_string(), config.pod_uid.clone()),
@@ -629,7 +624,7 @@ impl ContainerRuntime for ContainerdRuntime {
         Ok(ContainerId(config.name.clone()))
     }
 
-    async fn prepare_task(&self, id: &ContainerId) -> anyhow::Result<()> {
+    async fn prepare_task(&self, id: &ContainerId) -> Result<(), RuntimeError> {
         let mut snapshots = SnapshotsClient::new(self.channel.clone());
         let mut mounts = Vec::new();
         for i in 0..50 {
@@ -646,7 +641,7 @@ impl ContainerRuntime for ContainerdRuntime {
                     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                 }
                 Err(e) => {
-                    anyhow::bail!("snapshot '{}' not found after 10s: {e}", id.0);
+                    return Err(anyhow::anyhow!("snapshot '{}' not found after 10s: {e}", id.0).into());
                 }
             }
         }
@@ -654,10 +649,8 @@ impl ContainerRuntime for ContainerdRuntime {
         let log_dir = self.data_dir.join("logs");
         std::fs::create_dir_all(&log_dir)?;
 
-        // CRI-style logging: containerd writes to two named pipes, our pump
-        // threads merge them into <id>.log with per-line timestamp + stream tag.
-        // Threads must be started *before* tasks.create() so the fifo opens
-        // unblock simultaneously on both ends.
+        // CRI-style logging. Pumps must start *before* tasks.create() so the
+        // fifo opens unblock on both ends.
         let log_paths = crate::log_pump::LogPaths::for_container(&log_dir, &id.0);
         crate::log_pump::start(&log_paths)?;
 
@@ -668,13 +661,18 @@ impl ContainerRuntime for ContainerdRuntime {
             stderr: log_paths.stderr_fifo.to_string_lossy().to_string(),
             ..Default::default()
         };
-        TasksClient::new(self.channel.clone())
+        // On failure the pump threads would block on their fifo open forever.
+        if let Err(e) = TasksClient::new(self.channel.clone())
             .create(with_namespace!(req, NAMESPACE))
-            .await?;
+            .await
+        {
+            crate::log_pump::abort(&log_paths);
+            return Err(e.into());
+        }
         Ok(())
     }
 
-    async fn start_container(&self, id: &ContainerId) -> anyhow::Result<()> {
+    async fn start_container(&self, id: &ContainerId) -> Result<(), RuntimeError> {
         let req = StartRequest {
             container_id: id.0.clone(),
             ..Default::default()
@@ -691,7 +689,7 @@ impl ContainerRuntime for ContainerdRuntime {
         &self,
         id: &ContainerId,
         timeout: std::time::Duration,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), RuntimeError> {
         let mut tasks = TasksClient::new(self.channel.clone());
 
         let req = KillRequest {
@@ -741,7 +739,7 @@ impl ContainerRuntime for ContainerdRuntime {
         Ok(())
     }
 
-    async fn remove_container(&self, id: &ContainerId) -> anyhow::Result<()> {
+    async fn remove_container(&self, id: &ContainerId) -> Result<(), RuntimeError> {
         let req = DeleteTaskRequest {
             container_id: id.0.clone(),
         };
@@ -762,9 +760,8 @@ impl ContainerRuntime for ContainerdRuntime {
             .remove(with_namespace!(req, NAMESPACE))
             .await;
 
-        // The task delete above already closed the shim's writer fds, so the
-        // pump threads have hit EOF and exited. Unlink the fifo paths so they
-        // don't accumulate. Leave <id>.log for post-mortem `kubectl logs`.
+        // Task delete closed the shim's writer fds, so the pumps have exited.
+        // Unlink the fifos; keep <id>.log for post-mortem `kubectl logs`.
         let log_paths =
             crate::log_pump::LogPaths::for_container(&self.data_dir.join("logs"), &id.0);
         let _ = std::fs::remove_file(&log_paths.stdout_fifo);
@@ -774,18 +771,19 @@ impl ContainerRuntime for ContainerdRuntime {
         Ok(())
     }
 
-    async fn container_status(&self, id: &ContainerId) -> anyhow::Result<ContainerStatus> {
+    async fn container_status(&self, id: &ContainerId) -> Result<ContainerStatus, RuntimeError> {
         let req = GetRequest {
             container_id: id.0.clone(),
             ..Default::default()
         };
         let resp = TasksClient::new(self.channel.clone())
             .get(with_namespace!(req, NAMESPACE))
-            .await?;
+            .await
+            .map_err(|s| task_lookup_err(&id.0, s))?;
         let process = resp
             .into_inner()
             .process
-            .ok_or_else(|| anyhow::anyhow!("no process info for container {}", id.0))?;
+            .ok_or_else(|| RuntimeError::NotFound(id.0.clone()))?;
 
         let status = TaskStatus::try_from(process.status).unwrap_or(TaskStatus::Unknown);
 
@@ -799,25 +797,25 @@ impl ContainerRuntime for ContainerdRuntime {
         })
     }
 
-    async fn container_pid(&self, id: &ContainerId) -> anyhow::Result<u32> {
+    async fn container_pid(&self, id: &ContainerId) -> Result<u32, RuntimeError> {
         let req = GetRequest {
             container_id: id.0.clone(),
             ..Default::default()
         };
         let resp = TasksClient::new(self.channel.clone())
             .get(with_namespace!(req, NAMESPACE))
-            .await?;
+            .await
+            .map_err(|s| task_lookup_err(&id.0, s))?;
         let process = resp
             .into_inner()
             .process
-            .ok_or_else(|| anyhow::anyhow!("no process info"))?;
+            .ok_or_else(|| RuntimeError::NotFound(id.0.clone()))?;
         Ok(process.pid)
     }
 
-    async fn list_owned_containers(&self) -> anyhow::Result<Vec<OwnedContainer>> {
-        // Server-side filter to this cluster's containers — the containerd
-        // namespace is shared, so without it we'd see (and could reap) other
-        // clusters' containers.
+    async fn list_owned_containers(&self) -> Result<Vec<OwnedContainer>, RuntimeError> {
+        // Server-side filter to this cluster — the containerd namespace is
+        // shared across clusters.
         let req = ListContainersRequest {
             filters: vec![format!("labels.\"{LABEL_CLUSTER}\"==\"{}\"", self.cluster)],
         };
@@ -842,7 +840,7 @@ impl ContainerRuntime for ContainerdRuntime {
         id: &ContainerId,
         command: &[String],
         timeout: std::time::Duration,
-    ) -> anyhow::Result<i32> {
+    ) -> Result<i32, RuntimeError> {
         use crate::traits::{ExecConfig, ExecRuntime};
 
         let streams = self
@@ -855,9 +853,7 @@ impl ContainerRuntime for ContainerdRuntime {
             })
             .await?;
 
-        // Drain stdout/stderr so the FIFO pump tasks never block on a full
-        // channel (probe output is tiny, but a blocked pump can wedge the
-        // exec'd process before it exits).
+        // Drain stdout/stderr so a full channel never wedges the exec'd process.
         let mut stdout_rx = streams.stdout_rx;
         tokio::spawn(async move { while stdout_rx.recv().await.is_some() {} });
         if let Some(mut stderr_rx) = streams.stderr_rx {
@@ -866,21 +862,73 @@ impl ContainerRuntime for ContainerdRuntime {
 
         match tokio::time::timeout(timeout, streams.exit_rx).await {
             Ok(Ok(code)) => Ok(code),
-            Ok(Err(_)) => anyhow::bail!("exec wait channel closed"),
-            Err(_) => anyhow::bail!("exec '{}' timed out", id.0),
+            Ok(Err(_)) => Err(anyhow::anyhow!("exec wait channel closed").into()),
+            Err(_) => Err(anyhow::anyhow!("exec '{}' timed out", id.0).into()),
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_image_ref;
+    use super::{compute_chain_id, normalize_image_ref, task_lookup_err};
+    use crate::error::RuntimeError;
+    use containerd_client::tonic::Status;
+
+    #[test]
+    fn chain_id_single_layer_is_diff_id() {
+        assert_eq!(
+            compute_chain_id(&["sha256:aaa".to_string()]).unwrap(),
+            "sha256:aaa"
+        );
+    }
+
+    #[test]
+    fn chain_id_empty_is_error() {
+        let empty: &[String] = &[];
+        assert!(compute_chain_id(empty).is_err());
+    }
+
+    #[test]
+    fn chain_id_folds_layers_left_to_right() {
+        // Vectors computed independently: sha256("<prev> <diff>") per OCI.
+        assert_eq!(
+            compute_chain_id(&["sha256:aaa".to_string(), "sha256:bbb".to_string()]).unwrap(),
+            "sha256:56efb1d4f6c79b745d37d6eff87e3ed8dd2be28104e124ba73fd6e6c4892c792"
+        );
+        assert_eq!(
+            compute_chain_id(&[
+                "sha256:aaa".to_string(),
+                "sha256:bbb".to_string(),
+                "sha256:ccc".to_string(),
+            ])
+            .unwrap(),
+            "sha256:5f37250437ffd4d0a708296d64527afcea82547c8f3683aed2e2e1abbc1999c2"
+        );
+    }
+
+    #[test]
+    fn task_lookup_err_classifies_notfound() {
+        assert!(matches!(
+            task_lookup_err("c1", Status::not_found("gone")),
+            RuntimeError::NotFound(id) if id == "c1"
+        ));
+        assert!(matches!(
+            task_lookup_err("c1", Status::unavailable("backend down")),
+            RuntimeError::Other(_)
+        ));
+    }
 
     #[test]
     fn normalizes_image_refs() {
         // Bare name -> docker.io/library + :latest
-        assert_eq!(normalize_image_ref("traefik"), "docker.io/library/traefik:latest");
-        assert_eq!(normalize_image_ref("ubuntu:22.04"), "docker.io/library/ubuntu:22.04");
+        assert_eq!(
+            normalize_image_ref("traefik"),
+            "docker.io/library/traefik:latest"
+        );
+        assert_eq!(
+            normalize_image_ref("ubuntu:22.04"),
+            "docker.io/library/ubuntu:22.04"
+        );
 
         // Docker Hub *namespaced* short ref (the ingress-nginx echo backend):
         // `hashicorp` is a namespace, not a registry, so it lives under docker.io.
@@ -904,7 +952,10 @@ mod tests {
         );
 
         // Explicit docker.io prefix: official images get library/, others kept.
-        assert_eq!(normalize_image_ref("docker.io/redis:7"), "docker.io/library/redis:7");
+        assert_eq!(
+            normalize_image_ref("docker.io/redis:7"),
+            "docker.io/library/redis:7"
+        );
         assert_eq!(
             normalize_image_ref("docker.io/bitnami/redis:7"),
             "docker.io/bitnami/redis:7"

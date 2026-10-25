@@ -1,7 +1,17 @@
+//! Job controller.
+//!
+//! Drives a Job's pods toward `spec.completions` successes, honoring
+//! `parallelism`, `backoffLimit`, `activeDeadlineSeconds`, and `suspend`.
+//!
+//! Only the default (NonIndexed) `completionMode` is modeled: completion is
+//! counted by number of succeeded pods, not by covered index. An `Indexed` Job
+//! runs but is treated as NonIndexed — pods get no completion-index, so a Job
+//! that relies on per-index semantics won't behave to spec. Single-node
+//! workloads don't use it.
+
 use r8s_store::{Store, backend::ResourceRef, watch::WatchEventType};
 use r8s_types::{
-    GroupVersionResource, JobCondition, JobStatus, ObjectMeta, OwnerReference, Pod,
-    PodTemplateSpec, Time,
+    GroupVersionResource, JobCondition, JobStatus, ObjectMeta, Pod, PodTemplateSpec, Time,
 };
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
@@ -38,7 +48,7 @@ pub async fn run(store: Store, shutdown: CancellationToken) -> anyhow::Result<()
             event = pod_rx.recv() => {
                 match event {
                     Ok(event) if matches!(event.event_type, WatchEventType::Modified | WatchEventType::Deleted) => {
-                        let pod: Pod = match serde_json::from_value(event.object) {
+                        let pod: Pod = match serde_json::from_value(event.object.as_ref().clone()) {
                             Ok(p) => p,
                             Err(_) => continue,
                         };
@@ -100,14 +110,7 @@ fn reconcile_job(store: &Store, job_value: &serde_json::Value) -> anyhow::Result
     };
     let current_uid = current.metadata.uid.as_deref().unwrap_or(job_uid);
 
-    let finished = current
-        .status
-        .as_ref()
-        .and_then(|s| s.conditions.as_deref())
-        .unwrap_or_default()
-        .iter()
-        .any(|c| (c.type_ == "Complete" || c.type_ == "Failed") && c.status == "True");
-    if finished {
+    if crate::job_condition_true(&current, &["Complete", "Failed"]) {
         return Ok(());
     }
 
@@ -128,6 +131,8 @@ fn reconcile_job(store: &Store, job_value: &serde_json::Value) -> anyhow::Result
         .filter(|p| is_owned_by(&p.metadata, current_uid))
         .collect();
 
+    let suspended = spec.suspend == Some(true);
+
     let mut active = 0i32;
     let mut succeeded = 0i32;
     let mut failed = 0i32;
@@ -136,32 +141,33 @@ fn reconcile_job(store: &Store, job_value: &serde_json::Value) -> anyhow::Result
         match pod.status.as_ref().and_then(|s| s.phase.as_deref()) {
             Some("Succeeded") => succeeded += 1,
             Some("Failed") => failed += 1,
-            _ => active += 1,
+            // Active = not terminal and not being deleted (upstream
+            // `IsPodActive`). A terminating pod counted active would stall
+            // replacement creation until the store finally dropped it.
+            _ if pod.metadata.deletion_timestamp.is_none() => active += 1,
+            _ => {}
         }
     }
 
     let now = Time(chrono::Utc::now());
-
-    let start_time = current
-        .status
-        .as_ref()
-        .and_then(|s| s.start_time.clone())
-        .unwrap_or_else(|| now.clone());
+    let existing_start = current.status.as_ref().and_then(|s| s.start_time.clone());
+    // The clock only runs while the Job is admitted to run: a suspended Job that
+    // never started has no start time (upstream leaves it nil), so `activeDeadline`
+    // isn't measured against a suspend window.
+    let start_time = if suspended {
+        existing_start.clone()
+    } else {
+        Some(existing_start.clone().unwrap_or_else(|| now.clone()))
+    };
 
     if succeeded >= completions {
         let status = JobStatus {
-            active: if active > 0 { Some(active) } else { None },
+            active: positive(active),
             succeeded: Some(succeeded),
             failed: Some(failed),
-            start_time: Some(start_time),
-            completion_time: Some(Time(chrono::Utc::now())),
-            conditions: Some(vec![JobCondition {
-                type_: "Complete".into(),
-                status: "True".into(),
-                last_probe_time: Some(now.clone()),
-                last_transition_time: Some(now),
-                ..Default::default()
-            }]),
+            start_time,
+            completion_time: Some(now.clone()),
+            conditions: Some(vec![condition("Complete", "True", None, None, &now)]),
             ..Default::default()
         };
         update_job_status(store, job_name, job_ns, &status)?;
@@ -169,23 +175,73 @@ fn reconcile_job(store: &Store, job_value: &serde_json::Value) -> anyhow::Result
         return Ok(());
     }
 
-    if failed > backoff_limit {
+    // Suspended: tear down running pods and stop creating them, but keep the
+    // succeeded/failed tallies. Resuming (suspend=false) re-enters the create
+    // path below.
+    if suspended {
+        delete_active_pods(store, &owned, job_ns);
         let status = JobStatus {
-            active: if active > 0 { Some(active) } else { None },
+            active: None,
             succeeded: Some(succeeded),
             failed: Some(failed),
-            start_time: Some(start_time),
+            start_time,
             completion_time: None,
-            conditions: Some(vec![JobCondition {
-                type_: "Failed".into(),
-                status: "True".into(),
-                reason: Some("BackoffLimitExceeded".into()),
-                message: Some(format!(
+            conditions: Some(vec![condition(
+                "Suspended",
+                "True",
+                Some("JobSuspended"),
+                Some("Job is suspended"),
+                &now,
+            )]),
+            ..Default::default()
+        };
+        update_job_status(store, job_name, job_ns, &status)?;
+        tracing::info!("job '{job_name}': suspended");
+        return Ok(());
+    }
+
+    // activeDeadlineSeconds: wall-clock cap measured from start. On expiry the
+    // Job fails and its running pods are reaped.
+    if let (Some(deadline), Some(start)) = (spec.active_deadline_seconds, start_time.as_ref())
+        && (now.0 - start.0).num_seconds() >= deadline
+    {
+        delete_active_pods(store, &owned, job_ns);
+        let status = JobStatus {
+            active: None,
+            succeeded: Some(succeeded),
+            failed: Some(failed),
+            start_time,
+            completion_time: None,
+            conditions: Some(vec![condition(
+                "Failed",
+                "True",
+                Some("DeadlineExceeded"),
+                Some("Job was active longer than specified deadline"),
+                &now,
+            )]),
+            ..Default::default()
+        };
+        update_job_status(store, job_name, job_ns, &status)?;
+        tracing::info!("job '{job_name}': failed (active deadline {deadline}s exceeded)");
+        return Ok(());
+    }
+
+    if failed > backoff_limit {
+        let status = JobStatus {
+            active: positive(active),
+            succeeded: Some(succeeded),
+            failed: Some(failed),
+            start_time,
+            completion_time: None,
+            conditions: Some(vec![condition(
+                "Failed",
+                "True",
+                Some("BackoffLimitExceeded"),
+                Some(&format!(
                     "Job has reached the specified backoff limit ({backoff_limit})"
                 )),
-                last_probe_time: Some(now.clone()),
-                last_transition_time: Some(now),
-            }]),
+                &now,
+            )]),
             ..Default::default()
         };
         update_job_status(store, job_name, job_ns, &status)?;
@@ -205,14 +261,10 @@ fn reconcile_job(store: &Store, job_value: &serde_json::Value) -> anyhow::Result
 
     let new_active = active + needed.max(0);
     let status = JobStatus {
-        active: if new_active > 0 {
-            Some(new_active)
-        } else {
-            None
-        },
+        active: positive(new_active),
         succeeded: Some(succeeded),
         failed: Some(failed),
-        start_time: Some(start_time),
+        start_time,
         completion_time: None,
         conditions: None,
         ..Default::default()
@@ -220,6 +272,51 @@ fn reconcile_job(store: &Store, job_value: &serde_json::Value) -> anyhow::Result
     update_job_status(store, job_name, job_ns, &status)?;
 
     Ok(())
+}
+
+fn positive(n: i32) -> Option<i32> {
+    (n > 0).then_some(n)
+}
+
+fn condition(
+    type_: &str,
+    status: &str,
+    reason: Option<&str>,
+    message: Option<&str>,
+    now: &Time,
+) -> JobCondition {
+    JobCondition {
+        type_: type_.into(),
+        status: status.into(),
+        reason: reason.map(String::from),
+        message: message.map(String::from),
+        last_probe_time: Some(now.clone()),
+        last_transition_time: Some(now.clone()),
+    }
+}
+
+/// Delete the Job's still-running pods (used on suspend and deadline expiry).
+/// Succeeded/failed pods are left in place — they carry the tally and are useful
+/// for inspection.
+fn delete_active_pods(store: &Store, owned: &[Pod], namespace: Option<&str>) {
+    let gvr = GroupVersionResource::pods();
+    for pod in owned {
+        let terminal = matches!(
+            pod.status.as_ref().and_then(|s| s.phase.as_deref()),
+            Some("Succeeded") | Some("Failed")
+        );
+        if terminal || pod.metadata.deletion_timestamp.is_some() {
+            continue;
+        }
+        if let Some(name) = pod.metadata.name.as_deref() {
+            let rref = ResourceRef {
+                gvr: &gvr,
+                namespace,
+                name,
+            };
+            let _ = store.delete(&rref);
+        }
+    }
 }
 
 fn create_pod(
@@ -242,14 +339,12 @@ fn create_pod(
             name: Some(pod_name.clone()),
             namespace: namespace.map(String::from),
             labels,
-            owner_references: Some(vec![OwnerReference {
-                api_version: "batch/v1".into(),
-                kind: "Job".into(),
-                name: job_name.into(),
-                uid: job_uid.into(),
-                controller: Some(true),
-                block_owner_deletion: Some(true),
-            }]),
+            owner_references: Some(vec![crate::owner_reference(
+                "batch/v1",
+                "Job",
+                job_name,
+                job_uid,
+            )]),
             ..Default::default()
         },
         spec,
@@ -302,5 +397,238 @@ fn update_job_status(
             tracing::debug!("job status update conflict for '{job_name}': {e}");
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::{Value, json};
+
+    fn store() -> (tempfile::TempDir, Store) {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(&dir.path().join("t.db")).unwrap();
+        (dir, s)
+    }
+
+    fn template() -> Value {
+        json!({
+            "metadata": {"labels": {"app": "j"}},
+            "spec": {"containers": [{"name": "c", "image": "img"}]}
+        })
+    }
+
+    fn create_job(store: &Store, name: &str, obj: Value) -> Value {
+        let gvr = GroupVersionResource::jobs();
+        store
+            .create(
+                ResourceRef {
+                    gvr: &gvr,
+                    namespace: Some("default"),
+                    name,
+                },
+                &obj,
+            )
+            .unwrap()
+    }
+
+    fn create_pod(store: &Store, name: &str, uid: &str, phase: Option<&str>, terminating: bool) {
+        let gvr = GroupVersionResource::pods();
+        let mut meta = json!({
+            "name": name, "namespace": "default",
+            "ownerReferences": [{
+                "apiVersion": "batch/v1", "kind": "Job", "name": "j",
+                "uid": uid, "controller": true
+            }]
+        });
+        if terminating {
+            meta["deletionTimestamp"] = json!("2020-01-01T00:00:00Z");
+        }
+        let mut obj = json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": meta,
+            "spec": {"containers": []}
+        });
+        if let Some(p) = phase {
+            obj["status"] = json!({"phase": p});
+        }
+        store
+            .create(
+                ResourceRef {
+                    gvr: &gvr,
+                    namespace: Some("default"),
+                    name,
+                },
+                &obj,
+            )
+            .unwrap();
+    }
+
+    fn get_job(store: &Store, name: &str) -> Value {
+        let gvr = GroupVersionResource::jobs();
+        store
+            .get(&ResourceRef {
+                gvr: &gvr,
+                namespace: Some("default"),
+                name,
+            })
+            .unwrap()
+            .unwrap()
+    }
+
+    fn pod_exists(store: &Store, name: &str) -> bool {
+        let gvr = GroupVersionResource::pods();
+        store
+            .get(&ResourceRef {
+                gvr: &gvr,
+                namespace: Some("default"),
+                name,
+            })
+            .unwrap()
+            .is_some()
+    }
+
+    fn owned_pod_count(store: &Store, uid: &str) -> usize {
+        let gvr = GroupVersionResource::pods();
+        store
+            .list_as::<Pod>(&gvr, Some("default"))
+            .unwrap()
+            .iter()
+            .filter(|p| is_owned_by(&p.metadata, uid))
+            .count()
+    }
+
+    fn has_condition(job: &Value, type_: &str, reason: Option<&str>) -> bool {
+        job["status"]["conditions"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|c| {
+                c["type"] == type_
+                    && c["status"] == "True"
+                    && reason.is_none_or(|r| c["reason"] == r)
+            })
+    }
+
+    #[test]
+    fn suspend_deletes_active_pods_and_marks_condition() {
+        let (_d, store) = store();
+        let job = create_job(
+            &store,
+            "j",
+            json!({
+                "apiVersion": "batch/v1", "kind": "Job",
+                "metadata": {"name": "j", "namespace": "default"},
+                "spec": {"suspend": true, "template": template()}
+            }),
+        );
+        let uid = job["metadata"]["uid"].as_str().unwrap().to_string();
+        create_pod(&store, "j-run", &uid, Some("Running"), false);
+
+        reconcile_job(&store, &job).unwrap();
+
+        assert!(!pod_exists(&store, "j-run"), "suspend reaps running pods");
+        assert_eq!(owned_pod_count(&store, &uid), 0, "no replacement while suspended");
+        assert!(has_condition(&get_job(&store, "j"), "Suspended", Some("JobSuspended")));
+    }
+
+    #[test]
+    fn active_deadline_fails_job() {
+        let (_d, store) = store();
+        let job = create_job(
+            &store,
+            "j",
+            json!({
+                "apiVersion": "batch/v1", "kind": "Job",
+                "metadata": {"name": "j", "namespace": "default"},
+                "spec": {"activeDeadlineSeconds": 1, "template": template()},
+                "status": {"startTime": "2000-01-01T00:00:00Z"}
+            }),
+        );
+        let uid = job["metadata"]["uid"].as_str().unwrap().to_string();
+        create_pod(&store, "j-run", &uid, Some("Running"), false);
+
+        reconcile_job(&store, &job).unwrap();
+
+        assert!(!pod_exists(&store, "j-run"), "deadline reaps running pods");
+        assert!(has_condition(
+            &get_job(&store, "j"),
+            "Failed",
+            Some("DeadlineExceeded")
+        ));
+    }
+
+    #[test]
+    fn terminating_pod_is_not_active_so_replacement_is_created() {
+        let (_d, store) = store();
+        let job = create_job(
+            &store,
+            "j",
+            json!({
+                "apiVersion": "batch/v1", "kind": "Job",
+                "metadata": {"name": "j", "namespace": "default"},
+                "spec": {"template": template()}
+            }),
+        );
+        let uid = job["metadata"]["uid"].as_str().unwrap().to_string();
+        // A running pod that's being deleted must not count as active.
+        create_pod(&store, "j-old", &uid, Some("Running"), true);
+
+        reconcile_job(&store, &job).unwrap();
+
+        assert_eq!(
+            owned_pod_count(&store, &uid),
+            2,
+            "terminating pod plus a fresh replacement"
+        );
+        assert_eq!(get_job(&store, "j")["status"]["active"], json!(1));
+    }
+
+    #[test]
+    fn completes_when_succeeded_meets_completions() {
+        let (_d, store) = store();
+        let job = create_job(
+            &store,
+            "j",
+            json!({
+                "apiVersion": "batch/v1", "kind": "Job",
+                "metadata": {"name": "j", "namespace": "default"},
+                "spec": {"completions": 1, "template": template()}
+            }),
+        );
+        let uid = job["metadata"]["uid"].as_str().unwrap().to_string();
+        create_pod(&store, "j-done", &uid, Some("Succeeded"), false);
+
+        reconcile_job(&store, &job).unwrap();
+
+        let j = get_job(&store, "j");
+        assert!(has_condition(&j, "Complete", None));
+        assert!(j["status"]["completionTime"].is_string());
+    }
+
+    #[test]
+    fn backoff_limit_exceeded_fails_job() {
+        let (_d, store) = store();
+        let job = create_job(
+            &store,
+            "j",
+            json!({
+                "apiVersion": "batch/v1", "kind": "Job",
+                "metadata": {"name": "j", "namespace": "default"},
+                "spec": {"backoffLimit": 2, "template": template()}
+            }),
+        );
+        let uid = job["metadata"]["uid"].as_str().unwrap().to_string();
+        for i in 0..3 {
+            create_pod(&store, &format!("j-f{i}"), &uid, Some("Failed"), false);
+        }
+
+        reconcile_job(&store, &job).unwrap();
+
+        assert!(has_condition(
+            &get_job(&store, "j"),
+            "Failed",
+            Some("BackoffLimitExceeded")
+        ));
     }
 }

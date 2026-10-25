@@ -1,7 +1,22 @@
-use r8s_store::{Store, backend::ResourceRef, watch::WatchEventType};
+//! CronJob controller.
+//!
+//! Each tick (and on any CronJob change) evaluates every CronJob's schedule in
+//! its `spec.timeZone` (default UTC). For a scheduled slot that elapsed since
+//! `status.lastScheduleTime` and is still within `startingDeadlineSeconds`, it
+//! creates a Job — subject to `concurrencyPolicy`. Job names derive from the
+//! scheduled slot, so re-running a slot is idempotent (the create collides and
+//! is ignored).
+//!
+//! The cron grammar is the standard five fields with lists, ranges, and steps
+//! (`a-b/n`, `*/n`, `n/n`), named months (`JAN`..`DEC`) and weekdays
+//! (`SUN`..`SAT`, plus `7` = Sunday), and the day-of-month / day-of-week OR rule
+//! (when both are restricted, a match on either fires).
+
+use chrono::{DateTime, Datelike, Duration, Timelike, Utc};
+use chrono_tz::Tz;
+use r8s_store::{StoreError, backend::ResourceRef, watch::WatchEventType, Store};
 use r8s_types::{
-    CronJobStatus, GroupVersionResource, JobTemplateSpec, ObjectMeta, ObjectReference,
-    OwnerReference, Time,
+    CronJobStatus, GroupVersionResource, Job, JobTemplateSpec, ObjectMeta, ObjectReference, Time,
 };
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
@@ -58,44 +73,12 @@ fn reconcile_all(store: &Store) {
     }
 }
 
-#[derive(serde::Deserialize)]
-struct JobMeta {
-    metadata: ObjectMeta,
-    status: Option<JobStatusBrief>,
+fn is_finished(job: &Job) -> bool {
+    crate::job_condition_true(job, &["Complete", "Failed"])
 }
 
-#[derive(serde::Deserialize)]
-struct JobStatusBrief {
-    conditions: Option<Vec<JobConditionBrief>>,
-}
-
-#[derive(serde::Deserialize)]
-struct JobConditionBrief {
-    #[serde(rename = "type")]
-    type_: String,
-    status: String,
-}
-
-fn is_job_finished(job: &JobMeta) -> bool {
-    job.status
-        .as_ref()
-        .and_then(|s| s.conditions.as_ref())
-        .map(|cs| {
-            cs.iter()
-                .any(|c| (c.type_ == "Complete" || c.type_ == "Failed") && c.status == "True")
-        })
-        .unwrap_or(false)
-}
-
-fn is_job_succeeded(job: &JobMeta) -> bool {
-    job.status
-        .as_ref()
-        .and_then(|s| s.conditions.as_ref())
-        .map(|cs| {
-            cs.iter()
-                .any(|c| c.type_ == "Complete" && c.status == "True")
-        })
-        .unwrap_or(false)
+fn is_succeeded(job: &Job) -> bool {
+    crate::job_condition_true(job, &["Complete"])
 }
 
 fn reconcile_cronjob(store: &Store, cj_value: &serde_json::Value) -> anyhow::Result<()> {
@@ -129,52 +112,88 @@ fn reconcile_cronjob(store: &Store, cj_value: &serde_json::Value) -> anyhow::Res
         return Ok(());
     }
 
-    let schedule = &spec.schedule;
     let concurrency_policy = spec.concurrency_policy.as_deref().unwrap_or("Allow");
     let job_template = &spec.job_template;
 
-    let now = chrono::Utc::now();
+    let sched = match Schedule::parse(&spec.schedule) {
+        Some(s) => s,
+        None => {
+            tracing::warn!(
+                "cronjob '{cj_name}': invalid schedule '{}'; skipping",
+                spec.schedule
+            );
+            return Ok(());
+        }
+    };
+    let tz = match spec.time_zone.as_deref() {
+        Some(name) => match name.parse::<Tz>() {
+            Ok(tz) => tz,
+            Err(_) => {
+                tracing::warn!("cronjob '{cj_name}': unknown timeZone '{name}'; using UTC");
+                Tz::UTC
+            }
+        },
+        None => Tz::UTC,
+    };
 
-    let job_gvr = GroupVersionResource::jobs();
-    let owned_jobs: Vec<JobMeta> = store
-        .list_as::<JobMeta>(&job_gvr, cj_ns)?
+    let now = Utc::now();
+
+    let owned_jobs: Vec<Job> = store
+        .list_as::<Job>(&GroupVersionResource::jobs(), cj_ns)?
         .into_iter()
         .filter(|j| is_owned_by(&j.metadata, current_uid))
         .collect();
-
-    let active_jobs: Vec<&JobMeta> = owned_jobs.iter().filter(|j| !is_job_finished(j)).collect();
+    let active_jobs: Vec<&Job> = owned_jobs.iter().filter(|j| !is_finished(j)).collect();
 
     let last_schedule = current
         .status
         .as_ref()
         .and_then(|s| s.last_schedule_time.as_ref())
         .map(|t| t.0);
-    let due = should_run(schedule, last_schedule, now);
+    // Before the first run, measure missed schedules from creation.
+    let earliest = last_schedule
+        .or_else(|| current.metadata.creation_timestamp.as_ref().map(|t| t.0))
+        .unwrap_or(now);
 
-    if due {
-        match concurrency_policy {
-            "Forbid" if !active_jobs.is_empty() => {
-                tracing::debug!(
-                    "cronjob '{cj_name}': skipping (concurrencyPolicy=Forbid, {} active)",
-                    active_jobs.len()
-                );
-            }
-            "Replace" if !active_jobs.is_empty() => {
-                for job in &active_jobs {
-                    if let Some(name) = job.metadata.name.as_deref() {
-                        let job_ref = ResourceRef {
-                            gvr: &job_gvr,
-                            namespace: cj_ns,
-                            name,
-                        };
-                        let _ = store.delete(&job_ref);
-                        tracing::info!("cronjob '{cj_name}': replaced active job '{name}'");
-                    }
+    // The most recent slot we haven't acted on yet, if any.
+    let scheduled = most_recent_due(&sched, tz, earliest, now);
+
+    if let Some(slot) = scheduled {
+        let missed_by = now - slot;
+        let within_deadline = spec
+            .starting_deadline_seconds
+            .is_none_or(|d| missed_by <= Duration::seconds(d.max(0)));
+
+        if !within_deadline {
+            tracing::info!(
+                "cronjob '{cj_name}': slot {slot} missed by {}s, past startingDeadlineSeconds; skipping",
+                missed_by.num_seconds()
+            );
+        } else {
+            match concurrency_policy {
+                "Forbid" if !active_jobs.is_empty() => {
+                    tracing::debug!(
+                        "cronjob '{cj_name}': slot {slot} skipped (concurrencyPolicy=Forbid, {} active)",
+                        active_jobs.len()
+                    );
                 }
-                create_job(store, cj_name, current_uid, cj_ns, job_template)?;
-            }
-            _ => {
-                create_job(store, cj_name, current_uid, cj_ns, job_template)?;
+                "Replace" if !active_jobs.is_empty() => {
+                    let job_gvr = GroupVersionResource::jobs();
+                    for job in &active_jobs {
+                        if let Some(name) = job.metadata.name.as_deref() {
+                            let _ = store.delete(&ResourceRef {
+                                gvr: &job_gvr,
+                                namespace: cj_ns,
+                                name,
+                            });
+                            tracing::info!("cronjob '{cj_name}': replaced active job '{name}'");
+                        }
+                    }
+                    create_job(store, cj_name, current_uid, cj_ns, job_template, slot)?;
+                }
+                _ => {
+                    create_job(store, cj_name, current_uid, cj_ns, job_template, slot)?;
+                }
             }
         }
     }
@@ -183,9 +202,16 @@ fn reconcile_cronjob(store: &Store, cj_value: &serde_json::Value) -> anyhow::Res
     let failed_limit = spec.failed_jobs_history_limit.unwrap_or(1) as usize;
     cleanup_history(store, &owned_jobs, cj_ns, success_limit, failed_limit);
 
-    let active_refs: Vec<ObjectReference> = owned_jobs
+    // Re-list so status reflects the job just created/replaced.
+    let owned_now: Vec<Job> = store
+        .list_as::<Job>(&GroupVersionResource::jobs(), cj_ns)?
+        .into_iter()
+        .filter(|j| is_owned_by(&j.metadata, current_uid))
+        .collect();
+
+    let active_refs: Vec<ObjectReference> = owned_now
         .iter()
-        .filter(|j| !is_job_finished(j))
+        .filter(|j| !is_finished(j))
         .map(|j| ObjectReference {
             api_version: Some("batch/v1".into()),
             kind: Some("Job".into()),
@@ -196,22 +222,22 @@ fn reconcile_cronjob(store: &Store, cj_value: &serde_json::Value) -> anyhow::Res
         })
         .collect();
 
-    let last_successful = owned_jobs
+    let last_successful = owned_now
         .iter()
-        .filter(|j| is_job_succeeded(j))
+        .filter(|j| is_succeeded(j))
         .filter_map(|j| j.metadata.creation_timestamp.clone())
         .max_by_key(|t| t.0);
 
+    // Advance lastScheduleTime past the slot we processed (even if concurrency
+    // or the deadline skipped the actual run) so the same slot isn't re-evaluated
+    // every tick.
+    let last_schedule_time = scheduled
+        .map(Time)
+        .or_else(|| last_schedule.map(Time));
+
     let new_status = CronJobStatus {
         active: Some(active_refs),
-        last_schedule_time: if due {
-            Some(Time(now))
-        } else {
-            current
-                .status
-                .as_ref()
-                .and_then(|s| s.last_schedule_time.clone())
-        },
+        last_schedule_time,
         last_successful_time: last_successful.or_else(|| {
             current
                 .status
@@ -243,11 +269,13 @@ fn create_job(
     cj_uid: &str,
     namespace: Option<&str>,
     job_template: &JobTemplateSpec,
+    scheduled: DateTime<Utc>,
 ) -> anyhow::Result<()> {
-    let timestamp = chrono::Utc::now().timestamp();
-    let job_name = format!("{cj_name}-{timestamp}");
+    // Name by the scheduled slot: re-running the same slot yields the same name,
+    // so a duplicate create is an idempotent no-op rather than a second Job.
+    let job_name = format!("{cj_name}-{}", scheduled.timestamp());
 
-    let job = r8s_types::Job {
+    let job = Job {
         metadata: ObjectMeta {
             name: Some(job_name.clone()),
             namespace: namespace.map(String::from),
@@ -255,164 +283,331 @@ fn create_job(
                 .metadata
                 .as_ref()
                 .and_then(|m| m.labels.clone()),
-            owner_references: Some(vec![OwnerReference {
-                api_version: "batch/v1".into(),
-                kind: "CronJob".into(),
-                name: cj_name.into(),
-                uid: cj_uid.into(),
-                controller: Some(true),
-                block_owner_deletion: Some(true),
-            }]),
+            owner_references: Some(vec![crate::owner_reference(
+                "batch/v1",
+                "CronJob",
+                cj_name,
+                cj_uid,
+            )]),
             ..Default::default()
         },
         spec: job_template.spec.clone(),
         status: None,
     };
 
-    let gvr = GroupVersionResource::jobs();
     let resource_ref = ResourceRef {
-        gvr: &gvr,
+        gvr: &GroupVersionResource::jobs(),
         namespace,
         name: &job_name,
     };
-    store.create(resource_ref, &serde_json::to_value(&job)?)?;
-    tracing::info!("cronjob '{cj_name}': created job '{job_name}'");
+    match store.create(resource_ref, &serde_json::to_value(&job)?) {
+        Ok(_) => tracing::info!("cronjob '{cj_name}': created job '{job_name}'"),
+        Err(StoreError::AlreadyExists { .. }) => {
+            tracing::debug!("cronjob '{cj_name}': job '{job_name}' already exists for this slot");
+        }
+        Err(e) => return Err(e.into()),
+    }
     Ok(())
 }
 
 fn cleanup_history(
     store: &Store,
-    jobs: &[JobMeta],
+    jobs: &[Job],
     namespace: Option<&str>,
     success_limit: usize,
     failed_limit: usize,
 ) {
     let gvr = GroupVersionResource::jobs();
 
-    let mut succeeded: Vec<&JobMeta> = jobs.iter().filter(|j| is_job_succeeded(j)).collect();
-    let mut failed: Vec<&JobMeta> = jobs
+    let mut succeeded: Vec<&Job> = jobs.iter().filter(|j| is_succeeded(j)).collect();
+    let mut failed: Vec<&Job> = jobs
         .iter()
-        .filter(|j| is_job_finished(j) && !is_job_succeeded(j))
+        .filter(|j| is_finished(j) && !is_succeeded(j))
         .collect();
 
     succeeded.sort_by_key(|j| j.metadata.creation_timestamp.as_ref().map(|t| t.0));
     failed.sort_by_key(|j| j.metadata.creation_timestamp.as_ref().map(|t| t.0));
 
-    if succeeded.len() > success_limit {
-        for job in &succeeded[..succeeded.len() - success_limit] {
+    let reap = |batch: &[&Job]| {
+        for job in batch {
             if let Some(name) = job.metadata.name.as_deref() {
-                let job_ref = ResourceRef {
+                let _ = store.delete(&ResourceRef {
                     gvr: &gvr,
                     namespace,
                     name,
-                };
-                let _ = store.delete(&job_ref);
+                });
             }
         }
+    };
+    if succeeded.len() > success_limit {
+        reap(&succeeded[..succeeded.len() - success_limit]);
     }
     if failed.len() > failed_limit {
-        for job in &failed[..failed.len() - failed_limit] {
-            if let Some(name) = job.metadata.name.as_deref() {
-                let job_ref = ResourceRef {
-                    gvr: &gvr,
-                    namespace,
-                    name,
-                };
-                let _ = store.delete(&job_ref);
+        reap(&failed[..failed.len() - failed_limit]);
+    }
+}
+
+/// The most recent scheduled slot in `(earliest, now]`, or None. Scans backward
+/// at minute granularity and returns the first (hence latest) match. Bounded so
+/// a long-idle controller can't scan unboundedly; only the most recent missed
+/// slot is acted on (cron doesn't backfill).
+fn most_recent_due(
+    sched: &Schedule,
+    tz: Tz,
+    earliest: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    let now_min = now.with_second(0)?.with_nanosecond(0)?;
+    let start = (earliest + Duration::minutes(1))
+        .with_second(0)?
+        .with_nanosecond(0)?;
+    if start > now_min {
+        return None;
+    }
+    const MAX_SCAN_MINUTES: i64 = 366 * 24 * 60;
+    let scan_from = if (now_min - start).num_minutes() > MAX_SCAN_MINUTES {
+        now_min - Duration::minutes(MAX_SCAN_MINUTES)
+    } else {
+        start
+    };
+    let mut t = now_min;
+    while t >= scan_from {
+        if sched.matches(t, tz) {
+            return Some(t);
+        }
+        t -= Duration::minutes(1);
+    }
+    None
+}
+
+const MONTH_NAMES: &[(&str, u32)] = &[
+    ("jan", 1),
+    ("feb", 2),
+    ("mar", 3),
+    ("apr", 4),
+    ("may", 5),
+    ("jun", 6),
+    ("jul", 7),
+    ("aug", 8),
+    ("sep", 9),
+    ("oct", 10),
+    ("nov", 11),
+    ("dec", 12),
+];
+const DAY_NAMES: &[(&str, u32)] = &[
+    ("sun", 0),
+    ("mon", 1),
+    ("tue", 2),
+    ("wed", 3),
+    ("thu", 4),
+    ("fri", 5),
+    ("sat", 6),
+];
+
+struct Schedule {
+    minutes: Vec<u32>,
+    hours: Vec<u32>,
+    doms: Vec<u32>,
+    months: Vec<u32>,
+    dows: Vec<u32>,
+    dom_restricted: bool,
+    dow_restricted: bool,
+}
+
+impl Schedule {
+    fn parse(spec: &str) -> Option<Schedule> {
+        let f: Vec<&str> = spec.split_whitespace().collect();
+        if f.len() != 5 {
+            return None;
+        }
+        let minutes = parse_cron_field(f[0], 0, 59, &[])?;
+        let hours = parse_cron_field(f[1], 0, 23, &[])?;
+        let doms = parse_cron_field(f[2], 1, 31, &[])?;
+        let months = parse_cron_field(f[3], 1, 12, MONTH_NAMES)?;
+        // Day-of-week allows 0-7 with 7 == Sunday; normalize to 0-6.
+        let mut dows = parse_cron_field(f[4], 0, 7, DAY_NAMES)?;
+        for d in dows.iter_mut() {
+            if *d == 7 {
+                *d = 0;
             }
         }
+        dows.sort_unstable();
+        dows.dedup();
+
+        let star = |x: &str| x == "*" || x == "?";
+        Some(Schedule {
+            minutes,
+            hours,
+            doms,
+            months,
+            dows,
+            dom_restricted: !star(f[2]),
+            dow_restricted: !star(f[4]),
+        })
+    }
+
+    fn matches(&self, t: DateTime<Utc>, tz: Tz) -> bool {
+        let local = t.with_timezone(&tz);
+        let dom = local.day();
+        let dow = local.weekday().num_days_from_sunday();
+        // Cron's OR rule: when BOTH day fields are restricted, either matching
+        // fires; otherwise the restricted one (if any) gates.
+        let day_ok = match (self.dom_restricted, self.dow_restricted) {
+            (false, false) => true,
+            (true, false) => self.doms.contains(&dom),
+            (false, true) => self.dows.contains(&dow),
+            (true, true) => self.doms.contains(&dom) || self.dows.contains(&dow),
+        };
+        self.minutes.contains(&local.minute())
+            && self.hours.contains(&local.hour())
+            && self.months.contains(&local.month())
+            && day_ok
     }
 }
 
-fn should_run(
-    schedule: &str,
-    last_run: Option<chrono::DateTime<chrono::Utc>>,
-    now: chrono::DateTime<chrono::Utc>,
-) -> bool {
-    let fields: Vec<&str> = schedule.split_whitespace().collect();
-    if fields.len() != 5 {
-        tracing::warn!("invalid cron schedule '{schedule}': expected 5 fields");
-        return false;
-    }
-
-    let minutes = match parse_cron_field(fields[0], 0, 59) {
-        Some(v) => v,
-        None => return false,
-    };
-    let hours = match parse_cron_field(fields[1], 0, 23) {
-        Some(v) => v,
-        None => return false,
-    };
-    let days_of_month = match parse_cron_field(fields[2], 1, 31) {
-        Some(v) => v,
-        None => return false,
-    };
-    let months = match parse_cron_field(fields[3], 1, 12) {
-        Some(v) => v,
-        None => return false,
-    };
-    let days_of_week = match parse_cron_field(fields[4], 0, 6) {
-        Some(v) => v,
-        None => return false,
-    };
-
-    use chrono::{Datelike, Timelike};
-
-    let now_min = now.minute();
-    let now_hour = now.hour();
-    let now_dom = now.day();
-    let now_month = now.month();
-    let now_dow = now.weekday().num_days_from_sunday();
-
-    let matches = minutes.contains(&now_min)
-        && hours.contains(&now_hour)
-        && days_of_month.contains(&now_dom)
-        && months.contains(&now_month)
-        && days_of_week.contains(&now_dow);
-
-    if !matches {
-        return false;
-    }
-
-    if let Some(last) = last_run
-        && last.date_naive() == now.date_naive()
-        && last.time().hour() == now_hour
-        && last.time().minute() == now_min
-    {
-        return false;
-    }
-
-    true
-}
-
-fn parse_cron_field(field: &str, min: u32, max: u32) -> Option<Vec<u32>> {
+/// Parse one comma-list cron field into its set of matching values. Supports
+/// `*`, `a`, `a-b`, and any of those with a `/step`, plus symbolic names.
+/// Returns None on any out-of-range or malformed token.
+fn parse_cron_field(field: &str, min: u32, max: u32, names: &[(&str, u32)]) -> Option<Vec<u32>> {
     let mut values = Vec::new();
-
     for part in field.split(',') {
-        if part == "*" {
-            return Some((min..=max).collect());
-        } else if let Some(step) = part.strip_prefix("*/") {
-            let step: u32 = step.parse().ok()?;
-            if step == 0 {
-                return None;
-            }
-            let mut v = min;
-            while v <= max {
-                values.push(v);
-                v += step;
-            }
-        } else if part.contains('-') {
-            let mut parts = part.split('-');
-            let start: u32 = parts.next()?.parse().ok()?;
-            let end: u32 = parts.next()?.parse().ok()?;
-            for v in start..=end.min(max) {
-                values.push(v);
-            }
+        let (range, step) = match part.split_once('/') {
+            Some((r, s)) => (r, s.parse::<u32>().ok().filter(|&s| s != 0)?),
+            None => (part, 1),
+        };
+        let (lo, hi) = if range == "*" || range == "?" {
+            (min, max)
+        } else if let Some((a, b)) = range.split_once('-') {
+            (resolve_token(a, names)?, resolve_token(b, names)?)
         } else {
-            let v: u32 = part.parse().ok()?;
+            let v = resolve_token(range, names)?;
+            // "n/step" runs n..=max; a bare "n" is just n.
+            if part.contains('/') { (v, max) } else { (v, v) }
+        };
+        if lo > hi || lo < min || hi > max {
+            return None;
+        }
+        let mut v = lo;
+        while v <= hi {
             values.push(v);
+            v += step;
         }
     }
-
+    if values.is_empty() {
+        return None;
+    }
     Some(values)
+}
+
+fn resolve_token(token: &str, names: &[(&str, u32)]) -> Option<u32> {
+    if let Ok(n) = token.parse::<u32>() {
+        return Some(n);
+    }
+    let lower = token.to_ascii_lowercase();
+    names.iter().find(|(name, _)| *name == lower).map(|(_, v)| *v)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dt(s: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
+    }
+
+    fn matches(schedule: &str, ts: &str) -> bool {
+        Schedule::parse(schedule).unwrap().matches(dt(ts), Tz::UTC)
+    }
+
+    #[test]
+    fn basic_fields() {
+        assert!(matches("5 4 * * *", "2026-07-01T04:05:00Z"));
+        assert!(!matches("5 4 * * *", "2026-07-01T04:06:00Z"));
+        // */15 minutes.
+        assert!(matches("*/15 * * * *", "2026-07-01T10:30:00Z"));
+        assert!(!matches("*/15 * * * *", "2026-07-01T10:31:00Z"));
+    }
+
+    #[test]
+    fn range_with_step() {
+        // Every 2 hours from 9 to 17.
+        let s = "0 9-17/2 * * *";
+        assert!(matches(s, "2026-07-01T09:00:00Z"));
+        assert!(matches(s, "2026-07-01T11:00:00Z"));
+        assert!(matches(s, "2026-07-01T17:00:00Z"));
+        assert!(!matches(s, "2026-07-01T10:00:00Z"));
+    }
+
+    #[test]
+    fn named_months_and_days() {
+        // 2026-07-01 is a Wednesday.
+        assert!(matches("0 0 * JUL WED", "2026-07-01T00:00:00Z"));
+        assert!(!matches("0 0 * JAN WED", "2026-07-01T00:00:00Z"));
+        // MON-FRI weekday range.
+        assert!(matches("0 0 * * MON-FRI", "2026-07-01T00:00:00Z"));
+        assert!(!matches("0 0 * * SAT,SUN", "2026-07-01T00:00:00Z"));
+    }
+
+    #[test]
+    fn sunday_is_zero_or_seven() {
+        // 2026-07-05 is a Sunday.
+        assert!(matches("0 0 * * 0", "2026-07-05T00:00:00Z"));
+        assert!(matches("0 0 * * 7", "2026-07-05T00:00:00Z"));
+        assert!(matches("0 0 * * SUN", "2026-07-05T00:00:00Z"));
+    }
+
+    #[test]
+    fn dom_dow_or_rule() {
+        // When both DOM and DOW are restricted, EITHER matching fires.
+        // 2026-07-01 is a Wednesday, day-of-month 1.
+        // DOM=15 (no), DOW=WED (yes) → fires by OR.
+        assert!(matches("0 0 15 * WED", "2026-07-01T00:00:00Z"));
+        // DOM=1 (yes), DOW=MON (no) → fires by OR.
+        assert!(matches("0 0 1 * MON", "2026-07-01T00:00:00Z"));
+        // Neither matches → no fire.
+        assert!(!matches("0 0 15 * MON", "2026-07-01T00:00:00Z"));
+    }
+
+    #[test]
+    fn dom_restricted_dow_star_is_and_only_on_dom() {
+        // DOW is '*', so only DOM gates: day 1 matches, day 2 does not.
+        assert!(matches("0 0 1 * *", "2026-07-01T00:00:00Z"));
+        assert!(!matches("0 0 1 * *", "2026-07-02T00:00:00Z"));
+    }
+
+    #[test]
+    fn timezone_shifts_match() {
+        let s = "0 9 * * *"; // 09:00 local
+        let tz: Tz = "America/New_York".parse().unwrap();
+        // 2026-07-01 09:00 EDT == 13:00 UTC.
+        assert!(Schedule::parse(s).unwrap().matches(dt("2026-07-01T13:00:00Z"), tz));
+        assert!(!Schedule::parse(s).unwrap().matches(dt("2026-07-01T09:00:00Z"), tz));
+    }
+
+    #[test]
+    fn invalid_schedules_rejected() {
+        assert!(Schedule::parse("* * * *").is_none()); // 4 fields
+        assert!(Schedule::parse("60 * * * *").is_none()); // minute out of range
+        assert!(Schedule::parse("0 24 * * *").is_none()); // hour out of range
+        assert!(Schedule::parse("0 0 * * 8").is_none()); // dow out of range
+        assert!(Schedule::parse("0 0 * BOGUS *").is_none()); // bad month name
+    }
+
+    #[test]
+    fn most_recent_due_finds_missed_slot() {
+        let sched = Schedule::parse("*/5 * * * *").unwrap();
+        // last handled 10:00; now 10:12 → most recent slot is 10:10.
+        let earliest = dt("2026-07-01T10:00:00Z");
+        let now = dt("2026-07-01T10:12:00Z");
+        let slot = most_recent_due(&sched, Tz::UTC, earliest, now).unwrap();
+        assert_eq!(slot, dt("2026-07-01T10:10:00Z"));
+    }
+
+    #[test]
+    fn most_recent_due_none_when_no_slot_elapsed() {
+        let sched = Schedule::parse("0 0 * * *").unwrap();
+        let earliest = dt("2026-07-01T10:00:00Z");
+        let now = dt("2026-07-01T10:12:00Z");
+        assert!(most_recent_due(&sched, Tz::UTC, earliest, now).is_none());
+    }
 }

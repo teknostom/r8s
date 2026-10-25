@@ -2,16 +2,10 @@ use std::collections::BTreeMap;
 
 use r8s_store::{Store, backend::ResourceRef, watch::WatchEventType};
 use r8s_types::{
-    DaemonEndpoint, GroupVersionResource, Node, NodeAddress, NodeCondition, NodeDaemonEndpoints,
-    NodeSpec, NodeStatus, NodeSystemInfo, ObjectMeta, Pod, PodCondition, Quantity, Time,
+    DaemonEndpoint, GroupVersionResource, KUBELET_PORT, NODE_INTERNAL_IP, Node, NodeAddress,
+    NodeCondition, NodeDaemonEndpoints, NodeSpec, NodeStatus, NodeSystemInfo, ObjectMeta,
+    PodCondition, Quantity, Time,
 };
-
-/// The node's InternalIP. It's the r8s bridge gateway, which is the host —
-/// reachable from pods, so metrics-server (a pod) can scrape the kubelet
-/// metrics server r8sd runs there. Must match where that server binds.
-pub const NODE_INTERNAL_IP: &str = "10.244.0.1";
-/// Port the kubelet metrics server listens on (advertised via daemonEndpoints).
-pub const KUBELET_PORT: i32 = 10250;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
@@ -21,9 +15,15 @@ pub async fn run(store: Store, shutdown: CancellationToken) -> anyhow::Result<()
     tracing::info!("scheduler started");
 
     register_node(&store)?;
-    schedule_all(&store);
 
-    let mut rx = store.watch(&GroupVersionResource::pods());
+    // Subscribe before the snapshot so a pod created during the initial scan
+    // arrives as an event rather than vanishing in a list/watch gap.
+    let (initial, mut rx) =
+        store.list_and_watch(&GroupVersionResource::pods(), None, None, None)?;
+    for pod in &initial.items {
+        schedule_pod(&store, pod);
+    }
+
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => {
@@ -114,7 +114,9 @@ fn register_node(store: &Store) -> anyhow::Result<()> {
                 },
             ]),
             daemon_endpoints: Some(NodeDaemonEndpoints {
-                kubelet_endpoint: Some(DaemonEndpoint { port: KUBELET_PORT }),
+                kubelet_endpoint: Some(DaemonEndpoint {
+                    port: i32::from(KUBELET_PORT),
+                }),
             }),
             ..Default::default()
         }),
@@ -138,31 +140,31 @@ fn schedule_all(store: &Store) {
     }
 }
 
-fn is_scheduled(pod: &Pod) -> bool {
-    pod.spec
-        .as_ref()
-        .and_then(|s| s.node_name.as_ref())
-        .is_some_and(|n| !n.is_empty())
+fn is_scheduled(pod: &serde_json::Value) -> bool {
+    pod.get("spec")
+        .and_then(|spec| spec.get("nodeName"))
+        .and_then(|name| name.as_str())
+        .is_some_and(|name| !name.is_empty())
 }
 
 fn schedule_pod(store: &Store, pod_value: &serde_json::Value) {
-    let pod: Pod = match serde_json::from_value(pod_value.clone()) {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::warn!("failed to deserialize pod: {e}");
-            return;
-        }
-    };
-
-    if is_scheduled(&pod) {
+    // Already bound — skip without a store round-trip. Kubelet status writes
+    // re-fire this watch for pods we scheduled long ago.
+    if is_scheduled(pod_value) {
         return;
     }
 
-    let name = match pod.metadata.name.as_deref() {
-        Some(n) => n,
+    let metadata = pod_value.get("metadata");
+    let name = match metadata
+        .and_then(|m| m.get("name"))
+        .and_then(|v| v.as_str())
+    {
+        Some(name) => name,
         None => return,
     };
-    let namespace = pod.metadata.namespace.as_deref();
+    let namespace = metadata
+        .and_then(|m| m.get("namespace"))
+        .and_then(|v| v.as_str());
 
     let gvr = GroupVersionResource::pods();
     let resource_ref = ResourceRef {
@@ -171,16 +173,13 @@ fn schedule_pod(store: &Store, pod_value: &serde_json::Value) {
         name,
     };
 
-    // Re-read from store — the watch event may be stale
+    // Re-read: the event may be stale, and the optimistic update needs the live
+    // resourceVersion to detect a concurrent binding.
     let mut current = match store.get(&resource_ref) {
         Ok(Some(v)) => v,
         _ => return,
     };
-    let current_pod: Pod = match serde_json::from_value(current.clone()) {
-        Ok(p) => p,
-        Err(_) => return,
-    };
-    if is_scheduled(&current_pod) {
+    if is_scheduled(&current) {
         return;
     }
 

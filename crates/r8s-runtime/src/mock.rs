@@ -2,6 +2,7 @@ use rustc_hash::FxHashMap;
 use std::sync::Mutex;
 use std::time::Duration;
 
+use crate::error::RuntimeError;
 use crate::traits::*;
 
 pub struct MockRuntime {
@@ -53,12 +54,15 @@ impl ContainerRuntime for MockRuntime {
         &self,
         image: &str,
         _auth: Option<&RegistryAuth>,
-    ) -> anyhow::Result<ImageId> {
+    ) -> Result<ImageId, RuntimeError> {
         tracing::info!(image, "mock: pulling image");
         Ok(ImageId(format!("mock-{image}")))
     }
 
-    async fn create_container(&self, config: &ContainerConfig) -> anyhow::Result<ContainerId> {
+    async fn create_container(
+        &self,
+        config: &ContainerConfig,
+    ) -> Result<ContainerId, RuntimeError> {
         let mut next_id = self.next_id.lock().expect("mock lock poisoned");
         let id = format!("mock-container-{next_id}");
         *next_id += 1;
@@ -76,11 +80,11 @@ impl ContainerRuntime for MockRuntime {
         Ok(ContainerId(id))
     }
 
-    async fn prepare_task(&self, _id: &ContainerId) -> anyhow::Result<()> {
+    async fn prepare_task(&self, _id: &ContainerId) -> Result<(), RuntimeError> {
         Ok(())
     }
 
-    async fn start_container(&self, id: &ContainerId) -> anyhow::Result<()> {
+    async fn start_container(&self, id: &ContainerId) -> Result<(), RuntimeError> {
         let mut containers = self.containers.lock().expect("mock lock poisoned");
         if let Some(c) = containers.get_mut(&id.0) {
             c.running = true;
@@ -90,7 +94,7 @@ impl ContainerRuntime for MockRuntime {
         Ok(())
     }
 
-    async fn stop_container(&self, id: &ContainerId, _timeout: Duration) -> anyhow::Result<()> {
+    async fn stop_container(&self, id: &ContainerId, _timeout: Duration) -> Result<(), RuntimeError> {
         let mut containers = self.containers.lock().expect("mock lock poisoned");
         if let Some(c) = containers.get_mut(&id.0) {
             c.running = false;
@@ -102,14 +106,14 @@ impl ContainerRuntime for MockRuntime {
         Ok(())
     }
 
-    async fn remove_container(&self, id: &ContainerId) -> anyhow::Result<()> {
+    async fn remove_container(&self, id: &ContainerId) -> Result<(), RuntimeError> {
         let mut containers = self.containers.lock().expect("mock lock poisoned");
         containers.remove(&id.0);
         tracing::info!(id = id.0, "mock: removed container");
         Ok(())
     }
 
-    async fn container_status(&self, id: &ContainerId) -> anyhow::Result<ContainerStatus> {
+    async fn container_status(&self, id: &ContainerId) -> Result<ContainerStatus, RuntimeError> {
         let containers = self.containers.lock().expect("mock lock poisoned");
         match containers.get(&id.0) {
             Some(c) => Ok(ContainerStatus {
@@ -117,15 +121,15 @@ impl ContainerRuntime for MockRuntime {
                 running: c.running,
                 exit_code: if c.running { None } else { c.exit_code },
             }),
-            None => anyhow::bail!("container not found: {}", id.0),
+            None => Err(RuntimeError::NotFound(id.0.clone())),
         }
     }
 
-    async fn container_pid(&self, _id: &ContainerId) -> anyhow::Result<u32> {
-        anyhow::bail!("mock runtime has no container PIDs")
+    async fn container_pid(&self, _id: &ContainerId) -> Result<u32, RuntimeError> {
+        Err(anyhow::anyhow!("mock runtime has no container PIDs").into())
     }
 
-    async fn list_owned_containers(&self) -> anyhow::Result<Vec<OwnedContainer>> {
+    async fn list_owned_containers(&self) -> Result<Vec<OwnedContainer>, RuntimeError> {
         let containers = self.containers.lock().expect("mock lock poisoned");
         Ok(containers
             .iter()
@@ -142,9 +146,8 @@ impl ContainerRuntime for MockRuntime {
         _id: &ContainerId,
         _command: &[String],
         _timeout: Duration,
-    ) -> anyhow::Result<i32> {
-        // Mock has no real process to exec into; treat probes as passing so
-        // probe-bearing pods reach Ready in in-process tests.
+    ) -> Result<i32, RuntimeError> {
+        // No real process to exec into; treat probes as passing.
         Ok(0)
     }
 }

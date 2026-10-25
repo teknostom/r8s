@@ -9,20 +9,18 @@ use hyper::server::conn::http1 as server_http1;
 use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
 use r8s_store::Store;
-use r8s_types::{Endpoints, GroupVersionResource, Ingress};
+use r8s_types::{GroupVersionResource, Ingress};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
-struct Backend {
-    addr: SocketAddr,
-}
+use crate::endpoints::ready_endpoint_addresses;
 
 struct Route {
     host: Option<String>,
     path: String,
     prefix: bool,
-    backends: Vec<Backend>,
+    backends: Vec<SocketAddr>,
     counter: AtomicUsize,
 }
 
@@ -32,7 +30,7 @@ impl Route {
             return None;
         }
         let idx = self.counter.fetch_add(1, Ordering::Relaxed) % self.backends.len();
-        Some(self.backends[idx].addr)
+        Some(self.backends[idx])
     }
 
     fn matches(&self, host: Option<&str>, path: &str) -> bool {
@@ -123,37 +121,13 @@ fn resolve_backends(
     namespace: &str,
     service_name: &str,
     service_port: u16,
-) -> Vec<Backend> {
-    let gvr = GroupVersionResource::endpoints();
-    let ep_ref = r8s_store::backend::ResourceRef {
-        gvr: &gvr,
-        namespace: Some(namespace),
-        name: service_name,
-    };
-
-    let ep: Endpoints = match store.get_as::<Endpoints>(&ep_ref) {
-        Ok(Some(ep)) => ep,
-        _ => return Vec::new(),
-    };
-
-    let mut backends = Vec::new();
-    for subset in ep.subsets.as_deref().unwrap_or_default() {
-        let target_port = subset
-            .ports
-            .as_ref()
-            .and_then(|p| p.first())
-            .map(|p| p.port as u16)
-            .unwrap_or(service_port);
-
-        for addr in subset.addresses.as_deref().unwrap_or_default() {
-            if let Ok(ip) = addr.ip.parse() {
-                backends.push(Backend {
-                    addr: SocketAddr::new(ip, target_port),
-                });
-            }
-        }
-    }
-    backends
+) -> Vec<SocketAddr> {
+    ready_endpoint_addresses(store, Some(namespace), service_name)
+        .into_iter()
+        // The endpoint's own port wins when present; otherwise the Service port
+        // named in the Ingress rule is assumed to reach the pod directly.
+        .map(|a| SocketAddr::new(a.ip.into(), a.port.unwrap_or(service_port)))
+        .collect()
 }
 
 type ProxyBody = Either<Full<Bytes>, Incoming>;
@@ -219,7 +193,7 @@ async fn proxy_request(
     }
 }
 
-pub async fn run_ingress_proxy(store: Store, shutdown: CancellationToken) -> anyhow::Result<()> {
+pub async fn run_ingress_proxy(store: Store, shutdown: CancellationToken) -> crate::Result<()> {
     let routes: Arc<RwLock<RouteTable>> = Arc::new(RwLock::new(rebuild_routes(&store)));
 
     let watcher_routes = routes.clone();
@@ -269,5 +243,54 @@ pub async fn run_ingress_proxy(store: Store, shutdown: CancellationToken) -> any
                 });
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn route(host: Option<&str>, path: &str, prefix: bool) -> Route {
+        Route {
+            host: host.map(str::to_string),
+            path: path.to_string(),
+            prefix,
+            backends: Vec::new(),
+            counter: AtomicUsize::new(0),
+        }
+    }
+
+    #[test]
+    fn host_specific_route_requires_matching_host() {
+        let r = route(Some("api.example.com"), "/", true);
+        assert!(r.matches(Some("api.example.com"), "/anything"));
+        assert!(!r.matches(Some("other.example.com"), "/anything"));
+        assert!(!r.matches(None, "/anything"));
+    }
+
+    #[test]
+    fn hostless_route_matches_any_host() {
+        let r = route(None, "/", true);
+        assert!(r.matches(Some("whatever.com"), "/x"));
+        assert!(r.matches(None, "/x"));
+    }
+
+    #[test]
+    fn prefix_route_matches_subpaths_exact_route_does_not() {
+        let prefix = route(None, "/api", true);
+        assert!(prefix.matches(None, "/api"));
+        assert!(prefix.matches(None, "/api/v1/things"));
+        assert!(!prefix.matches(None, "/other"));
+
+        let exact = route(None, "/api", false);
+        assert!(exact.matches(None, "/api"));
+        assert!(!exact.matches(None, "/api/v1"));
+    }
+
+    #[test]
+    fn root_prefix_matches_empty_path() {
+        let r = route(None, "/", true);
+        assert!(r.matches(None, ""));
+        assert!(r.matches(None, "/"));
     }
 }

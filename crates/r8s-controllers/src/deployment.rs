@@ -3,7 +3,7 @@ use std::hash::{Hash, Hasher};
 use r8s_store::{Store, backend::ResourceRef, watch::WatchEventType};
 use r8s_types::{
     Deployment, DeploymentCondition, DeploymentSpec, DeploymentStatus, GroupVersionResource,
-    IntOrString, ObjectMeta, OwnerReference, ReplicaSet, ReplicaSetSpec,
+    IntOrString, ObjectMeta, ReplicaSet, ReplicaSetSpec,
 };
 use rustc_hash::FxHasher;
 use tokio::sync::broadcast;
@@ -66,7 +66,7 @@ pub async fn run(store: Store, shutdown: CancellationToken) -> anyhow::Result<()
             event = rs_rx.recv() => {
                 match event {
                     Ok(event) if matches!(event.event_type, WatchEventType::Modified) => {
-                        let rs: ReplicaSet = match serde_json::from_value(event.object) {
+                        let rs: ReplicaSet = match serde_json::from_value(event.object.as_ref().clone()) {
                             Ok(r) => r,
                             Err(_) => continue,
                         };
@@ -435,14 +435,12 @@ fn create_new_rs(
             namespace: deploy_ns.map(String::from),
             labels: Some(rs_labels),
             annotations: Some(annotations),
-            owner_references: Some(vec![OwnerReference {
-                api_version: "apps/v1".into(),
-                kind: "Deployment".into(),
-                name: deploy_name.into(),
-                uid: deploy_uid.into(),
-                controller: Some(true),
-                block_owner_deletion: Some(true),
-            }]),
+            owner_references: Some(vec![crate::owner_reference(
+                "apps/v1",
+                "Deployment",
+                deploy_name,
+                deploy_uid,
+            )]),
             ..Default::default()
         },
         spec: Some(ReplicaSetSpec {
@@ -528,11 +526,7 @@ fn update_deploy_status(store: &Store, deploy_value: &serde_json::Value) -> anyh
         .filter(|rs| rs_revision(rs) == max_revision && max_revision > 0)
         .filter_map(|rs| rs.status.as_ref().map(|s| s.replicas))
         .sum();
-    let desired_replicas = deploy
-        .spec
-        .as_ref()
-        .and_then(|s| s.replicas)
-        .unwrap_or(1);
+    let desired_replicas = deploy.spec.as_ref().and_then(|s| s.replicas).unwrap_or(1);
     let progressing_done =
         updated_replicas == desired_replicas && ready_replicas >= desired_replicas;
 

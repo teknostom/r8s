@@ -3,8 +3,9 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 
-// Incremented before the DB commit, so failed transactions leave gaps.
-// This matches K8s where revision gaps are normal and expected.
+/// Monotonic allocator for `resourceVersion` values. Numbers are unique and
+/// increasing but not contiguous: a revision is consumed before its write
+/// commits, so a failed commit leaves a gap.
 #[derive(Clone)]
 pub struct RevisionCounter {
     revision_id: Arc<AtomicU64>,

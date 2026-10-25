@@ -14,12 +14,9 @@ set -euo pipefail
 #     coverage; 2 already proves replica fan-out and per-ordinal PVCs.
 #   * persistence.size=1Gi — default is 8Gi per pod; the data here is a
 #     handful of test keys.
-#   * networkPolicy.enabled=false / pdb.create=false — the chart defaults
-#     both ON, but r8s advertises neither networking.k8s.io/v1 NetworkPolicy
-#     nor policy/v1 PodDisruptionBudget in discovery, so helm can't even map
-#     the objects ("no matches for kind ..."). Same opt-outs as the
-#     postgresql suite; registering the kinds (inert at minimum) is a
-#     planned follow-up.
+# The chart's NetworkPolicy and PodDisruptionBudget defaults are left ON:
+# both kinds are registered (stored, unenforced), so the install exercises
+# the same manifests a normal cluster gets.
 helm install redis bitnami/redis \
     --namespace redis \
     --set architecture=replication \
@@ -27,7 +24,4 @@ helm install redis bitnami/redis \
     --set replica.replicaCount=2 \
     --set master.persistence.size=1Gi \
     --set replica.persistence.size=1Gi \
-    --set networkPolicy.enabled=false \
-    --set master.pdb.create=false \
-    --set replica.pdb.create=false \
     --wait --timeout 5m

@@ -77,14 +77,28 @@ pub async fn try_proxy(
         Some(q) if !q.is_empty() => format!("{path}?{q}"),
         _ => path.to_string(),
     };
-    Some(proxy(ip, port, &backend, &state.data_dir, method, &path_and_query, headers, body).await)
+    Some(
+        proxy(
+            ip,
+            port,
+            &backend,
+            &state.data_dir,
+            method,
+            &path_and_query,
+            headers,
+            body,
+        )
+        .await,
+    )
 }
 
 fn find_backend(state: &AppState, group: &str, version: &str) -> Option<Backend> {
     let gvr = GroupVersionResource::new("apiregistration.k8s.io", "v1", "apiservices");
     let list = state.store.list(&gvr, None, None, None, None, None).ok()?;
     for item in &list.items {
-        let Some(spec) = item.get("spec") else { continue };
+        let Some(spec) = item.get("spec") else {
+            continue;
+        };
         if spec.get("group").and_then(|v| v.as_str()) != Some(group)
             || spec.get("version").and_then(|v| v.as_str()) != Some(version)
         {
@@ -122,6 +136,7 @@ fn find_backend(state: &AppState, group: &str, version: &str) -> Option<Backend>
     None
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn proxy(
     ip: IpAddr,
     port: u16,
@@ -177,14 +192,20 @@ async fn proxy(
         req.push_str("X-Remote-User: system:apiserver\r\n");
         req.push_str("X-Remote-Group: system:masters\r\n");
         req.push_str("X-Remote-Group: system:authenticated\r\n");
-        req.push_str(&format!("Content-Length: {}\r\nConnection: close\r\n\r\n", body.len()));
+        req.push_str(&format!(
+            "Content-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        ));
 
         stream
             .write_all(req.as_bytes())
             .await
             .map_err(|e| format!("write: {e}"))?;
         if !body.is_empty() {
-            stream.write_all(body).await.map_err(|e| format!("write body: {e}"))?;
+            stream
+                .write_all(body)
+                .await
+                .map_err(|e| format!("write body: {e}"))?;
         }
         stream.flush().await.map_err(|e| format!("flush: {e}"))?;
 
@@ -238,7 +259,11 @@ fn parse_response(raw: &[u8]) -> Response {
         }
     }
     let raw_body = &raw[pos + 4..];
-    let body = if chunked { dechunk(raw_body) } else { raw_body.to_vec() };
+    let body = if chunked {
+        dechunk(raw_body)
+    } else {
+        raw_body.to_vec()
+    };
 
     Response::builder()
         .status(StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY))
@@ -249,15 +274,10 @@ fn parse_response(raw: &[u8]) -> Response {
 
 fn dechunk(mut data: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(data.len());
-    loop {
-        let Some(nl) = data.windows(2).position(|w| w == b"\r\n") else {
-            break;
-        };
-        let size = usize::from_str_radix(
-            std::str::from_utf8(&data[..nl]).unwrap_or("0").trim(),
-            16,
-        )
-        .unwrap_or(0);
+    while let Some(nl) = data.windows(2).position(|w| w == b"\r\n") {
+        let size =
+            usize::from_str_radix(std::str::from_utf8(&data[..nl]).unwrap_or("0").trim(), 16)
+                .unwrap_or(0);
         data = &data[nl + 2..];
         if size == 0 || data.len() < size {
             break;

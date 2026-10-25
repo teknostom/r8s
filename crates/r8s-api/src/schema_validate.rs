@@ -33,10 +33,7 @@ fn walk(value: &Value, schema: &Value, path: &str) -> Result<(), String> {
     if let Some(enums) = obj.get("enum").and_then(|v| v.as_array())
         && !enums.iter().any(|e| e == value)
     {
-        let allowed: Vec<String> = enums
-            .iter()
-            .map(|v| v.to_string())
-            .collect();
+        let allowed: Vec<String> = enums.iter().map(|v| v.to_string()).collect();
         return Err(format!(
             "{path}: Unsupported value: {value}: supported values: {}",
             allowed.join(", ")

@@ -1,22 +1,12 @@
-//! Prost-generated bindings for gnostic's `OpenAPIv2.proto` (Swagger 2.0),
-//! plus a converter from `serde_json::Value` (the shape the rest of r8s
-//! works with) into the generated `Document` message.
+//! Prost bindings for gnostic's `OpenAPIv2.proto` (Swagger 2.0) plus a
+//! `serde_json::Value` → `Document` converter.
 //!
-//! The converter handles the subset of Swagger 2.0 that Kubernetes actually
-//! emits — anything outside that subset is silently dropped. In particular:
-//!
-//! - `paths`, `parameters`, `responses`, `security`, `tags`, `externalDocs`
-//!   are intentionally skipped (k8s clients use /apis discovery to map kinds
-//!   and don't need them for validation).
-//! - `x-*` keys at every level are preserved as `vendor_extension` entries
-//!   with YAML-encoded values; `x-kubernetes-group-version-kind` is what
-//!   lets clients find the right schema for a given GVK.
+//! Covers the subset k8s emits: `paths`/`parameters`/`responses`/`security`/
+//! `tags`/`externalDocs` are dropped; `x-*` keys are preserved as
+//! `vendor_extension` entries with YAML-encoded values.
 
 pub mod openapi {
     pub mod v2 {
-        // Generated code: some prost-emitted enums have a large size difference
-        // between variants. Boxing them would mean fork-maintaining the proto
-        // bindings, so just silence the lint here.
         #![allow(clippy::large_enum_variant)]
         include!(concat!(env!("OUT_DIR"), "/openapi.v2.rs"));
     }
@@ -166,8 +156,7 @@ fn json_to_additional_properties(v: &Value) -> Option<Box<pb::AdditionalProperti
     Some(Box::new(pb::AdditionalPropertiesItem { oneof }))
 }
 
-/// Wraps an arbitrary JSON value as an `Any`. gnostic represents unstructured
-/// payloads as YAML strings; serialized JSON is valid YAML.
+/// Wrap a JSON value as an `Any` (gnostic stores these as YAML; JSON is valid YAML).
 fn json_to_any(v: &Value) -> pb::Any {
     pb::Any {
         value: None,

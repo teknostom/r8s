@@ -16,3 +16,4 @@ toml.workspace = true
 libc = "0.2"
 rustc-hash.workspace = true
 r8s-store.workspace = true
+r8s-types.workspace = true

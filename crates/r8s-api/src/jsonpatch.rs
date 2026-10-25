@@ -286,13 +286,21 @@ mod tests {
     #[test]
     fn test_op_succeeds() {
         let mut t = json!({"x": "ok"});
-        apply(&mut t, &json!([{"op": "test", "path": "/x", "value": "ok"}])).unwrap();
+        apply(
+            &mut t,
+            &json!([{"op": "test", "path": "/x", "value": "ok"}]),
+        )
+        .unwrap();
     }
 
     #[test]
     fn test_op_fails() {
         let mut t = json!({"x": "ok"});
-        let err = apply(&mut t, &json!([{"op": "test", "path": "/x", "value": "no"}])).unwrap_err();
+        let err = apply(
+            &mut t,
+            &json!([{"op": "test", "path": "/x", "value": "no"}]),
+        )
+        .unwrap_err();
         assert!(matches!(err, JsonPatchError::TestFailed(_)));
     }
 

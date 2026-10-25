@@ -1,13 +1,36 @@
-use r8s_store::{Store, backend::ResourceRef, watch::WatchEventType};
+//! Background cascading deletion — the low-latency fast path.
+//!
+//! When an owner (Deployment, ReplicaSet, Job, …) is deleted with the default
+//! background policy, its dependents must be reaped. This controller does that
+//! immediately off the owner's `Deleted` watch event, so a two-level cascade
+//! (Deployment → ReplicaSet → pods) collapses in a couple of events rather than
+//! waiting on a polling scan.
+//!
+//! It is deliberately best-effort: it only fires on live events and drops
+//! everything on `Lagged`. Correctness is guaranteed elsewhere —
+//! [`crate::foreground_gc`]'s absent-owner pass relists on a timer and reaps any
+//! dependent whose owners have all vanished, with a debounce that this fast path
+//! can't afford. So anything this controller misses (a lagged channel, a
+//! multi-owner dependent it declines to touch) is caught there within a tick.
+
+use r8s_store::{
+    Store,
+    backend::ResourceRef,
+    watch::{WatchEvent, WatchEventType},
+};
 use r8s_types::{GroupVersionResource, ObjectMeta};
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
-use crate::is_owned_by;
-
 #[derive(serde::Deserialize)]
 struct MetadataOnly {
     metadata: ObjectMeta,
+}
+
+/// Outcome of handling one watch event: whether the run loop should keep going.
+enum Flow {
+    Continue,
+    Stop,
 }
 
 pub async fn run(store: Store, shutdown: CancellationToken) -> anyhow::Result<()> {
@@ -30,178 +53,58 @@ pub async fn run(store: Store, shutdown: CancellationToken) -> anyhow::Result<()
     let mut cj_rx = store.watch(&cj_gvr);
 
     loop {
-        tokio::select! {
+        let flow = tokio::select! {
             _ = shutdown.cancelled() => {
                 tracing::info!("gc controller shutting down");
                 return Ok(());
             }
-            event = deploy_rx.recv() => {
-                match event {
-                    Ok(event) if matches!(event.event_type, WatchEventType::Deleted) => {
-                        let meta: MetadataOnly = match serde_json::from_value(event.object) {
-                            Ok(m) => m,
-                            Err(_) => continue,
-                        };
-                        let uid = meta.metadata.uid.as_deref().unwrap_or("");
-                        delete_owned(&store, &rs_gvr, uid);
-                    }
-                    Err(broadcast::error::RecvError::Lagged(_)) => {
-                        gc_orphans(&store, &deploy_gvr, &rs_gvr);
-                    }
-                    Err(broadcast::error::RecvError::Closed) => return Ok(()),
-                    _ => {}
-                }
-            }
-            event = rs_rx.recv() => {
-                match event {
-                    Ok(event) if matches!(event.event_type, WatchEventType::Deleted) => {
-                        let meta: MetadataOnly = match serde_json::from_value(event.object) {
-                            Ok(m) => m,
-                            Err(_) => continue,
-                        };
-                        let uid = meta.metadata.uid.as_deref().unwrap_or("");
-                        delete_owned(&store, &pods_gvr, uid);
-                    }
-                    Err(broadcast::error::RecvError::Lagged(_)) => {
-                        gc_orphans(&store, &rs_gvr, &pods_gvr);
-                    }
-                    Err(broadcast::error::RecvError::Closed) => return Ok(()),
-                    _ => {}
-                }
-            }
-            event = rc_rx.recv() => {
-                match event {
-                    Ok(event) if matches!(event.event_type, WatchEventType::Deleted) => {
-                        let meta: MetadataOnly = match serde_json::from_value(event.object) {
-                            Ok(m) => m,
-                            Err(_) => continue,
-                        };
-                        let uid = meta.metadata.uid.as_deref().unwrap_or("");
-                        delete_owned(&store, &pods_gvr, uid);
-                    }
-                    Err(broadcast::error::RecvError::Lagged(_)) => {
-                        gc_orphans(&store, &rc_gvr, &pods_gvr);
-                    }
-                    Err(broadcast::error::RecvError::Closed) => return Ok(()),
-                    _ => {}
-                }
-            }
-            event = sts_rx.recv() => {
-                match event {
-                    Ok(event) if matches!(event.event_type, WatchEventType::Deleted) => {
-                        let meta: MetadataOnly = match serde_json::from_value(event.object) {
-                            Ok(m) => m,
-                            Err(_) => continue,
-                        };
-                        let uid = meta.metadata.uid.as_deref().unwrap_or("");
-                        delete_owned(&store, &pods_gvr, uid);
-                    }
-                    Err(broadcast::error::RecvError::Lagged(_)) => {
-                        gc_orphans(&store, &sts_gvr, &pods_gvr);
-                    }
-                    Err(broadcast::error::RecvError::Closed) => return Ok(()),
-                    _ => {}
-                }
-            }
-            event = ds_rx.recv() => {
-                match event {
-                    Ok(event) if matches!(event.event_type, WatchEventType::Deleted) => {
-                        let meta: MetadataOnly = match serde_json::from_value(event.object) {
-                            Ok(m) => m,
-                            Err(_) => continue,
-                        };
-                        let uid = meta.metadata.uid.as_deref().unwrap_or("");
-                        delete_owned(&store, &pods_gvr, uid);
-                    }
-                    Err(broadcast::error::RecvError::Lagged(_)) => {
-                        gc_orphans(&store, &ds_gvr, &pods_gvr);
-                    }
-                    Err(broadcast::error::RecvError::Closed) => return Ok(()),
-                    _ => {}
-                }
-            }
-            event = cj_rx.recv() => {
-                match event {
-                    Ok(event) if matches!(event.event_type, WatchEventType::Deleted) => {
-                        let meta: MetadataOnly = match serde_json::from_value(event.object) {
-                            Ok(m) => m,
-                            Err(_) => continue,
-                        };
-                        let uid = meta.metadata.uid.as_deref().unwrap_or("");
-                        delete_owned(&store, &job_gvr, uid);
-                    }
-                    Err(broadcast::error::RecvError::Lagged(_)) => {
-                        gc_orphans(&store, &cj_gvr, &job_gvr);
-                    }
-                    Err(broadcast::error::RecvError::Closed) => return Ok(()),
-                    _ => {}
-                }
-            }
-            event = job_rx.recv() => {
-                match event {
-                    Ok(event) if matches!(event.event_type, WatchEventType::Deleted) => {
-                        let meta: MetadataOnly = match serde_json::from_value(event.object) {
-                            Ok(m) => m,
-                            Err(_) => continue,
-                        };
-                        let uid = meta.metadata.uid.as_deref().unwrap_or("");
-                        delete_owned(&store, &pods_gvr, uid);
-                    }
-                    Err(broadcast::error::RecvError::Lagged(_)) => {
-                        gc_orphans(&store, &job_gvr, &pods_gvr);
-                    }
-                    Err(broadcast::error::RecvError::Closed) => return Ok(()),
-                    _ => {}
-                }
-            }
+            event = deploy_rx.recv() => on_owner_deleted(&store, event, &rs_gvr),
+            event = rs_rx.recv() => on_owner_deleted(&store, event, &pods_gvr),
+            event = rc_rx.recv() => on_owner_deleted(&store, event, &pods_gvr),
+            event = sts_rx.recv() => on_owner_deleted(&store, event, &pods_gvr),
+            event = ds_rx.recv() => on_owner_deleted(&store, event, &pods_gvr),
+            event = cj_rx.recv() => on_owner_deleted(&store, event, &job_gvr),
+            event = job_rx.recv() => on_owner_deleted(&store, event, &pods_gvr),
+        };
+        if let Flow::Stop = flow {
+            return Ok(());
         }
     }
 }
 
-fn gc_orphans(store: &Store, owner_gvr: &GroupVersionResource, child_gvr: &GroupVersionResource) {
-    let owners = match store.list_as::<MetadataOnly>(owner_gvr, None) {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::warn!("gc orphan scan: failed to list owners: {e}");
-            return;
-        }
-    };
-    let owner_uids: rustc_hash::FxHashSet<String> =
-        owners.into_iter().filter_map(|m| m.metadata.uid).collect();
-
-    let children = match store.list_as::<MetadataOnly>(child_gvr, None) {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::warn!("gc orphan scan: failed to list children: {e}");
-            return;
-        }
-    };
-
-    for meta in &children {
-        for oref in meta
-            .metadata
-            .owner_references
-            .as_deref()
-            .unwrap_or_default()
-        {
-            if !owner_uids.contains(&oref.uid) {
-                let name = meta.metadata.name.as_deref().unwrap_or("");
-                let ns = meta.metadata.namespace.as_deref();
-                let rref = ResourceRef {
-                    gvr: child_gvr,
-                    namespace: ns,
-                    name,
-                };
-                let _ = store.delete(&rref);
-                tracing::info!(
-                    "gc: orphan {}/{} deleted (owner uid={} gone)",
-                    child_gvr.resource,
-                    name,
-                    oref.uid
-                );
+/// On an owner's `Deleted` event, reap the dependents it solely owned. `Lagged`
+/// and non-delete events are ignored — foreground-gc's timed scan is the
+/// correctness backstop. `Closed` means the store is gone: stop.
+fn on_owner_deleted(
+    store: &Store,
+    event: Result<WatchEvent, broadcast::error::RecvError>,
+    child_gvr: &GroupVersionResource,
+) -> Flow {
+    match event {
+        Ok(event) if matches!(event.event_type, WatchEventType::Deleted) => {
+            let meta: MetadataOnly = match serde_json::from_value(event.object.as_ref().clone()) {
+                Ok(m) => m,
+                Err(_) => return Flow::Continue,
+            };
+            if let Some(uid) = meta.metadata.uid.as_deref().filter(|u| !u.is_empty()) {
+                delete_owned(store, child_gvr, uid);
             }
+            Flow::Continue
         }
+        Err(broadcast::error::RecvError::Closed) => Flow::Stop,
+        _ => Flow::Continue,
     }
+}
+
+/// True when `owner_uid` is the object's one and only owner. We reap on that
+/// fast path only; a dependent with additional owners might still be held by a
+/// live one, so we defer it to foreground-gc's absent-owner pass, which checks
+/// every ref before reaping.
+fn is_sole_owner(meta: &ObjectMeta, owner_uid: &str) -> bool {
+    matches!(
+        meta.owner_references.as_deref(),
+        Some([oref]) if oref.uid == owner_uid
+    )
 }
 
 fn delete_owned(store: &Store, child_gvr: &GroupVersionResource, owner_uid: &str) {
@@ -213,7 +116,7 @@ fn delete_owned(store: &Store, child_gvr: &GroupVersionResource, owner_uid: &str
         }
     };
     for meta in &children {
-        if is_owned_by(&meta.metadata, owner_uid) {
+        if is_sole_owner(&meta.metadata, owner_uid) {
             let name = meta.metadata.name.as_deref().unwrap_or("");
             let namespace = meta.metadata.namespace.as_deref();
             let resource_ref = ResourceRef {

@@ -1,11 +1,18 @@
 pub mod k8s_pb;
 pub mod k8s_pb_serde;
+pub mod net;
 pub mod openapi;
 pub mod openapi_proto;
 pub mod registry;
 pub mod resource;
+pub mod well_known;
 
+pub use net::{
+    BRIDGE_NAME, IP_POOL_MAX, IP_POOL_MIN, KUBELET_PORT, NODE_INTERNAL_IP, POD_CIDR, POD_PREFIX,
+    SERVICE_CIDR, nft_table_name, pod_ip, pod_ip_host,
+};
 pub use resource::{GroupVersionResource, ResourceType};
+pub use well_known::FOREGROUND_FINALIZER;
 
 pub use k8s_openapi::api::core::v1::{
     ConfigMap, ConfigMapVolumeSource, Container, ContainerPort, ContainerState,

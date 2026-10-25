@@ -1,17 +1,18 @@
-use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use crate::error::{Result, StoreError};
 
-use rustc_hash::{FxHashMap, FxHashSet};
+/// Resolves the value to assume for a field an object omits, given the object's
+/// type key and the field path. The store is type-agnostic; the default
+/// supplies nothing, and a distribution injects this to mirror its own API
+/// defaulting (see [`FieldSelector::with_defaults`]).
+pub type FieldDefaults = fn(&str, &str) -> Option<String>;
 
-type LabelMap = FxHashMap<String, FxHashMap<String, FxHashSet<String>>>;
-
-#[derive(Default, Clone)]
-pub struct LabelIndex {
-    index: Arc<Mutex<LabelMap>>,
+fn no_field_defaults(_gvr: &str, _field: &str) -> Option<String> {
+    None
 }
 
 pub struct FieldSelector {
     pub requirements: Vec<FieldRequirement>,
+    defaults: FieldDefaults,
 }
 
 pub enum Requirement {
@@ -19,10 +20,7 @@ pub enum Requirement {
     NotEquals(String, String),
     Exists(String),
     NotExists(String),
-    /// `key in (v1, v2, ...)` — label value must equal one of the listed values.
     In(String, Vec<String>),
-    /// `key notin (v1, v2, ...)` — label value must NOT equal any of the listed values.
-    /// Note: an absent label vacuously satisfies `notin`, matching k8s semantics.
     NotIn(String, Vec<String>),
 }
 
@@ -59,20 +57,8 @@ impl LabelSelector {
         })
     }
 
-    /// Parse a Kubernetes label selector. Supports the full set of operators
-    /// upstream's `k8s.io/apimachinery/pkg/labels` accepts:
-    ///
-    ///   `key=value`         equality
-    ///   `key!=value`        inequality
-    ///   `key in (v1,v2)`    membership
-    ///   `key notin (v1,v2)` non-membership
-    ///   `key`               exists
-    ///   `!key`              not-exists
-    ///
-    /// Top-level requirements are comma-separated, but commas inside the
-    /// `in`/`notin` value list are not separators — the splitter respects
-    /// parenthesis nesting accordingly.
-    pub fn parse(s: &str) -> anyhow::Result<Self> {
+    /// Parse a Kubernetes label selector.
+    pub fn parse(s: &str) -> Result<Self> {
         if s.trim().is_empty() {
             return Ok(Self {
                 requirements: vec![],
@@ -118,44 +104,44 @@ fn split_top_level_commas(s: &str) -> Vec<String> {
     out
 }
 
-fn parse_requirement(part: &str) -> anyhow::Result<Requirement> {
-    // Try `in` / `notin` first — they're delimited by whitespace, unlike `=` /
-    // `!=` which can appear inside a value list (e.g. `key in (a=b)`).
+fn parse_requirement(part: &str) -> Result<Requirement> {
     if let Some(rest) = part.strip_prefix("!") {
         return Ok(Requirement::NotExists(rest.trim().to_string()));
     }
-    // Look for ` notin (` and ` in (` as the operator (whitespace-bounded so
-    // we don't match a literal "in" inside a label key).
+
     if let Some((key, values)) = split_set_op(part, "notin") {
         return Ok(Requirement::NotIn(key, values));
     }
+
     if let Some((key, values)) = split_set_op(part, "in") {
         return Ok(Requirement::In(key, values));
     }
+
     if let Some((key, value)) = part.split_once("!=") {
         return Ok(Requirement::NotEquals(
             key.trim().to_string(),
             value.trim().to_string(),
         ));
     }
+
     if let Some((key, value)) = part.split_once("==") {
         return Ok(Requirement::Equals(
             key.trim().to_string(),
             value.trim().to_string(),
         ));
     }
+
     if let Some((key, value)) = part.split_once('=') {
         return Ok(Requirement::Equals(
             key.trim().to_string(),
             value.trim().to_string(),
         ));
     }
+
     Ok(Requirement::Exists(part.trim().to_string()))
 }
 
 fn split_set_op(part: &str, op: &str) -> Option<(String, Vec<String>)> {
-    // Match `<key> <op> (<v1>, <v2>, ...)`. Operator must be surrounded by
-    // whitespace; values are inside the parens, comma-separated.
     let mid_pattern = format!(" {op} ");
     let idx = part.find(&mid_pattern)?;
     let key = part[..idx].trim().to_string();
@@ -170,20 +156,11 @@ fn split_set_op(part: &str, op: &str) -> Option<(String, Vec<String>)> {
 }
 
 impl FieldSelector {
-    pub fn parse(s: &str) -> anyhow::Result<Self> {
-        if s.is_empty() {
-            return Ok(Self {
-                requirements: vec![],
-            });
-        }
-
+    pub fn parse(s: &str) -> Result<Self> {
         let mut requirements = Vec::new();
         for part in s.split(',') {
             let part = part.trim();
-            // Tolerate empty terms, e.g. the leading comma in
-            // `,type!=helm.sh/release.v1` that client-go emits when it joins an
-            // empty selector with a real one (ingress-nginx's Secret informer
-            // does exactly this). Upstream ignores empty terms rather than 400.
+            // client-go emits empty terms when it joins an empty selector with a real one
             if part.is_empty() {
                 continue;
             }
@@ -192,40 +169,35 @@ impl FieldSelector {
             } else if let Some((key, value)) = part.split_once('=') {
                 requirements.push(FieldRequirement::Equals(key.into(), value.into()));
             } else {
-                anyhow::bail!("invalid field selector: {part}");
+                return Err(StoreError::InvalidSelector(format!(
+                    "field selector term '{part}' has no operator"
+                )));
             }
         }
-        Ok(Self { requirements })
-    }
-
-    /// Match a stored object against the selector. `gvr` is the resource's
-    /// key prefix (e.g. `"/v1/nodes"`) so we can apply the same per-resource
-    /// selectable-field conversion Kubernetes does — including supplying the
-    /// zero value for absent boolean defaults (e.g. `spec.unschedulable` on
-    /// Node, which the e2e suite filters on before any test runs).
-    pub fn matches(&self, object: &serde_json::Value, gvr: &str) -> bool {
-        self.requirements.iter().all(|req| match req {
-            FieldRequirement::Equals(field, expected) => {
-                selectable_field(gvr, object, field).as_deref() == Some(expected.as_str())
-            }
-            FieldRequirement::NotEquals(field, expected) => {
-                selectable_field(gvr, object, field).as_deref() != Some(expected.as_str())
-            }
+        Ok(Self {
+            requirements,
+            defaults: no_field_defaults,
         })
     }
-}
 
-/// Resolve a selectable field for a stored object, applying per-resource
-/// defaults for fields whose Go zero value is meaningful (mirrors
-/// `*ToSelectableFields` in upstream Kubernetes).
-fn selectable_field(gvr: &str, obj: &serde_json::Value, field: &str) -> Option<String> {
-    if let Some(v) = extract_field(obj, field) {
-        return Some(v);
+    /// Attach a per-type default resolver, letting a distribution supply the
+    /// values to assume for fields an object omits. Without it, an absent field
+    /// simply has no value.
+    pub fn with_defaults(mut self, defaults: FieldDefaults) -> Self {
+        self.defaults = defaults;
+        self
     }
-    match (gvr, field) {
-        ("/v1/nodes", "spec.unschedulable") => Some("false".into()),
-        ("/v1/pods", "spec.nodeName") => Some(String::new()),
-        _ => None,
+
+    /// Match a stored object against the selector. `gvr` is an opaque type key
+    /// passed through to the injected defaults; the store ascribes no meaning
+    /// to it.
+    pub fn matches(&self, object: &serde_json::Value, gvr: &str) -> bool {
+        let value =
+            |field: &str| extract_field(object, field).or_else(|| (self.defaults)(gvr, field));
+        self.requirements.iter().all(|req| match req {
+            FieldRequirement::Equals(field, expected) => value(field).as_deref() == Some(expected.as_str()),
+            FieldRequirement::NotEquals(field, expected) => value(field).as_deref() != Some(expected.as_str()),
+        })
     }
 }
 
@@ -242,61 +214,15 @@ fn extract_field(obj: &serde_json::Value, path: &str) -> Option<String> {
     }
 }
 
-impl LabelIndex {
-    pub fn update(&self, gvr_prefix: &str, resource_key: &str, labels: &BTreeMap<String, String>) {
-        let mut map = self.index.lock().expect("label index lock poisoned");
-        let inner = map.entry(gvr_prefix.to_string()).or_default();
-
-        for key_set in inner.values_mut() {
-            key_set.remove(resource_key);
-        }
-
-        for (key, value) in labels {
-            let label_string = format!("{key}={value}");
-            inner
-                .entry(label_string)
-                .or_default()
-                .insert(resource_key.to_string());
-        }
-    }
-
-    pub fn remove(&self, gvr_prefix: &str, resource_key: &str) {
-        self.update(gvr_prefix, resource_key, &BTreeMap::new());
-    }
-
-    pub fn matches(&self, gvr_prefix: &str, selector: &LabelSelector) -> Option<FxHashSet<String>> {
-        let map = self.index.lock().expect("label index lock poisoned");
-        let inner = map.get(gvr_prefix)?;
-
-        let mut result: Option<FxHashSet<String>> = None;
-
-        for requirement in &selector.requirements {
-            if let Requirement::Equals(key, value) = requirement {
-                let label_string = format!("{key}={value}");
-                let matching = inner.get(&label_string).cloned().unwrap_or_default();
-                result = Some(match result {
-                    Some(existing) => existing.intersection(&matching).cloned().collect(),
-                    None => matching,
-                });
-            }
-        }
-
-        result
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn field_selector_tolerates_leading_comma() {
-        // ingress-nginx's Secret informer sends `,type!=helm.sh/release.v1`
-        // (client-go joins an empty selector with a real one). Must parse.
         let sel = FieldSelector::parse(",type!=helm.sh/release.v1").expect("should parse");
         let helm = serde_json::json!({ "type": "helm.sh/release.v1" });
         let tls = serde_json::json!({ "type": "kubernetes.io/tls" });
-        // Helm release secret excluded; TLS secret kept.
         assert!(!sel.matches(&helm, "/v1/secrets"));
         assert!(sel.matches(&tls, "/v1/secrets"));
     }

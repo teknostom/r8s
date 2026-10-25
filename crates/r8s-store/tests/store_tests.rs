@@ -110,6 +110,42 @@ async fn create_and_get() {
 }
 
 #[tokio::test]
+async fn create_preserves_preset_uid_and_creation_timestamp() {
+    let dir = TempDir::new().unwrap();
+    let store = open_temp_store(&dir);
+    let gvr = test_gvr();
+
+    // The API layer stamps uid/creationTimestamp before validating admission
+    // webhooks run; the store must persist that identity, not mint a new one
+    // (the object a webhook approved and the object stored must be the same).
+    let mut obj = test_object("stamped", "default");
+    obj["metadata"]["uid"] = serde_json::json!("0a1b2c3d-1111-4222-8333-444455556666");
+    obj["metadata"]["creationTimestamp"] = serde_json::json!("2026-06-13T00:00:00+00:00");
+
+    let created = store
+        .create(
+            ResourceRef {
+                gvr: &gvr,
+                namespace: Some("default"),
+                name: "stamped",
+            },
+            &obj,
+        )
+        .unwrap();
+
+    assert_eq!(
+        created["metadata"]["uid"].as_str().unwrap(),
+        "0a1b2c3d-1111-4222-8333-444455556666"
+    );
+    assert_eq!(
+        created["metadata"]["creationTimestamp"].as_str().unwrap(),
+        "2026-06-13T00:00:00+00:00"
+    );
+    // resourceVersion stays server-owned regardless.
+    assert!(created["metadata"]["resourceVersion"].as_str().is_some());
+}
+
+#[tokio::test]
 async fn create_duplicate_returns_already_exists() {
     let dir = TempDir::new().unwrap();
     let store = open_temp_store(&dir);
@@ -129,9 +165,7 @@ async fn create_duplicate_returns_already_exists() {
         name: "nginx",
     };
     let err = store.create(rref, &obj).unwrap_err();
-    assert!(err.downcast_ref::<StoreError>().is_some());
-    let store_err = err.downcast_ref::<StoreError>().unwrap();
-    assert!(matches!(store_err, StoreError::AlreadyExists { .. }));
+    assert!(matches!(err, StoreError::AlreadyExists { .. }));
 }
 
 #[tokio::test]
@@ -202,8 +236,7 @@ async fn update_nonexistent_returns_not_found() {
         name: "ghost",
     };
     let err = store.update(&rref, &obj).unwrap_err();
-    let store_err = err.downcast_ref::<StoreError>().unwrap();
-    assert!(matches!(store_err, StoreError::NotFound { .. }));
+    assert!(matches!(err, StoreError::NotFound { .. }));
 }
 
 #[tokio::test]
@@ -220,23 +253,24 @@ async fn update_with_stale_revision_returns_conflict() {
     };
     let created = store.create(rref, &obj).unwrap();
 
-    // First update — bumps resourceVersion
+    // First update changes the image (and so bumps resourceVersion past 1).
+    let mut modified = created.clone();
+    modified["spec"]["containers"][0]["image"] = serde_json::json!("nginx:1.26");
     let rref = ResourceRef {
         gvr: &gvr,
         namespace: Some("default"),
         name: "nginx",
     };
-    let _updated = store.update(&rref, &created).unwrap();
+    let _updated = store.update(&rref, &modified).unwrap();
 
-    // Second update with the OLD resourceVersion — should conflict
+    // Second update carries the original (now stale) resourceVersion — conflict.
     let rref = ResourceRef {
         gvr: &gvr,
         namespace: Some("default"),
         name: "nginx",
     };
     let err = store.update(&rref, &created).unwrap_err();
-    let store_err = err.downcast_ref::<StoreError>().unwrap();
-    assert!(matches!(store_err, StoreError::Conflict { .. }));
+    assert!(matches!(err, StoreError::Conflict { .. }));
 }
 
 // ── Store: delete ────────────────────────────────────────────────────
@@ -489,12 +523,14 @@ async fn watch_receives_events() {
     assert_eq!(event.object["metadata"]["name"], "nginx");
 
     // Update
+    let mut modified = created.clone();
+    modified["spec"]["containers"][0]["image"] = serde_json::json!("nginx:1.26");
     let rref = ResourceRef {
         gvr: &gvr,
         namespace: Some("default"),
         name: "nginx",
     };
-    store.update(&rref, &created).unwrap();
+    store.update(&rref, &modified).unwrap();
 
     let event = rx.recv().await.unwrap();
     assert!(matches!(event.event_type, WatchEventType::Modified));
@@ -622,19 +658,277 @@ fn field_selector_not_equals() {
     assert!(!sel.matches(&obj2, "/v1/pods"));
 }
 
+/// Injected defaults supply a value for fields an object omits; a present
+/// field always overrides the default. The store stays type-agnostic — the
+/// test, not the store, decides what `spec.unschedulable` defaults to.
 #[test]
-fn field_selector_node_unschedulable_defaults_to_false() {
-    let sel = FieldSelector::parse("spec.unschedulable=false").unwrap();
-    let node = serde_json::json!({"metadata": {"name": "n1"}, "spec": {}});
-    assert!(
-        sel.matches(&node, "/v1/nodes"),
-        "absent spec.unschedulable on a Node must match `=false` (k8s default)"
-    );
+fn field_selector_applies_injected_defaults() {
+    fn defaults(_gvr: &str, field: &str) -> Option<String> {
+        (field == "spec.unschedulable").then(|| "false".to_string())
+    }
 
-    let sel_true = FieldSelector::parse("spec.unschedulable=true").unwrap();
-    assert!(!sel_true.matches(&node, "/v1/nodes"));
+    let sel = FieldSelector::parse("spec.unschedulable=false")
+        .unwrap()
+        .with_defaults(defaults);
+    let absent = serde_json::json!({"metadata": {"name": "n1"}, "spec": {}});
+    assert!(sel.matches(&absent, "example.com/v1/widgets"));
 
     let cordoned = serde_json::json!({"metadata": {"name": "n2"}, "spec": {"unschedulable": true}});
-    assert!(!sel.matches(&cordoned, "/v1/nodes"));
-    assert!(sel_true.matches(&cordoned, "/v1/nodes"));
+    assert!(!sel.matches(&cordoned, "example.com/v1/widgets"));
+
+    // Without injected defaults, an absent field has no value to match against.
+    let plain = FieldSelector::parse("spec.unschedulable=false").unwrap();
+    assert!(!plain.matches(&absent, "example.com/v1/widgets"));
+}
+
+// ── Store: durable watch replay ──────────────────────────────────────
+
+#[tokio::test]
+async fn watch_from_replays_events_after_revision() {
+    let dir = TempDir::new().unwrap();
+    let store = open_temp_store(&dir);
+    let gvr = test_gvr();
+
+    let created = store
+        .create(
+            ResourceRef {
+                gvr: &gvr,
+                namespace: Some("default"),
+                name: "a",
+            },
+            &test_object("a", "default"),
+        )
+        .unwrap();
+    store
+        .create(
+            ResourceRef {
+                gvr: &gvr,
+                namespace: Some("default"),
+                name: "b",
+            },
+            &test_object("b", "default"),
+        )
+        .unwrap();
+
+    let since_a: u64 = created["metadata"]["resourceVersion"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+
+    // Resuming just after "a" must replay "b" and nothing else.
+    let (history, _rx) = store.watch_from(&gvr, since_a).unwrap();
+    let names: Vec<&str> = history
+        .iter()
+        .map(|e| e.object["metadata"]["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, vec!["b"]);
+}
+
+#[tokio::test]
+async fn watch_from_streams_after_replay() {
+    let dir = TempDir::new().unwrap();
+    let store = open_temp_store(&dir);
+    let gvr = test_gvr();
+
+    let created = store
+        .create(
+            ResourceRef {
+                gvr: &gvr,
+                namespace: Some("default"),
+                name: "a",
+            },
+            &test_object("a", "default"),
+        )
+        .unwrap();
+    let rv: u64 = created["metadata"]["resourceVersion"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+
+    // No buffered events after `rv`, so the replay is empty and the receiver
+    // carries the next mutation live.
+    let (history, mut rx) = store.watch_from(&gvr, rv).unwrap();
+    assert!(history.is_empty());
+
+    store
+        .create(
+            ResourceRef {
+                gvr: &gvr,
+                namespace: Some("default"),
+                name: "b",
+            },
+            &test_object("b", "default"),
+        )
+        .unwrap();
+
+    let event = rx.recv().await.unwrap();
+    assert!(matches!(event.event_type, WatchEventType::Added));
+    assert_eq!(event.object["metadata"]["name"], "b");
+}
+
+// ── Store: list_and_watch ────────────────────────────────────────────
+
+#[tokio::test]
+async fn list_and_watch_snapshots_then_streams() {
+    let dir = TempDir::new().unwrap();
+    let store = open_temp_store(&dir);
+    let gvr = test_gvr();
+
+    store
+        .create(
+            ResourceRef {
+                gvr: &gvr,
+                namespace: Some("default"),
+                name: "existing",
+            },
+            &test_object("existing", "default"),
+        )
+        .unwrap();
+
+    let (snapshot, mut rx) = store
+        .list_and_watch(&gvr, Some("default"), None, None)
+        .unwrap();
+    assert_eq!(snapshot.items.len(), 1);
+    assert_eq!(snapshot.items[0]["metadata"]["name"], "existing");
+
+    // A mutation after the snapshot is delivered only on the live stream.
+    store
+        .create(
+            ResourceRef {
+                gvr: &gvr,
+                namespace: Some("default"),
+                name: "fresh",
+            },
+            &test_object("fresh", "default"),
+        )
+        .unwrap();
+
+    let event = rx.recv().await.unwrap();
+    assert!(matches!(event.event_type, WatchEventType::Added));
+    assert_eq!(event.object["metadata"]["name"], "fresh");
+}
+
+// ── Store: no-op update ──────────────────────────────────────────────
+
+/// Re-submitting an unchanged object must not bump resourceVersion or emit an
+/// event; controllers rely on this to avoid reconcile feedback loops.
+#[tokio::test]
+async fn update_without_changes_is_a_noop() {
+    let dir = TempDir::new().unwrap();
+    let store = open_temp_store(&dir);
+    let gvr = test_gvr();
+
+    let created = store
+        .create(
+            ResourceRef {
+                gvr: &gvr,
+                namespace: Some("default"),
+                name: "nginx",
+            },
+            &test_object("nginx", "default"),
+        )
+        .unwrap();
+    let rv = created["metadata"]["resourceVersion"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let rref = ResourceRef {
+        gvr: &gvr,
+        namespace: Some("default"),
+        name: "nginx",
+    };
+    let again = store.update(&rref, &created).unwrap();
+    assert_eq!(again["metadata"]["resourceVersion"].as_str().unwrap(), rv);
+}
+
+// ── Store: pagination across a deleted continue key ──────────────────
+
+/// If the row named by a continue token is deleted between pages, the next
+/// page must resume at the following row rather than skipping it.
+#[tokio::test]
+async fn list_pagination_survives_deleted_continue_key() {
+    let dir = TempDir::new().unwrap();
+    let store = open_temp_store(&dir);
+    let gvr = test_gvr();
+
+    for name in ["a", "b", "c", "d", "e"] {
+        store
+            .create(
+                ResourceRef {
+                    gvr: &gvr,
+                    namespace: Some("default"),
+                    name,
+                },
+                &test_object(name, "default"),
+            )
+            .unwrap();
+    }
+
+    let page1 = store
+        .list(&gvr, Some("default"), None, None, Some(2), None)
+        .unwrap();
+    assert_eq!(page1.items.len(), 2);
+    assert_eq!(page1.items[1]["metadata"]["name"], "b");
+    let token = page1.continue_token.clone().expect("expected continue token");
+
+    // Delete the row the token points at, then resume.
+    store
+        .delete(&ResourceRef {
+            gvr: &gvr,
+            namespace: Some("default"),
+            name: "b",
+        })
+        .unwrap();
+
+    let page2 = store
+        .list(&gvr, Some("default"), None, None, Some(2), Some(&token))
+        .unwrap();
+    let names: Vec<&str> = page2
+        .items
+        .iter()
+        .map(|i| i["metadata"]["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, vec!["c", "d"], "must not skip 'c' after 'b' was deleted");
+}
+
+// ── Store: no-op detection ignores resourceVersion ───────────────────
+
+#[tokio::test]
+async fn update_ignoring_resource_version_is_a_noop() {
+    let dir = TempDir::new().unwrap();
+    let store = open_temp_store(&dir);
+    let gvr = test_gvr();
+
+    let created = store
+        .create(
+            ResourceRef {
+                gvr: &gvr,
+                namespace: Some("default"),
+                name: "nginx",
+            },
+            &test_object("nginx", "default"),
+        )
+        .unwrap();
+    let rv = created["metadata"]["resourceVersion"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Identical content but with resourceVersion stripped is still a no-op.
+    let mut incoming = created.clone();
+    incoming["metadata"]
+        .as_object_mut()
+        .unwrap()
+        .remove("resourceVersion");
+
+    let rref = ResourceRef {
+        gvr: &gvr,
+        namespace: Some("default"),
+        name: "nginx",
+    };
+    let again = store.update(&rref, &incoming).unwrap();
+    assert_eq!(again["metadata"]["resourceVersion"].as_str().unwrap(), rv);
 }

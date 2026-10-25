@@ -8,6 +8,7 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
+use r8s_types::nft_table_name;
 
 #[derive(Parser)]
 #[command(name = "r8s", about = "Lightweight single-node Kubernetes in Rust")]
@@ -386,16 +387,6 @@ fn container_owned_by(info_json: &str, cluster: &str) -> Option<bool> {
     Some(got == cluster)
 }
 
-/// Must match `r8s_network::proxy::nft_table_name` — kept in sync by hand to
-/// avoid pulling tokio/hyper into the CLI just for one identifier sanitizer.
-fn nft_table_name(cluster: &str) -> String {
-    let sanitized: String = cluster
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-        .collect();
-    format!("r8s_{sanitized}")
-}
-
 fn tail_follow(path: &Path) -> anyhow::Result<()> {
     let content = std::fs::read_to_string(path)?;
     let lines: Vec<&str> = content.lines().collect();
@@ -549,12 +540,12 @@ fn main() -> anyhow::Result<()> {
             if !db_path.exists() {
                 anyhow::bail!("store not found for cluster '{name}'");
             }
-            let (rev, rev_entries, resources) = r8s_store::stats(&db_path)?;
+            let stats = r8s_store::stats(&db_path)?;
             let size = std::fs::metadata(&db_path)?.len();
             println!("Cluster: {name}");
-            println!("Current revision:      {rev}");
-            println!("Revision table entries: {rev_entries}");
-            println!("Resource count:         {resources}");
+            println!("Current revision:      {}", stats.current_revision);
+            println!("Revision table entries: {}", stats.revision_entries);
+            println!("Resource count:         {}", stats.resource_count);
             println!("Store size:             {:.1} KB", size as f64 / 1024.0);
         }
 
@@ -671,12 +662,6 @@ fn env_nuke(config: PathBuf) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn nft_table_name_matches_runtime_sanitizer() {
-        assert_eq!(nft_table_name("default"), "r8s_default");
-        assert_eq!(nft_table_name("my-cluster.1"), "r8s_my_cluster_1");
-    }
 
     #[test]
     fn container_owned_by_matches_label() {

@@ -8,12 +8,14 @@ use std::{
 };
 
 use base64::Engine;
-use r8s_runtime::{ContainerConfig, ContainerId, ContainerRuntime, Mount, RegistryAuth};
+use r8s_runtime::{
+    ContainerConfig, ContainerId, ContainerRuntime, Mount, RegistryAuth, RuntimeError,
+};
 use r8s_store::{Store, backend::ResourceRef, watch::WatchEventType};
 use r8s_types::{
     Container, ContainerState, ContainerStateRunning, ContainerStateTerminated,
-    ContainerStateWaiting, ContainerStatus, GroupVersionResource, Pod, PodCondition, PodIP, PodSpec,
-    PodStatus, Time, Volume, VolumeMount,
+    ContainerStateWaiting, ContainerStatus, GroupVersionResource, IP_POOL_MAX, IP_POOL_MIN, Pod,
+    PodCondition, PodIP, PodSpec, PodStatus, Time, Volume, VolumeMount, pod_ip,
 };
 use rustc_hash::FxHashMap;
 use tokio::sync::{Mutex, broadcast};
@@ -21,9 +23,6 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 const NODE_NAME: &str = "r8s-node";
-/// Reported as `status.hostIP`/`status.hostIPs` for the downward API. r8s runs
-/// pods on the single bridge gateway host.
-const HOST_IP: &str = "10.244.0.1";
 const MAX_BACKOFF: Duration = Duration::from_secs(300);
 const INITIAL_BACKOFF: Duration = Duration::from_secs(10);
 
@@ -61,7 +60,7 @@ impl IpPool {
     fn new() -> Self {
         Self {
             free: Vec::new(),
-            next: 2,
+            next: IP_POOL_MIN,
         }
     }
 
@@ -69,7 +68,7 @@ impl IpPool {
         if let Some(ip) = self.free.pop() {
             return Some(ip);
         }
-        if self.next > 254 {
+        if self.next > IP_POOL_MAX {
             return None;
         }
         let ip = self.next;
@@ -77,8 +76,26 @@ impl IpPool {
         Some(ip)
     }
 
+    /// Mark a specific host as allocated — used to adopt a pod's existing IP
+    /// after a restart so it can't also be handed out fresh. Idempotent: pushes
+    /// the high-water mark past `ip` (freeing the gap it opens) or drops `ip`
+    /// from the free list, whichever applies.
+    fn reserve(&mut self, ip: u32) {
+        if ip >= self.next {
+            self.free.extend(self.next..ip);
+            self.next = ip + 1;
+        } else {
+            self.free.retain(|&f| f != ip);
+        }
+    }
+
     fn release(&mut self, ip: u32) {
-        self.free.push(ip);
+        // Idempotent: only a genuinely-allocated IP (below the high-water mark
+        // and not already free) re-enters the pool. Without this a double
+        // release would queue the same address twice and hand it to two pods.
+        if ip < self.next && !self.free.contains(&ip) {
+            self.free.push(ip);
+        }
     }
 }
 
@@ -100,7 +117,10 @@ struct StartGuard<'a> {
 
 impl Drop for StartGuard<'_> {
     fn drop(&mut self) {
-        self.starting.lock().expect("starting poisoned").remove(&self.uid);
+        self.starting
+            .lock()
+            .expect("starting poisoned")
+            .remove(&self.uid);
     }
 }
 
@@ -153,6 +173,19 @@ impl PodState {
         self.ip_pool.lock().await.allocate()
     }
 
+    async fn reserve_ip(&self, ip: u32) {
+        self.ip_pool.lock().await.reserve(ip);
+    }
+
+    /// Re-reserve every IP in `used` under a single lock — the restart recovery
+    /// pass, run before any allocation can race it.
+    async fn reserve_ips(&self, used: &rustc_hash::FxHashSet<u32>) {
+        let mut pool = self.ip_pool.lock().await;
+        for &ip in used {
+            pool.reserve(ip);
+        }
+    }
+
     async fn release_ip(&self, ip: u32) {
         self.ip_pool.lock().await.release(ip);
     }
@@ -166,6 +199,17 @@ fn restart_backoff(restart_count: i32) -> Duration {
         .as_secs()
         .saturating_mul(1u64 << (restart_count - 1).min(30));
     Duration::from_secs(secs).min(MAX_BACKOFF)
+}
+
+/// Stop then remove each container, ignoring errors. Teardown is idempotent — an
+/// already-stopped or already-gone container is not a failure — so every cleanup
+/// path (rollback, crash, delete, reap, shutdown) funnels through here. `grace`
+/// is the stop timeout before the runtime kills the container.
+async fn stop_and_remove<R: ContainerRuntime>(runtime: &R, ids: &[ContainerId], grace: Duration) {
+    for cid in ids {
+        let _ = runtime.stop_container(cid, grace).await;
+        let _ = runtime.remove_container(cid).await;
+    }
 }
 
 pub async fn run<R: ContainerRuntime + 'static>(
@@ -197,7 +241,10 @@ pub async fn run_with_config<R: ContainerRuntime + 'static>(
     tracing::info!("kubelet started for node '{NODE_NAME}'");
 
     let state = Arc::new(PodState::new());
+    // Serializes the periodic sweep with itself — see the ticker arm below.
+    let sweep_lock = Arc::new(Mutex::new(()));
 
+    recover_ip_allocations(&store, &state).await;
     reconcile_all(&store, &*runtime, &state, &data_dir, &cluster).await;
 
     let mut rx = store.watch(&GroupVersionResource::pods());
@@ -211,20 +258,28 @@ pub async fn run_with_config<R: ContainerRuntime + 'static>(
                 let snap = state.snapshot().await;
                 for (_, pod_arc) in snap {
                     let tracked = pod_arc.lock().await;
-                    for cid in &tracked.container_ids {
-                        let _ = runtime.stop_container(cid, Duration::from_secs(5)).await;
-                        let _ = runtime.remove_container(cid).await;
-                    }
+                    stop_and_remove(&*runtime, &tracked.container_ids, Duration::from_secs(5)).await;
                 }
                 return Ok(());
             }
             _ = ticker.tick() => {
+                // At most one sweep at a time. A sweep that outlives the tick
+                // interval (many pods, a slow backend) would otherwise overlap
+                // the next one, and two concurrent check_health ->
+                // restart_in_place passes can both restart the same crashed pod,
+                // racing in create_container. Skipping the tick keeps "one sweep
+                // at a time" structural instead of assuming a sweep always
+                // finishes before the next tick fires.
+                let Ok(sweep_guard) = sweep_lock.clone().try_lock_owned() else {
+                    continue;
+                };
                 let state = state.clone();
                 let runtime = runtime.clone();
                 let store = store.clone();
                 let data_dir = data_dir.clone();
                 let cluster = cluster.clone();
                 tokio::spawn(async move {
+                    let _sweep_guard = sweep_guard;
                     // Retry pods scheduled here that haven't started yet — e.g.
                     // one whose first reconcile lost the race against the
                     // provisioner binding its PVC. check_health only inspects
@@ -287,6 +342,44 @@ async fn reconcile_all<R: ContainerRuntime>(
     }
 }
 
+/// Re-reserve the IPs of pods already running on this node, recovered from their
+/// `status.podIP`, before any reconcile can hand out a fresh address. The pool
+/// is empty on every daemon start; without this a restart could allocate an IP a
+/// surviving pod still holds, putting two pods on one address. `reconcile_pod`
+/// then reuses each pod's own reserved IP (see [`existing_pod_ip_num`]), so
+/// addresses stay stable across restarts rather than churning.
+async fn recover_ip_allocations(store: &Store, state: &PodState) {
+    let result = match store.list(&GroupVersionResource::pods(), None, None, None, None, None) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("kubelet ip recovery list error: {e}");
+            return;
+        }
+    };
+    let used: rustc_hash::FxHashSet<u32> = result
+        .items
+        .iter()
+        .filter(|v| v.pointer("/spec/nodeName").and_then(|n| n.as_str()) == Some(NODE_NAME))
+        .filter_map(existing_pod_ip_num)
+        .collect();
+    if !used.is_empty() {
+        tracing::info!("kubelet: recovered {} pod IP allocation(s)", used.len());
+        state.reserve_ips(&used).await;
+    }
+}
+
+/// The pool host number of a pod's already-assigned IP (`status.podIP`), if set
+/// and within our pod range. A restart reuses this instead of churning the
+/// address; `None` means allocate a fresh one.
+fn existing_pod_ip_num(pod_value: &serde_json::Value) -> Option<u32> {
+    pod_value
+        .pointer("/status/podIP")
+        .and_then(|v| v.as_str())?
+        .parse::<std::net::Ipv4Addr>()
+        .ok()
+        .and_then(r8s_types::pod_ip_host)
+}
+
 /// Reap containers whose pod no longer exists in the store. Discovers them by
 /// asking the runtime for everything tagged as ours (`list_owned_containers`)
 /// rather than by replaying our in-memory `state`: a container is labeled the
@@ -308,14 +401,17 @@ async fn reap_orphans<R: ContainerRuntime>(
     data_dir: &Path,
     cluster: &str,
 ) {
-    // What *should* exist: live pod uids in the store.
-    let live_uids: std::collections::HashSet<String> =
+    // What *should* exist: live pod uids in the store. Read the uid straight
+    // from the JSON rather than deserializing the whole Pod — a pod whose body
+    // we can't fully parse would otherwise fall out of this set and have its
+    // live containers reaped. The uid is all the membership test needs.
+    let live_uids: rustc_hash::FxHashSet<String> =
         match store.list(&GroupVersionResource::pods(), None, None, None, None, None) {
             Ok(r) => r
                 .items
                 .iter()
-                .filter_map(|v| serde_json::from_value::<Pod>(v.clone()).ok())
-                .filter_map(|p| p.metadata.uid)
+                .filter_map(|v| v.pointer("/metadata/uid").and_then(|u| u.as_str()))
+                .map(String::from)
                 .collect(),
             Err(e) => {
                 tracing::warn!("kubelet reap list error: {e}");
@@ -364,10 +460,7 @@ async fn reap_orphans<R: ContainerRuntime>(
         if uid.is_empty() || live_uids.contains(&uid) {
             continue;
         }
-        for cid in &cids {
-            let _ = runtime.stop_container(cid, Duration::from_secs(10)).await;
-            let _ = runtime.remove_container(cid).await;
-        }
+        stop_and_remove(runtime, &cids, Duration::from_secs(10)).await;
         // Drop in-memory tracking + release the IP if we still held it.
         if let Some(pod_arc) = state.remove(&uid).await {
             let tracked = pod_arc.lock().await;
@@ -379,9 +472,7 @@ async fn reap_orphans<R: ContainerRuntime>(
         // the labeled links too.
         r8s_network::bridge::teardown_pod_network(&name);
         for link in &veths {
-            let _ = std::process::Command::new("ip")
-                .args(["link", "delete", link])
-                .output();
+            r8s_network::bridge::delete_link(link);
         }
         cleanup_pod_volumes(data_dir, &uid);
         tracing::info!(
@@ -462,14 +553,28 @@ async fn reconcile_pod<R: ContainerRuntime>(
         }
     };
 
-    let ip_num = match state.allocate_ip().await {
-        Some(ip) => ip,
-        None => {
-            tracing::error!("pod '{pod_name}': IP pool exhausted");
-            return;
+    // Reuse the IP this pod already holds (recovered from a prior incarnation's
+    // status.podIP across a daemon restart) so the address is stable; otherwise
+    // draw a fresh one. recover_ip_allocations reserved every in-use IP up front
+    // and reserve is idempotent, so neither path hands one address to two pods.
+    // Reuse the IP this pod already holds (recovered from a prior incarnation's
+    // status.podIP across a daemon restart) so the address is stable; otherwise
+    // draw a fresh one. recover_ip_allocations reserved every in-use IP up front
+    // and reserve is idempotent, so neither path hands one address to two pods.
+    let ip_num = match existing_pod_ip_num(pod_value) {
+        Some(ip) => {
+            state.reserve_ip(ip).await;
+            ip
         }
+        None => match state.allocate_ip().await {
+            Some(ip) => ip,
+            None => {
+                tracing::error!("pod '{pod_name}': IP pool exhausted");
+                return;
+            }
+        },
     };
-    let pod_ip = format!("10.244.0.{ip_num}");
+    let pod_ip = pod_ip(ip_num).to_string();
 
     // Init containers run to completion (in order) before the main containers.
     if run_init_containers(
@@ -507,10 +612,7 @@ async fn reconcile_pod<R: ContainerRuntime>(
     {
         Ok(ids) => ids,
         Err(ids) => {
-            for cid in &ids {
-                let _ = runtime.stop_container(cid, Duration::from_secs(5)).await;
-                let _ = runtime.remove_container(cid).await;
-            }
+            stop_and_remove(runtime, &ids, Duration::from_secs(5)).await;
             state.release_ip(ip_num).await;
             cleanup_pod_volumes(data_dir, &pod_uid);
             tracing::warn!("pod '{pod_name}': rolled back {} containers", ids.len());
@@ -582,7 +684,8 @@ async fn start_containers<R: ContainerRuntime>(
     for container_spec in &spec.containers {
         let container_name = &container_spec.name;
 
-        if let Err(e) = ensure_image(runtime, store, pod_name, pod_ns, pod_value, container_spec).await
+        if let Err(e) =
+            ensure_image(runtime, store, pod_name, pod_ns, pod_value, container_spec).await
         {
             tracing::error!("pod '{pod_name}': {e}");
             return Err(container_ids);
@@ -688,6 +791,7 @@ async fn ensure_image<R: ContainerRuntime>(
 /// `$(VAR)` expansion, downward-API fieldRefs, secret/configMap keyRefs),
 /// command/args expansion, mounts, and securityContext UID/GID. Shared by both
 /// init and main containers.
+#[allow(clippy::too_many_arguments)]
 fn build_container_config(
     store: &Store,
     pod_name: &str,
@@ -797,6 +901,7 @@ fn build_container_config(
 /// are created once per pod), so an init container can stage files a main
 /// container later reads — which is exactly how prometheus's config-reloader
 /// expands its config Secret into the shared `config_out` dir.
+#[allow(clippy::too_many_arguments)]
 async fn run_init_containers<R: ContainerRuntime>(
     runtime: &R,
     store: &Store,
@@ -814,13 +919,22 @@ async fn run_init_containers<R: ContainerRuntime>(
 
     for container_spec in inits {
         let name = &container_spec.name;
-        if let Err(e) = ensure_image(runtime, store, pod_name, pod_ns, pod_value, container_spec).await
+        if let Err(e) =
+            ensure_image(runtime, store, pod_name, pod_ns, pod_value, container_spec).await
         {
             tracing::error!("pod '{pod_name}': init '{name}': {e}");
             return Err(());
         }
-        let config =
-            build_container_config(store, pod_name, pod_ns, pod_value, spec, container_spec, volume_paths, pod_ip);
+        let config = build_container_config(
+            store,
+            pod_name,
+            pod_ns,
+            pod_value,
+            spec,
+            container_spec,
+            volume_paths,
+            pod_ip,
+        );
 
         let id = match runtime.create_container(&config).await {
             Ok(id) => id,
@@ -831,8 +945,7 @@ async fn run_init_containers<R: ContainerRuntime>(
         };
         if runtime.prepare_task(&id).await.is_err() || runtime.start_container(&id).await.is_err() {
             tracing::error!("pod '{pod_name}': init '{name}': failed to start");
-            let _ = runtime.stop_container(&id, Duration::from_secs(5)).await;
-            let _ = runtime.remove_container(&id).await;
+            stop_and_remove(runtime, std::slice::from_ref(&id), Duration::from_secs(5)).await;
             return Err(());
         }
 
@@ -857,13 +970,20 @@ async fn run_init_containers<R: ContainerRuntime>(
                     }
                     tokio::time::sleep(Duration::from_millis(500)).await;
                 }
-                // Task already gone (fast exit before first poll): treat as done.
-                Err(_) => break false,
+                // Task gone (fast exit before first poll): init done.
+                Err(RuntimeError::NotFound(_)) => break false,
+                // Transient backend error: retry until the deadline.
+                Err(e) => {
+                    if Instant::now() > deadline {
+                        tracing::warn!("pod '{pod_name}': init '{name}' status unknown: {e}");
+                        break true;
+                    }
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
             }
         };
 
-        let _ = runtime.stop_container(&id, Duration::from_secs(5)).await;
-        let _ = runtime.remove_container(&id).await;
+        stop_and_remove(runtime, std::slice::from_ref(&id), Duration::from_secs(5)).await;
         if failed {
             return Err(());
         }
@@ -890,7 +1010,7 @@ fn update_pod_status(store: &Store, tracked: &TrackedPod) {
     };
 
     let now = Time(chrono::Utc::now());
-    let pod_ip = format!("10.244.0.{}", tracked.ip_num);
+    let pod_ip = pod_ip(tracked.ip_num).to_string();
 
     let containers = current_pod
         .spec
@@ -1080,10 +1200,7 @@ async fn handle_delete<R: ContainerRuntime>(
         None => (container_ids_from_spec(&pod, &pod_name), None),
     };
 
-    for cid in &container_ids {
-        let _ = runtime.stop_container(cid, Duration::from_secs(10)).await;
-        let _ = runtime.remove_container(cid).await;
-    }
+    stop_and_remove(runtime, &container_ids, Duration::from_secs(10)).await;
     if let Some(ip) = ip_num {
         state.release_ip(ip).await;
     }
@@ -1137,14 +1254,17 @@ async fn check_health<R: ContainerRuntime>(
                     crashed.push((pod_uid.clone(), status.exit_code));
                     break;
                 }
+                Err(RuntimeError::NotFound(_)) => {
+                    crashed.push((pod_uid.clone(), None));
+                    break;
+                }
+                // Transient backend error: skip this sweep, re-poll next tick.
                 Err(e) => {
                     tracing::warn!(
                         "pod '{}': container {} status check failed: {e}",
                         tracked.name,
                         cid.0
                     );
-                    crashed.push((pod_uid.clone(), None));
-                    break;
                 }
                 _ => {}
             }
@@ -1152,7 +1272,10 @@ async fn check_health<R: ContainerRuntime>(
     }
 
     for (pod_uid, exit_code) in crashed {
-        handle_crash(store, runtime, state, data_dir, &pod_uid, exit_code, cluster).await;
+        handle_crash(
+            store, runtime, state, data_dir, &pod_uid, exit_code, cluster,
+        )
+        .await;
     }
 
     run_probes(store, runtime, state, data_dir, cluster).await;
@@ -1249,10 +1372,7 @@ async fn restart_in_place<R: ContainerRuntime>(
     };
 
     // Stop & remove old containers
-    for cid in &old_container_ids {
-        let _ = runtime.stop_container(cid, Duration::from_secs(5)).await;
-        let _ = runtime.remove_container(cid).await;
-    }
+    stop_and_remove(runtime, &old_container_ids, Duration::from_secs(5)).await;
 
     // Tear down the dangling host-side veth so the next setup_pod_network can recreate it.
     r8s_network::bridge::teardown_pod_network(&pod_name);
@@ -1286,7 +1406,7 @@ async fn restart_in_place<R: ContainerRuntime>(
         }
     };
 
-    let pod_ip = format!("10.244.0.{ip_num}");
+    let pod_ip = pod_ip(ip_num).to_string();
     let new_ids = match start_containers(
         runtime,
         store,
@@ -1303,10 +1423,7 @@ async fn restart_in_place<R: ContainerRuntime>(
     {
         Ok(ids) => ids,
         Err(partial) => {
-            for cid in &partial {
-                let _ = runtime.stop_container(cid, Duration::from_secs(5)).await;
-                let _ = runtime.remove_container(cid).await;
-            }
+            stop_and_remove(runtime, &partial, Duration::from_secs(5)).await;
             tracing::error!("pod '{pod_name}': restart failed, will retry next tick");
             return;
         }
@@ -1360,10 +1477,7 @@ async fn terminate_pod<R: ContainerRuntime>(
     let tracked = pod_arc.lock().await;
 
     // Containers are already stopped (they crashed), but clean up
-    for cid in &tracked.container_ids {
-        let _ = runtime.stop_container(cid, Duration::from_secs(1)).await;
-        let _ = runtime.remove_container(cid).await;
-    }
+    stop_and_remove(runtime, &tracked.container_ids, Duration::from_secs(1)).await;
     state.release_ip(tracked.ip_num).await;
     r8s_network::bridge::teardown_pod_network(&tracked.name);
     cleanup_pod_volumes(data_dir, pod_uid);
@@ -1426,6 +1540,15 @@ async fn terminate_pod<R: ContainerRuntime>(
     );
 }
 
+// TODO(probes): probe every container, not just the first. This is a pod-level
+// approximation — the first container stands in for the whole pod — because the
+// surrounding model is pod-level: `TrackedPod` holds one `ProbeState` per probe
+// kind (not per container), `ready` is a single bool stamped onto every
+// container status, and a liveness failure restarts the whole pod. Doing it
+// properly is a cross-cutting change: per-container `ProbeState`, per-container
+// readiness aggregated into the pod `Ready` condition, and container-granular
+// restart in `restart_in_place` — touching `TrackedPod`, `run_probes`,
+// `update_pod_status`, and the restart path together.
 async fn run_probes<R: ContainerRuntime>(
     store: &Store,
     runtime: &R,
@@ -1462,7 +1585,7 @@ async fn run_probes<R: ContainerRuntime>(
             Some(s) => s,
             None => continue,
         };
-        let pod_ip = format!("10.244.0.{}", tracked.ip_num);
+        let pod_ip = pod_ip(tracked.ip_num).to_string();
 
         let cid = match tracked.container_ids.first().cloned() {
             Some(cid) => cid,
@@ -1780,6 +1903,47 @@ fn prepare_volumes(
             // pod isn't started this pass, and the kubelet retries on its next
             // health tick once the provisioner has bound the claim.
             resolve_pvc_host_path(store, pod_ns, &pvc_src.claim_name)?
+        } else if let Some(proj) = &vol.projected {
+            // A projected volume merges several sources into one directory. We
+            // handle the secret/configMap source types by reusing the same
+            // projection logic as standalone secret/configMap volumes; the
+            // projected-level defaultMode applies to every file (the per-source
+            // projections carry no mode of their own). bitnami kafka's
+            // `kafka-sasl` volume projects a Secret of SCRAM passwords this way,
+            // and the prepare-config init container exits non-zero if it can't
+            // read them. downwardAPI/serviceAccountToken sources aren't modelled
+            // yet — warn rather than fail so a pod that only needs the
+            // secret/configMap parts can still come up.
+            let dir = vol_dir(&vol.name);
+            std::fs::create_dir_all(&dir)?;
+            for src in proj.sources.iter().flatten() {
+                if let Some(s) = &src.secret {
+                    project_secret(
+                        store,
+                        pod_ns,
+                        &s.name,
+                        &dir,
+                        s.optional.unwrap_or(false),
+                        proj.default_mode,
+                    )?;
+                } else if let Some(cm) = &src.config_map {
+                    project_configmap(
+                        store,
+                        pod_ns,
+                        &cm.name,
+                        &dir,
+                        cm.optional.unwrap_or(false),
+                        proj.default_mode,
+                    )?;
+                } else {
+                    tracing::warn!(
+                        "volume '{}': projected source other than secret/configMap \
+                         not supported, skipping",
+                        vol.name
+                    );
+                }
+            }
+            dir.to_string_lossy().to_string()
         } else {
             tracing::warn!("volume '{}': unsupported volume source, skipping", vol.name);
             continue;
@@ -1917,12 +2081,7 @@ fn project_secret(
 /// Look up `valueFrom.secretKeyRef`: read `key` from the named Secret in the
 /// pod's namespace and base64-decode it. `None` (→ empty value) if the secret,
 /// key, or decode is missing — best-effort, matching the downward-API path.
-fn secret_value(
-    store: &Store,
-    namespace: Option<&str>,
-    name: &str,
-    key: &str,
-) -> Option<String> {
+fn secret_value(store: &Store, namespace: Option<&str>, name: &str, key: &str) -> Option<String> {
     let gvr = GroupVersionResource::secrets();
     let secret = store
         .get(&ResourceRef {
@@ -1931,7 +2090,10 @@ fn secret_value(
             name,
         })
         .ok()??;
-    let b64 = secret.get("data").and_then(|d| d.get(key)).and_then(|v| v.as_str())?;
+    let b64 = secret
+        .get("data")
+        .and_then(|d| d.get(key))
+        .and_then(|v| v.as_str())?;
     let bytes = base64::engine::general_purpose::STANDARD.decode(b64).ok()?;
     String::from_utf8(bytes).ok()
 }
@@ -1974,7 +2136,8 @@ fn resolve_field_ref(
         "metadata.namespace" => Some(pod_ns.into()),
         "metadata.uid" => Some(pod_uid.into()),
         "status.podIP" | "status.podIPs" => Some(pod_ip.into()),
-        "status.hostIP" | "status.hostIPs" => Some(HOST_IP.into()),
+        // status.hostIP: the node is the bridge gateway host.
+        "status.hostIP" | "status.hostIPs" => Some(r8s_types::NODE_INTERNAL_IP.into()),
         "spec.nodeName" => Some(NODE_NAME.into()),
         "spec.serviceAccountName" => Some(sa_name.into()),
         _ => None,
@@ -2139,7 +2302,11 @@ mod tests {
         // kubelet labels the container with that same uid — so read it back.
         let created = store
             .create(
-                ResourceRef { gvr: &pods, namespace: Some("default"), name: "live" },
+                ResourceRef {
+                    gvr: &pods,
+                    namespace: Some("default"),
+                    name: "live",
+                },
                 &serde_json::json!({
                     "apiVersion": "v1", "kind": "Pod",
                     "metadata": { "name": "live", "namespace": "default" },
@@ -2153,11 +2320,17 @@ mod tests {
             .and_then(|v| v.as_str())
             .unwrap()
             .to_string();
-        let live_cid = runtime.create_container(&cfg("live", &live_uid)).await.unwrap();
+        let live_cid = runtime
+            .create_container(&cfg("live", &live_uid))
+            .await
+            .unwrap();
 
         // An orphan: its container exists in the backend but no Pod object does
         // — exactly the crash/dropped-delete leak the sweep must catch.
-        let dead_cid = runtime.create_container(&cfg("dead", "uid-dead")).await.unwrap();
+        let dead_cid = runtime
+            .create_container(&cfg("dead", "uid-dead"))
+            .await
+            .unwrap();
 
         reap_orphans(&store, &runtime, &state, dir.path(), "test").await;
 
@@ -2168,6 +2341,123 @@ mod tests {
         assert!(
             runtime.container_status(&live_cid).await.is_ok(),
             "live pod's container must survive"
+        );
+    }
+
+    #[tokio::test]
+    async fn reap_orphans_keeps_pod_whose_body_fails_to_parse() {
+        // Liveness is decided from the uid alone. Reading the whole Pod and
+        // dropping any that fail to deserialize would let one malformed field
+        // reap a running pod's containers. Store a pod whose `spec` is the wrong
+        // JSON type (so `from_value::<Pod>` fails) but whose uid is intact, and
+        // confirm its container survives the sweep.
+        use super::{PodState, reap_orphans};
+        use r8s_runtime::{ContainerConfig, ContainerRuntime, MockRuntime};
+        use r8s_store::{Store, backend::ResourceRef};
+        use r8s_types::GroupVersionResource;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(&dir.path().join("s.db")).unwrap();
+        let runtime = MockRuntime::new();
+        let state = PodState::new();
+        let pods = GroupVersionResource::pods();
+
+        let created = store
+            .create(
+                ResourceRef {
+                    gvr: &pods,
+                    namespace: Some("default"),
+                    name: "broken",
+                },
+                &serde_json::json!({
+                    "apiVersion": "v1", "kind": "Pod",
+                    "metadata": { "name": "broken", "namespace": "default" },
+                    "spec": "this is not a pod spec"
+                }),
+            )
+            .unwrap();
+        let uid = created
+            .pointer("/metadata/uid")
+            .and_then(|v| v.as_str())
+            .unwrap()
+            .to_string();
+        assert!(
+            serde_json::from_value::<r8s_types::Pod>(created).is_err(),
+            "test premise: this pod must not fully deserialize"
+        );
+
+        let cid = runtime
+            .create_container(&ContainerConfig {
+                name: "broken_main".to_string(),
+                pod_uid: uid,
+                pod_name: "broken".to_string(),
+                container_name: "main".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        reap_orphans(&store, &runtime, &state, dir.path(), "test").await;
+
+        assert!(
+            runtime.container_status(&cid).await.is_ok(),
+            "container of a live pod must survive even if the pod body won't parse"
+        );
+    }
+
+    #[test]
+    fn prepare_volumes_projects_secret_source() {
+        use super::prepare_volumes;
+        use base64::Engine;
+        use r8s_store::{Store, backend::ResourceRef};
+        use r8s_types::{GroupVersionResource, Volume};
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(&dir.path().join("s.db")).unwrap();
+
+        // Shaped like bitnami kafka's `kafka-user-passwords`: one key per
+        // password file, base64-encoded as Secret data always is.
+        let secrets = GroupVersionResource::secrets();
+        let b64 = base64::engine::general_purpose::STANDARD.encode("r8s-integration");
+        store
+            .create(
+                ResourceRef {
+                    gvr: &secrets,
+                    namespace: Some("kafka"),
+                    name: "kafka-user-passwords",
+                },
+                &serde_json::json!({
+                    "apiVersion": "v1", "kind": "Secret",
+                    "metadata": { "name": "kafka-user-passwords", "namespace": "kafka" },
+                    "data": { "client-passwords": b64 }
+                }),
+            )
+            .unwrap();
+
+        // A single-source projected volume, exactly the `kafka-sasl` shape.
+        let volumes: Vec<Volume> = serde_json::from_value(serde_json::json!([
+            {
+                "name": "kafka-sasl",
+                "projected": {
+                    "sources": [ { "secret": { "name": "kafka-user-passwords" } } ]
+                }
+            }
+        ]))
+        .unwrap();
+
+        let paths =
+            prepare_volumes(&store, dir.path(), "pod-uid", Some("kafka"), &volumes).unwrap();
+        let vol_dir = paths
+            .get("kafka-sasl")
+            .expect("projected volume must resolve to a host dir");
+        let contents =
+            std::fs::read_to_string(std::path::Path::new(vol_dir).join("client-passwords"))
+                .unwrap();
+        assert_eq!(
+            contents, "r8s-integration",
+            "secret value must be decoded into the file"
         );
     }
 
@@ -2213,7 +2503,14 @@ mod tests {
     #[test]
     fn field_ref_downward_api() {
         assert_eq!(
-            resolve_field_ref("metadata.namespace", "p", "cert-manager", "u", "10.244.0.5", "sa"),
+            resolve_field_ref(
+                "metadata.namespace",
+                "p",
+                "cert-manager",
+                "u",
+                "10.244.0.5",
+                "sa"
+            ),
             Some("cert-manager".into())
         );
         assert_eq!(
@@ -2272,7 +2569,10 @@ mod tests {
 
         let mounts = resolve_mounts(&vms, &paths);
         let expected = base.join("tmp-dir");
-        assert!(expected.is_dir(), "subPath dir should be created on the host");
+        assert!(
+            expected.is_dir(),
+            "subPath dir should be created on the host"
+        );
         assert_eq!(mounts.len(), 1);
         assert_eq!(mounts[0].host_path, expected.to_string_lossy());
         assert_eq!(mounts[0].container_path, "/tmp");
@@ -2304,5 +2604,107 @@ mod tests {
         let target = base.join("web-config.yaml");
         assert!(target.is_file(), "existing file subPath must remain a file");
         assert_eq!(mounts[0].host_path, target.to_string_lossy());
+    }
+
+    #[test]
+    fn ip_pool_reserve_skips_reserved_and_fills_gaps() {
+        use super::IpPool;
+        // Reserving .5 (a restart-recovered IP) opens .2..=.4 as gaps. Fresh
+        // allocations fill those, then jump past the reserved high-water mark —
+        // never re-issuing .5.
+        let mut pool = IpPool::new();
+        pool.reserve(5);
+        let mut got: Vec<u32> = std::iter::from_fn(|| pool.allocate()).take(4).collect();
+        got.sort();
+        assert_eq!(got, [2, 3, 4, 6]);
+        assert!(!got.contains(&5), "reserved IP must never be allocated");
+    }
+
+    #[test]
+    fn ip_pool_reserve_is_idempotent() {
+        use super::IpPool;
+        let mut pool = IpPool::new();
+        pool.reserve(5);
+        pool.reserve(5);
+        let mut got: Vec<u32> = std::iter::from_fn(|| pool.allocate()).take(4).collect();
+        got.sort();
+        assert_eq!(got, [2, 3, 4, 6]);
+    }
+
+    #[test]
+    fn ip_pool_release_is_idempotent() {
+        use super::IpPool;
+        let mut pool = IpPool::new();
+        let a = pool.allocate().unwrap();
+        pool.release(a);
+        pool.release(a); // double release must not queue the address twice
+        assert_eq!(pool.allocate(), Some(a), "released IP is reused once");
+        assert_ne!(pool.allocate(), Some(a), "but never handed out a second time");
+    }
+
+    #[test]
+    fn ip_pool_release_ignores_never_allocated() {
+        use super::IpPool;
+        use r8s_types::IP_POOL_MIN;
+        let mut pool = IpPool::new();
+        pool.release(99); // never handed out -> ignored, not added to free
+        assert_eq!(pool.allocate(), Some(IP_POOL_MIN));
+    }
+
+    #[tokio::test]
+    async fn reconcile_pod_reuses_existing_status_pod_ip() {
+        // After a daemon restart the in-memory pool is empty but the pod still
+        // carries its old status.podIP. reconcile_pod must reuse that address,
+        // not churn the pod onto a fresh one.
+        use super::{PodState, reconcile_pod, recover_ip_allocations};
+        use r8s_runtime::MockRuntime;
+        use r8s_store::{Store, backend::ResourceRef};
+        use r8s_types::GroupVersionResource;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(&dir.path().join("s.db")).unwrap();
+        let runtime = MockRuntime::new();
+        let state = PodState::new();
+        let pods = GroupVersionResource::pods();
+
+        store
+            .create(
+                ResourceRef {
+                    gvr: &pods,
+                    namespace: Some("default"),
+                    name: "web",
+                },
+                &serde_json::json!({
+                    "apiVersion": "v1", "kind": "Pod",
+                    "metadata": { "name": "web", "namespace": "default" },
+                    "spec": {
+                        "nodeName": "r8s-node",
+                        "containers": [{ "name": "app", "image": "nginx" }]
+                    },
+                    "status": { "phase": "Running", "podIP": "10.244.0.7" }
+                }),
+            )
+            .unwrap();
+
+        recover_ip_allocations(&store, &state).await;
+        let read = || {
+            store
+                .get(&ResourceRef {
+                    gvr: &pods,
+                    namespace: Some("default"),
+                    name: "web",
+                })
+                .unwrap()
+                .unwrap()
+        };
+        let pod_value = read();
+        reconcile_pod(&store, &runtime, &state, &pod_value, dir.path(), "test").await;
+
+        assert_eq!(
+            read().pointer("/status/podIP").and_then(|v| v.as_str()),
+            Some("10.244.0.7"),
+            "restart must preserve the pod's IP"
+        );
     }
 }

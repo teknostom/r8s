@@ -242,29 +242,6 @@ fn to_rest_friendly_name(group: &str, version: &str, kind: &str) -> String {
     name
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn dotted_group_is_reversed() {
-        assert_eq!(
-            to_rest_friendly_name("stable.example.com", "v6", "Foo"),
-            "com.example.stable.v6.Foo"
-        );
-    }
-
-    #[test]
-    fn single_segment_group_is_kept_as_is() {
-        assert_eq!(to_rest_friendly_name("apps", "v1", "Deployment"), "apps.v1.Deployment");
-    }
-
-    #[test]
-    fn empty_group_uses_version_kind_only() {
-        assert_eq!(to_rest_friendly_name("", "v1", "Pod"), "v1.Pod");
-    }
-}
-
 fn wants_proto(headers: &http::HeaderMap) -> bool {
     accept_has_mime(headers, |mime| mime == PROTO_OPENAPI_V2_ACCEPT)
 }
@@ -293,4 +270,30 @@ fn accept_has_mime<F: Fn(&str) -> bool>(headers: &http::HeaderMap, f: F) -> bool
             let mime = part.split(';').next().unwrap_or("").trim();
             f(mime)
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dotted_group_is_reversed() {
+        assert_eq!(
+            to_rest_friendly_name("stable.example.com", "v6", "Foo"),
+            "com.example.stable.v6.Foo"
+        );
+    }
+
+    #[test]
+    fn single_segment_group_is_kept_as_is() {
+        assert_eq!(
+            to_rest_friendly_name("apps", "v1", "Deployment"),
+            "apps.v1.Deployment"
+        );
+    }
+
+    #[test]
+    fn empty_group_uses_version_kind_only() {
+        assert_eq!(to_rest_friendly_name("", "v1", "Pod"), "v1.Pod");
+    }
 }

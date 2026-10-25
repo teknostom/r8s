@@ -9,13 +9,14 @@
 //! - channel 1: stdout  (server → client)
 //! - channel 2: stderr  (server → client; absent when tty=true)
 //! - channel 3: error   (server → client; last frame is a Status JSON with
-//!                       the exit code, framed as metav1.Status)
+//!   the exit code, framed as metav1.Status)
 //! - channel 4: resize  (client → server; JSON {"Width":<cols>,"Height":<rows>})
-//!
-//! v5 adds CLOSE control messages (channel ID with empty payload signals the
-//! peer to close that half of the stream). We accept v5 but don't depend on
-//! the CLOSE semantics — if a peer sends one, we drop the corresponding mpsc
-//! sender, which is the same effect.
+//! - channel 255: CLOSE (v5 only; a frame `[255, <channel>]` half-closes one
+//!   stream). The case that matters is stdin: `kubectl exec -i` sends
+//!   `[255, 0]` when its input reaches EOF while keeping the socket open for
+//!   stdout, and we must drop our stdin sender so the runtime closes the
+//!   container's stdin and the exec'd process sees EOF instead of blocking
+//!   forever on a read.
 
 use axum::{
     extract::{
@@ -42,6 +43,8 @@ const CHAN_STDOUT: u8 = 1;
 const CHAN_STDERR: u8 = 2;
 const CHAN_ERROR: u8 = 3;
 const CHAN_RESIZE: u8 = 4;
+/// v5 reserved channel for CLOSE control frames: `[255, <channel-to-close>]`.
+const CHAN_CLOSE: u8 = 255;
 
 #[derive(Debug, Default)]
 pub struct ExecParams {
@@ -187,6 +190,18 @@ pub async fn pod_exec(
 
     ws.protocols([SUBPROTO_V5, SUBPROTO_V4])
         .on_upgrade(move |socket| async move {
+            // Diagnostic: which subprotocol did we land on? v4 has no stdin
+            // half-close signal at all; only v5 sends a CLOSE control frame.
+            let negotiated = socket
+                .protocol()
+                .and_then(|p| p.to_str().ok())
+                .unwrap_or("<none>")
+                .to_string();
+            tracing::info!(
+                subprotocol = %negotiated,
+                container_id = %container_id,
+                "exec session upgraded"
+            );
             let streams = match runtime
                 .exec(ExecConfig {
                     container_id: r8s_runtime::ContainerId(container_id),
@@ -255,7 +270,11 @@ async fn pump(
             let mut frame = Vec::with_capacity(chunk.len() + 1);
             frame.push(CHAN_STDOUT);
             frame.extend_from_slice(&chunk);
-            if out_tx_for_stdout.send(Message::Binary(frame.into())).await.is_err() {
+            if out_tx_for_stdout
+                .send(Message::Binary(frame.into()))
+                .await
+                .is_err()
+            {
                 break;
             }
         }
@@ -269,7 +288,11 @@ async fn pump(
                 let mut frame = Vec::with_capacity(chunk.len() + 1);
                 frame.push(CHAN_STDERR);
                 frame.extend_from_slice(&chunk);
-                if out_tx_for_stderr.send(Message::Binary(frame.into())).await.is_err() {
+                if out_tx_for_stderr
+                    .send(Message::Binary(frame.into()))
+                    .await
+                    .is_err()
+                {
                     break;
                 }
             }
@@ -347,6 +370,30 @@ async fn pump(
                 }
                 let chan = bytes[0];
                 let payload = &bytes[1..];
+                // Diagnostic: log every non-stdin-data frame so we can see what
+                // the client actually sends when its stdin reaches EOF.
+                if chan != CHAN_STDIN {
+                    let head = &payload[..payload.len().min(4)];
+                    tracing::info!(
+                        chan,
+                        payload_len = payload.len(),
+                        ?head,
+                        "exec: control frame"
+                    );
+                }
+                // A v5 CLOSE for stdin (`[255, 0]`) means the client's input
+                // hit EOF. Drop our stdin sender so the runtime closes the
+                // container's stdin FIFO and the exec'd process sees EOF —
+                // without this, `kubectl exec -i <<EOF` (cat, a console
+                // producer) blocks forever waiting for more input.
+                if is_stdin_close(chan, payload) {
+                    tracing::info!("exec: stdin CLOSE received, closing container stdin");
+                    drop(std::mem::replace(
+                        &mut streams.stdin_tx,
+                        tokio::sync::mpsc::channel(1).0,
+                    ));
+                    continue;
+                }
                 match chan {
                     CHAN_STDIN => {
                         if streams.stdin_tx.send(payload.to_vec()).await.is_err() {
@@ -355,23 +402,10 @@ async fn pump(
                     }
                     CHAN_RESIZE => {
                         if let Ok(resize) = serde_json::from_slice::<ResizeMsg>(payload) {
-                            let _ = streams
-                                .resize_tx
-                                .send((resize.width, resize.height))
-                                .await;
+                            let _ = streams.resize_tx.send((resize.width, resize.height)).await;
                         }
                     }
-                    _ => {
-                        // v5 CLOSE arrives as a 1-byte frame with the channel
-                        // ID being closed. We treat any unknown channel as a
-                        // hint to drop our matching sender.
-                        if payload.is_empty() && chan == CHAN_STDIN {
-                            drop(std::mem::replace(
-                                &mut streams.stdin_tx,
-                                tokio::sync::mpsc::channel(1).0,
-                            ));
-                        }
-                    }
+                    _ => {}
                 }
             }
             Message::Close(_) => break,
@@ -385,6 +419,13 @@ async fn pump(
     drop(streams.resize_tx);
     let _ = writer_task.await;
     Ok(())
+}
+
+/// True when an incoming WS frame is a v5 CLOSE control message for the stdin
+/// channel (`[255, 0]`). kubectl sends this when its stdin reaches EOF while
+/// keeping the rest of the session open for stdout/stderr.
+fn is_stdin_close(chan: u8, payload: &[u8]) -> bool {
+    chan == CHAN_CLOSE && payload.first() == Some(&CHAN_STDIN)
 }
 
 #[derive(Deserialize)]
@@ -414,3 +455,21 @@ async fn send_error_status(
     tx.send(Message::Binary(frame.into())).await
 }
 
+#[cfg(test)]
+mod tests {
+    use super::{CHAN_CLOSE, CHAN_STDIN, is_stdin_close};
+
+    #[test]
+    fn detects_v5_stdin_close() {
+        // kubectl sends [255, 0] when its stdin reaches EOF.
+        assert!(is_stdin_close(CHAN_CLOSE, &[CHAN_STDIN]));
+    }
+
+    #[test]
+    fn ignores_non_stdin_close_and_data() {
+        assert!(!is_stdin_close(CHAN_CLOSE, &[1])); // closing stdout, not stdin
+        assert!(!is_stdin_close(CHAN_STDIN, b"hello")); // real stdin data
+        assert!(!is_stdin_close(CHAN_CLOSE, &[])); // malformed: no channel byte
+        assert!(!is_stdin_close(4, &[0])); // resize frame, not a close
+    }
+}

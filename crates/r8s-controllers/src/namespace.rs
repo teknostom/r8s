@@ -21,7 +21,7 @@ pub async fn run(
     let sa_gvr = GroupVersionResource::service_accounts();
     let cm_gvr = GroupVersionResource::configmaps();
 
-    reconcile_all(&store, &ns_gvr, &sa_gvr, &cm_gvr, &ca_pem);
+    reconcile_all(&store, &ns_gvr, &sa_gvr, &cm_gvr, &ca_pem, &registry);
 
     let mut rx = store.watch(&ns_gvr);
     loop {
@@ -33,7 +33,7 @@ pub async fn run(
             event = rx.recv() => {
                 match event {
                     Ok(event) if matches!(event.event_type, WatchEventType::Added) => {
-                        let ns: Result<r8s_types::Namespace, _> = serde_json::from_value(event.object);
+                        let ns: Result<r8s_types::Namespace, _> = serde_json::from_value(event.object.as_ref().clone());
                         if let Ok(ns) = ns
                             && let Some(name) = ns.metadata.name.as_deref()
                         {
@@ -43,7 +43,7 @@ pub async fn run(
                     }
                     Ok(event) if matches!(event.event_type, WatchEventType::Deleted) => {
                         let ns: Result<r8s_types::Namespace, _> =
-                            serde_json::from_value(event.object);
+                            serde_json::from_value(event.object.as_ref().clone());
                         if let Ok(ns) = ns
                             && let Some(name) = ns.metadata.name.as_deref()
                         {
@@ -52,7 +52,7 @@ pub async fn run(
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         tracing::warn!("namespace controller lagged {n} events, re-syncing");
-                        reconcile_all(&store, &ns_gvr, &sa_gvr, &cm_gvr, &ca_pem);
+                        reconcile_all(&store, &ns_gvr, &sa_gvr, &cm_gvr, &ca_pem, &registry);
                     }
                     Err(broadcast::error::RecvError::Closed) => return Ok(()),
                     Ok(_) => {}
@@ -68,6 +68,7 @@ fn reconcile_all(
     sa_gvr: &GroupVersionResource,
     cm_gvr: &GroupVersionResource,
     ca_pem: &str,
+    registry: &ResourceRegistry,
 ) {
     let namespaces = match store.list_as::<r8s_types::Namespace>(ns_gvr, None) {
         Ok(r) => r,
@@ -76,11 +77,57 @@ fn reconcile_all(
             return;
         }
     };
-    for ns in &namespaces {
-        if let Some(name) = ns.metadata.name.as_deref() {
-            ensure_default_sa(store, sa_gvr, name);
-            ensure_kube_root_ca(store, cm_gvr, name, ca_pem);
+    let live: rustc_hash::FxHashSet<String> = namespaces
+        .iter()
+        .filter_map(|ns| ns.metadata.name.clone())
+        .collect();
+    for name in &live {
+        ensure_default_sa(store, sa_gvr, name);
+        ensure_kube_root_ca(store, cm_gvr, name, ca_pem);
+    }
+    // Self-heal: a Deleted event dropped during a watch lag would leave that
+    // namespace's objects orphaned (its cascade never ran). Sweep any namespaced
+    // object whose namespace no longer exists.
+    sweep_orphaned(store, registry, &live);
+}
+
+/// Delete every namespaced object whose namespace isn't in `live`. Backstops
+/// [`cascade_delete`] for namespaces whose deletion event we missed.
+fn sweep_orphaned(store: &Store, registry: &ResourceRegistry, live: &rustc_hash::FxHashSet<String>) {
+    let mut deleted = 0u32;
+    for rt in registry.iter() {
+        if !rt.namespaced {
+            continue;
         }
+        let items = match store.list(&rt.gvr, None, None, None, None, None) {
+            Ok(r) => r.items,
+            Err(_) => continue,
+        };
+        for item in &items {
+            let meta = item.get("metadata");
+            let Some(ns) = meta.and_then(|m| m.get("namespace")).and_then(|v| v.as_str()) else {
+                continue;
+            };
+            if live.contains(ns) {
+                continue;
+            }
+            let Some(name) = meta.and_then(|m| m.get("name")).and_then(|v| v.as_str()) else {
+                continue;
+            };
+            if matches!(
+                store.delete(&ResourceRef {
+                    gvr: &rt.gvr,
+                    namespace: Some(ns),
+                    name,
+                }),
+                Ok(Some(_))
+            ) {
+                deleted += 1;
+            }
+        }
+    }
+    if deleted > 0 {
+        tracing::info!("namespace sweep: reaped {deleted} objects in vanished namespaces");
     }
 }
 
@@ -175,7 +222,10 @@ fn ensure_kube_root_ca(
         Ok(Some(_)) => {}
         Ok(None) => {
             let mut data = BTreeMap::new();
-            data.insert("ca.crt".to_string(), serde_json::Value::String(ca_pem.into()));
+            data.insert(
+                "ca.crt".to_string(),
+                serde_json::Value::String(ca_pem.into()),
+            );
             let cm = serde_json::json!({
                 "apiVersion": "v1",
                 "kind": "ConfigMap",
@@ -187,7 +237,9 @@ fn ensure_kube_root_ca(
             });
             match store.create(resource_ref, &cm) {
                 Ok(_) => {
-                    tracing::info!("published {KUBE_ROOT_CA_CONFIGMAP} into namespace '{namespace}'");
+                    tracing::info!(
+                        "published {KUBE_ROOT_CA_CONFIGMAP} into namespace '{namespace}'"
+                    );
                 }
                 Err(e) => tracing::warn!(
                     "failed to publish {KUBE_ROOT_CA_CONFIGMAP} into '{namespace}': {e}"
@@ -200,7 +252,7 @@ fn ensure_kube_root_ca(
 
 #[cfg(test)]
 mod tests {
-    use super::cascade_delete;
+    use super::{cascade_delete, sweep_orphaned};
     use r8s_store::{Store, backend::ResourceRef};
     use r8s_types::{GroupVersionResource, registry::ResourceRegistry};
     use tempfile::TempDir;
@@ -224,7 +276,11 @@ mod tests {
         let mk = |ns: &str, name: &str| {
             store
                 .create(
-                    ResourceRef { gvr: &pods, namespace: Some(ns), name },
+                    ResourceRef {
+                        gvr: &pods,
+                        namespace: Some(ns),
+                        name,
+                    },
                     &pod(name, ns),
                 )
                 .unwrap();
@@ -241,7 +297,62 @@ mod tests {
         let keep = store
             .list(&pods, Some("keep"), None, None, None, None)
             .unwrap();
-        assert_eq!(doomed.items.len(), 0, "target namespace contents must be cascaded");
-        assert_eq!(keep.items.len(), 1, "a bystander namespace must be untouched");
+        assert_eq!(
+            doomed.items.len(),
+            0,
+            "target namespace contents must be cascaded"
+        );
+        assert_eq!(
+            keep.items.len(),
+            1,
+            "a bystander namespace must be untouched"
+        );
+    }
+
+    #[test]
+    fn sweep_reaps_objects_in_vanished_namespaces() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(&dir.path().join("test.db")).unwrap();
+        let registry = ResourceRegistry::default_mvp();
+        let pods = GroupVersionResource::new("", "v1", "pods");
+
+        let mk = |ns: &str, name: &str| {
+            store
+                .create(
+                    ResourceRef {
+                        gvr: &pods,
+                        namespace: Some(ns),
+                        name,
+                    },
+                    &pod(name, ns),
+                )
+                .unwrap();
+        };
+        mk("live", "a");
+        mk("gone", "b");
+
+        // Only "live" still exists; "gone"'s deletion event was missed.
+        let mut live = rustc_hash::FxHashSet::default();
+        live.insert("live".to_string());
+        sweep_orphaned(&store, &registry, &live);
+
+        assert_eq!(
+            store
+                .list(&pods, Some("gone"), None, None, None, None)
+                .unwrap()
+                .items
+                .len(),
+            0,
+            "orphaned object in a vanished namespace must be reaped"
+        );
+        assert_eq!(
+            store
+                .list(&pods, Some("live"), None, None, None, None)
+                .unwrap()
+                .items
+                .len(),
+            1,
+            "object in a live namespace must survive"
+        );
     }
 }

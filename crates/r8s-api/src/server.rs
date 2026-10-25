@@ -16,16 +16,15 @@ use crate::{
     auth::{self_subject_access_review, self_subject_rules_review, subject_access_review},
     discovery::{
         ApiState, AppState, get_api_groups, get_api_versions, get_core_v1_resources,
-        get_group_version_resources, get_single_api_group, get_version,
+        get_group_version_resources, get_single_api_group, get_version, healthz,
     },
     handler::{
         RouteContext, create_cluster, create_impl, create_ns, delete_cluster,
         delete_collection_cluster, delete_collection_ns, delete_impl, delete_ns,
         extract_propagation_policy, get_cluster, get_impl, get_ns, get_status_cluster,
-        get_status_ns, list_all_ns, list_cluster, list_impl, list_ns, patch_cluster,
-        patch_impl, patch_ns, patch_status_cluster, patch_status_ns, pod_logs_ns,
-        put_status_cluster, put_status_ns, require_json, status_put_impl, update_cluster,
-        update_impl, update_ns,
+        get_status_ns, list_all_ns, list_cluster, list_impl, list_ns, patch_cluster, patch_impl,
+        patch_ns, patch_status_cluster, patch_status_ns, pod_logs_ns, put_status_cluster,
+        put_status_ns, require_json, status_put_impl, update_cluster, update_impl, update_ns,
     },
     openapi_v2::get_openapi_v2,
     openapi_v3::{get_openapi_v3_core, get_openapi_v3_discovery, get_openapi_v3_group},
@@ -191,7 +190,15 @@ async fn dynamic_dispatch(
                 Err(resp) => return resp,
             };
             let dry_run = parse_dry_run_query(raw_query.as_deref());
-            update_impl(&state, &ctx, api_path.namespace.as_deref(), name, json, dry_run).await
+            update_impl(
+                &state,
+                &ctx,
+                api_path.namespace.as_deref(),
+                name,
+                json,
+                dry_run,
+            )
+            .await
         }
         (Method::PATCH, Some(ref name)) => {
             let dry_run = parse_dry_run_query(raw_query.as_deref());
@@ -213,7 +220,15 @@ async fn dynamic_dispatch(
                 .unwrap_or("");
             let policy = extract_propagation_policy(raw_query.as_deref(), &body, content_type);
             let dry_run = parse_dry_run_query(raw_query.as_deref());
-            delete_impl(&state, &ctx, api_path.namespace.as_deref(), name, policy, dry_run).await
+            delete_impl(
+                &state,
+                &ctx,
+                api_path.namespace.as_deref(),
+                name,
+                policy,
+                dry_run,
+            )
+            .await
         }
         _ => not_found(),
     }
@@ -245,6 +260,9 @@ impl ApiServer {
     pub fn into_router(self) -> Router {
         let mut router = Router::new()
             .route("/version", get(get_version))
+            .route("/livez", get(healthz))
+            .route("/readyz", get(healthz))
+            .route("/healthz", get(healthz))
             .route("/openapi/v2", get(get_openapi_v2))
             .route("/openapi/v3", get(get_openapi_v3_discovery))
             .route("/openapi/v3/api/v1", get(get_openapi_v3_core))
@@ -287,7 +305,11 @@ impl ApiServer {
             // dynamic CRUD route installation for those to avoid axum's
             // "Overlapping method route" panic.
             let is_special_review = matches!(
-                (rt.gvr.group.as_str(), rt.gvr.version.as_str(), rt.gvr.resource.as_str()),
+                (
+                    rt.gvr.group.as_str(),
+                    rt.gvr.version.as_str(),
+                    rt.gvr.resource.as_str()
+                ),
                 ("authorization.k8s.io", "v1", "selfsubjectaccessreviews")
                     | ("authorization.k8s.io", "v1", "selfsubjectrulesreviews")
                     | ("authorization.k8s.io", "v1", "subjectaccessreviews")
@@ -307,7 +329,10 @@ impl ApiServer {
             if rt.namespaced {
                 let collection = format!("{base}/namespaces/{{ns}}/{}", rt.gvr.resource);
                 let item = format!("{base}/namespaces/{{ns}}/{}/{{name}}", rt.gvr.resource);
-                let status = format!("{base}/namespaces/{{ns}}/{}/{{name}}/status", rt.gvr.resource);
+                let status = format!(
+                    "{base}/namespaces/{{ns}}/{}/{{name}}/status",
+                    rt.gvr.resource
+                );
                 let all_ns = format!("{base}/{}", rt.gvr.resource);
                 router = router
                     .route(

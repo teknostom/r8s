@@ -117,7 +117,7 @@ pub fn bootstrap_namespaces(store: &Store) -> anyhow::Result<()> {
             },
             subsets: Some(vec![EndpointSubset {
                 addresses: Some(vec![EndpointAddress {
-                    ip: "10.244.0.1".into(),
+                    ip: r8s_types::NODE_INTERNAL_IP.into(),
                     target_ref: None,
                     ..Default::default()
                 }]),

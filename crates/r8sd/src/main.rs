@@ -198,10 +198,10 @@ async fn wait_for_shutdown() -> anyhow::Result<()> {
     }
 }
 
-fn spawn(
+fn spawn<E: std::fmt::Display>(
     tasks: &mut Vec<JoinHandle<()>>,
     name: &'static str,
-    fut: impl std::future::Future<Output = anyhow::Result<()>> + Send + 'static,
+    fut: impl std::future::Future<Output = Result<(), E>> + Send + 'static,
 ) {
     tasks.push(tokio::spawn(async move {
         if let Err(e) = fut.await {

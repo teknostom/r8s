@@ -4,9 +4,7 @@ version.workspace = true
 edition.workspace = true
 build = "build.rs"
 
-# prost-generated code carries doc comments lifted from the k8s .proto files;
-# rustdoc tries to parse them as doctests and fails on the embedded URLs/
-# JSON snippets. We have no human-authored doctests in this crate anyway.
+# prost doc-comments (from .proto files) break rustdoc; no real doctests here.
 [lib]
 doctest = false
 

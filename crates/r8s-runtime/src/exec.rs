@@ -14,8 +14,9 @@ use std::time::Duration;
 
 use containerd_client::{
     services::v1::{
-        DeleteProcessRequest, ExecProcessRequest, GetContainerRequest, ResizePtyRequest,
-        StartRequest, WaitRequest, containers_client::ContainersClient, tasks_client::TasksClient,
+        CloseIoRequest, DeleteProcessRequest, ExecProcessRequest, GetContainerRequest,
+        ResizePtyRequest, StartRequest, WaitRequest, containers_client::ContainersClient,
+        tasks_client::TasksClient,
     },
     tonic::{Request, transport::Channel},
     with_namespace,
@@ -48,10 +49,15 @@ impl ExecRuntime for ContainerdExec {
         &self,
         config: ExecConfig,
     ) -> Pin<Box<dyn Future<Output = anyhow::Result<ExecStreams>> + Send + '_>> {
-        Box::pin(start_exec(self.channel.clone(), self.data_dir.clone(), config))
+        Box::pin(start_exec(
+            self.channel.clone(),
+            self.data_dir.clone(),
+            config,
+        ))
     }
 }
 
+#[derive(Clone)]
 struct ExecPaths {
     stdin: std::path::PathBuf,
     stdout: std::path::PathBuf,
@@ -97,8 +103,7 @@ async fn start_exec(
     let exec_id = format!(
         "exec-{}-{}",
         std::process::id(),
-        // Monotonic-ish unique id per exec. Doesn't need to be cryptographic;
-        // containerd just needs uniqueness within the container.
+        // Unique per exec; containerd needs uniqueness within the container.
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
@@ -107,17 +112,51 @@ async fn start_exec(
 
     let paths = ExecPaths::for_session(&data_dir, &config.container_id.0, &exec_id);
     std::fs::create_dir_all(paths.stdin.parent().expect("parent dir"))?;
+
+    // Tear down a half-built session on setup failure.
+    match build_exec_session(&channel, &paths, &config, &exec_id).await {
+        Ok(streams) => Ok(streams),
+        Err(e) => {
+            teardown_failed_exec(&channel, &config.container_id.0, &exec_id, &paths).await;
+            Err(e)
+        }
+    }
+}
+
+/// Delete the exec record and unlink the fifos.
+async fn teardown_failed_exec(
+    channel: &Channel,
+    container_id: &str,
+    exec_id: &str,
+    paths: &ExecPaths,
+) {
+    let del = DeleteProcessRequest {
+        container_id: container_id.to_string(),
+        exec_id: exec_id.to_string(),
+    };
+    let _ = TasksClient::new(channel.clone())
+        .delete_process(with_namespace!(del, NAMESPACE))
+        .await;
+    paths.cleanup();
+}
+
+async fn build_exec_session(
+    channel: &Channel,
+    paths: &ExecPaths,
+    config: &ExecConfig,
+    exec_id: &str,
+) -> anyhow::Result<ExecStreams> {
+    let exec_id = exec_id.to_owned();
+
     mkfifo(&paths.stdin)?;
     mkfifo(&paths.stdout)?;
     if !config.tty {
         mkfifo(&paths.stderr)?;
     }
 
-    // Minimal OCI Process spec for exec — namespaces are inherited from the
-    // container's existing task. We do NOT set capabilities (containerd's shim
-    // inherits the container's set when the exec spec omits them). The env is
-    // pulled from the container's own spec so exec'd processes (incl. probes)
-    // resolve binaries against the same PATH as the container's main process.
+    // Minimal OCI Process spec — namespaces and capabilities are inherited from
+    // the container's task. Env is pulled from the container's spec so exec'd
+    // processes resolve binaries against the same PATH.
     let mut env = fetch_container_env(channel.clone(), &config.container_id.0).await;
     if config.tty {
         env.push("TERM=xterm-256color".to_string());
@@ -150,13 +189,13 @@ async fn start_exec(
     };
     tasks.exec(with_namespace!(exec_req, NAMESPACE)).await?;
 
-    // Bridge mpsc → stdin FIFO. We open the write end BEFORE calling Start
-    // so the runc shim's read open doesn't block; opening O_WRONLY on a FIFO
-    // blocks until a reader appears — but since we control both ends here
-    // (we're the writer; runc is the reader once Start runs), we want to be
-    // ready for Start to immediately wake.
+    // Bridge mpsc → stdin FIFO. Open our write end before Start so the shim's
+    // read open doesn't block on a missing writer.
     let (stdin_tx, mut stdin_rx) = mpsc::channel::<Vec<u8>>(16);
     let stdin_path = paths.stdin.clone();
+    let stdin_channel = channel.clone();
+    let stdin_cid = config.container_id.0.clone();
+    let stdin_eid = exec_id.clone();
     tokio::spawn(async move {
         let file = match tokio::fs::OpenOptions::new()
             .write(true)
@@ -178,19 +217,30 @@ async fn start_exec(
                 break;
             }
         }
-        // dropping `writer` closes our write end → reader sees EOF
+        // Client closed stdin. Dropping our FIFO writer isn't enough — the shim
+        // holds the stdin FIFO open, so EOF needs an explicit CloseIO.
+        drop(writer);
+        let mut tasks = TasksClient::new(stdin_channel);
+        let close_req = CloseIoRequest {
+            container_id: stdin_cid,
+            exec_id: stdin_eid,
+            stdin: true,
+        };
+        if let Err(e) = tasks.close_io(with_namespace!(close_req, NAMESPACE)).await {
+            tracing::warn!(error = %e, "exec CloseIO(stdin) failed");
+        }
     });
 
     // FIFO → mpsc readers for stdout / stderr.
     let (stdout_tx, stdout_rx) = mpsc::channel::<Vec<u8>>(16);
     spawn_pipe_reader(paths.stdout.clone(), stdout_tx);
 
-    let (stderr_rx_opt, _stderr_path_keep) = if config.tty {
-        (None, None)
+    let stderr_rx_opt = if config.tty {
+        None
     } else {
         let (stderr_tx, stderr_rx) = mpsc::channel::<Vec<u8>>(16);
         spawn_pipe_reader(paths.stderr.clone(), stderr_tx);
-        (Some(stderr_rx), Some(paths.stderr.clone()))
+        Some(stderr_rx)
     };
 
     // Start the exec'd process now that all FIFOs are wired.
@@ -211,10 +261,8 @@ async fn start_exec(
         let _ = tasks.resize_pty(with_namespace!(req, NAMESPACE)).await;
     }
 
-    // Resize channel: forward each (cols, rows) to containerd as long as the
-    // session is alive. Only meaningful when tty=true; we still accept the
-    // channel in the no-tty case so the caller has a uniform interface — sends
-    // are just no-ops.
+    // Forward (cols, rows) to containerd while the session lives. No-op when
+    // tty=false, kept for a uniform caller interface.
     let (resize_tx, mut resize_rx) = mpsc::channel::<(u16, u16)>(4);
     {
         let channel = channel.clone();
@@ -245,7 +293,7 @@ async fn start_exec(
         let channel = channel.clone();
         let container_id = config.container_id.0.clone();
         let exec_id = exec_id.clone();
-        let paths_for_cleanup = ExecPaths::for_session(&data_dir, &container_id, &exec_id);
+        let paths = paths.clone();
         tokio::spawn(async move {
             let mut tasks = TasksClient::new(channel);
             let wait_req = WaitRequest {
@@ -261,19 +309,18 @@ async fn start_exec(
             };
             let _ = exit_tx.send(exit_code);
 
-            // Free the exec record in containerd; without this it lingers and
-            // the next Wait on the same container can return stale state.
+            // Free the exec record, else the next Wait can return stale state.
             let del_req = DeleteProcessRequest {
                 container_id,
                 exec_id,
             };
-            let _ = tasks.delete_process(with_namespace!(del_req, NAMESPACE)).await;
+            let _ = tasks
+                .delete_process(with_namespace!(del_req, NAMESPACE))
+                .await;
 
-            // Best-effort: give the FIFO readers a beat to drain their last
-            // bytes, then unlink. The reader tasks will already have hit EOF
-            // when runc closed the pipe.
+            // Let the FIFO readers drain their last bytes, then unlink.
             tokio::time::sleep(Duration::from_millis(50)).await;
-            paths_for_cleanup.cleanup();
+            paths.cleanup();
         });
     }
 
@@ -286,9 +333,9 @@ async fn start_exec(
     })
 }
 
-/// Read the container's environment (notably `PATH`) out of its stored OCI
-/// runtime spec so exec'd processes resolve binaries the way the container's
-/// main process does. Falls back to a minimal PATH if the lookup fails.
+/// Read the container's environment from its stored OCI spec so exec'd
+/// processes resolve binaries like the main process. Falls back to a minimal
+/// PATH on failure.
 async fn fetch_container_env(channel: Channel, container_id: &str) -> Vec<String> {
     let fallback = || {
         vec![
@@ -327,9 +374,8 @@ async fn fetch_container_env(channel: Channel, container_id: &str) -> Vec<String
 
 fn spawn_pipe_reader(path: std::path::PathBuf, tx: mpsc::Sender<Vec<u8>>) {
     tokio::spawn(async move {
-        // Open O_RDONLY; this blocks until a writer appears (runc shim opens
-        // its write end when the exec starts). tokio::fs handles this on the
-        // blocking pool, so we don't stall the runtime.
+        // O_RDONLY blocks until the shim opens its write end; tokio::fs runs it
+        // on the blocking pool.
         let file = match tokio::fs::OpenOptions::new().read(true).open(&path).await {
             Ok(f) => f,
             Err(e) => {

@@ -1,11 +1,13 @@
 use std::path::Path;
 use std::process::Command;
 
-const BRIDGE_NAME: &str = "r8s0";
-const BRIDGE_CIDR: &str = "10.244.0.1/24";
+use r8s_types::{BRIDGE_NAME, NODE_INTERNAL_IP, POD_PREFIX, SERVICE_CIDR};
+
+use crate::error::{NetworkError, Result};
+
 const VETH_ALIAS_PREFIX: &str = "r8s:";
 
-pub fn setup_bridge(data_dir: &Path) -> anyhow::Result<()> {
+pub fn setup_bridge(data_dir: &Path) -> Result<()> {
     std::fs::create_dir_all(data_dir)?;
 
     let host_resolv = std::fs::read_to_string("/etc/resolv.conf").unwrap_or_default();
@@ -17,11 +19,14 @@ pub fn setup_bridge(data_dir: &Path) -> anyhow::Result<()> {
 
     std::fs::write(
         data_dir.join("resolv.conf"),
-        "nameserver 10.244.0.1\nsearch default.svc.cluster.local svc.cluster.local cluster.local\noptions ndots:5\n",
+        format!(
+            "nameserver {NODE_INTERNAL_IP}\nsearch default.svc.cluster.local svc.cluster.local cluster.local\noptions ndots:5\n"
+        ),
     )?;
 
     run_ignore_exists("ip", &["link", "add", BRIDGE_NAME, "type", "bridge"])?;
-    run_ignore_exists("ip", &["addr", "add", BRIDGE_CIDR, "dev", BRIDGE_NAME])?;
+    let bridge_cidr = format!("{NODE_INTERNAL_IP}/{POD_PREFIX}");
+    run_ignore_exists("ip", &["addr", "add", &bridge_cidr, "dev", BRIDGE_NAME])?;
     run("ip", &["link", "set", BRIDGE_NAME, "up"])?;
 
     run("sysctl", &["-w", "net.ipv4.ip_forward=1"])?;
@@ -33,7 +38,7 @@ pub fn setup_bridge(data_dir: &Path) -> anyhow::Result<()> {
     // and routes it through prerouting DNAT
     let _ = run("ip", &["link", "add", "r8s-svc", "type", "dummy"]);
     let _ = run("ip", &["link", "set", "r8s-svc", "up"]);
-    let _ = run("ip", &["addr", "add", "10.96.0.0/16", "dev", "r8s-svc"]);
+    let _ = run("ip", &["addr", "add", SERVICE_CIDR, "dev", "r8s-svc"]);
 
     // Docker sets the FORWARD chain policy to DROP. -C checks for existence
     // first so repeated r8sd starts don't stack duplicate rules.
@@ -55,7 +60,7 @@ pub fn setup_pod_network(
     pod_name: &str,
     cluster: &str,
     pod_uid: &str,
-) -> anyhow::Result<()> {
+) -> Result<()> {
     let veth_host = veth_name(pod_name);
     let veth_peer = format!("{veth_host}p");
     let pid_str = pid.to_string();
@@ -80,20 +85,30 @@ pub fn setup_pod_network(
     run("ip", &["link", "set", &veth_host, "master", BRIDGE_NAME])?;
     run("ip", &["link", "set", &veth_host, "up"])?;
 
-    let ip_cidr = format!("{pod_ip}/24");
+    let ip_cidr = format!("{pod_ip}/{POD_PREFIX}");
     nsenter(pid, &["ip", "addr", "add", &ip_cidr, "dev", "eth0"])?;
     nsenter(pid, &["ip", "link", "set", "eth0", "up"])?;
     nsenter(pid, &["ip", "link", "set", "lo", "up"])?;
-    nsenter(pid, &["ip", "route", "add", "default", "via", "10.244.0.1"])?;
+    nsenter(
+        pid,
+        &["ip", "route", "add", "default", "via", NODE_INTERNAL_IP],
+    )?;
 
     tracing::info!(pod_name, pod_ip, pid, "pod network configured");
     Ok(())
 }
 
 pub fn teardown_pod_network(pod_name: &str) {
-    let veth_host = veth_name(pod_name);
-    if let Err(e) = run("ip", &["link", "delete", &veth_host]) {
-        tracing::debug!(pod_name, "veth cleanup (may already be gone): {e}");
+    delete_link(&veth_name(pod_name));
+}
+
+/// Delete a host-side veth by its exact link name. Best-effort and idempotent —
+/// a missing link is logged at debug, not an error. The orphan sweep uses this
+/// to remove a labeled veth whose name doesn't match `teardown_pod_network`'s
+/// hash of the pod name (a pod-name collision across cluster restarts).
+pub fn delete_link(link: &str) {
+    if let Err(e) = run("ip", &["link", "delete", link]) {
+        tracing::debug!(link, "veth cleanup (may already be gone): {e}");
     }
 }
 
@@ -113,7 +128,7 @@ pub struct OwnedVeth {
 ///
 /// Returns an empty vec if the bridge is gone (cluster never came up, or
 /// already torn down) — never an error in that case.
-pub fn list_owned_veths(cluster: &str) -> anyhow::Result<Vec<OwnedVeth>> {
+pub fn list_owned_veths(cluster: &str) -> Result<Vec<OwnedVeth>> {
     let brif_dir = Path::new("/sys/class/net").join(BRIDGE_NAME).join("brif");
     let entries = match std::fs::read_dir(&brif_dir) {
         Ok(e) => e,
@@ -176,12 +191,18 @@ pub fn cleanup() {
     tracing::info!("bridge {BRIDGE_NAME} removed");
 }
 
-/// Linux interface names are limited to 15 characters.
+/// Linux interface names are limited to 15 characters, so a pod name is hashed
+/// into `veth` + 10 hex digits (14 chars). FNV-1a is used over std's
+/// `DefaultHasher` because the latter's output is explicitly unspecified across
+/// releases: a rustc upgrade could rename the veth for an existing pod and
+/// strand it. The alias sweep (`list_owned_veths`) is the teardown source of
+/// truth regardless, but the name itself should not depend on the toolchain.
 fn veth_name(pod_name: &str) -> String {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    pod_name.hash(&mut hasher);
-    let hash = hasher.finish();
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in pod_name.as_bytes() {
+        hash ^= *b as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
     format!("veth{hash:010x}", hash = hash & 0xff_ffff_ffff)
 }
 
@@ -198,27 +219,34 @@ fn ensure_iptables_forward(direction: &str) {
     }
 }
 
-fn run(cmd: &str, args: &[&str]) -> anyhow::Result<()> {
+fn run(cmd: &str, args: &[&str]) -> Result<()> {
     let output = Command::new(cmd).args(args).output()?;
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("{cmd} {}: {stderr}", args.join(" "));
+        return Err(command_error(cmd, args, &output.stderr));
     }
     Ok(())
 }
 
-fn run_ignore_exists(cmd: &str, args: &[&str]) -> anyhow::Result<()> {
+fn run_ignore_exists(cmd: &str, args: &[&str]) -> Result<()> {
     let output = Command::new(cmd).args(args).output()?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         if !stderr.contains("File exists") && !stderr.contains("already") {
-            anyhow::bail!("{cmd} {}: {stderr}", args.join(" "));
+            return Err(command_error(cmd, args, &output.stderr));
         }
     }
     Ok(())
 }
 
-fn nsenter(pid: u32, cmd_args: &[&str]) -> anyhow::Result<()> {
+fn command_error(cmd: &str, args: &[&str], stderr: &[u8]) -> NetworkError {
+    NetworkError::Command {
+        cmd: cmd.to_string(),
+        args: args.join(" "),
+        stderr: String::from_utf8_lossy(stderr).trim().to_string(),
+    }
+}
+
+fn nsenter(pid: u32, cmd_args: &[&str]) -> Result<()> {
     let pid_str = pid.to_string();
     let mut args = vec!["-t", &pid_str, "-n", "--"];
     args.extend_from_slice(cmd_args);

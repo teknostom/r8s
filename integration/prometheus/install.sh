@@ -11,10 +11,11 @@ set -euo pipefail
 #   * kube{ControllerManager,Scheduler,Etcd,Proxy}/coreDns disabled — r8s has no
 #     such pods, so their default ServiceMonitors would just be permanently-down
 #     targets and pure noise.
-#   * prometheusOperator.admissionWebhooks disabled — webhook+certgen surface is
-#     already covered by cert-manager; skip the extra cert Job here.
 # kube-state-metrics stays enabled: it's a real Deployment that Prometheus must
 # discover and scrape, which is the actual assertion in run.sh.
+# prometheusOperator admissionWebhooks/tls stay at their defaults (ON): the
+# certgen Job mints the webhook cert and the chart's default PrometheusRules
+# must pass through the operator's validating webhook during install.
 helm install kube-prometheus-stack prometheus-community/kube-prometheus-stack \
     --namespace monitoring \
     --set alertmanager.enabled=false \
@@ -25,6 +26,4 @@ helm install kube-prometheus-stack prometheus-community/kube-prometheus-stack \
     --set kubeEtcd.enabled=false \
     --set kubeProxy.enabled=false \
     --set coreDns.enabled=false \
-    --set prometheusOperator.admissionWebhooks.enabled=false \
-    --set prometheusOperator.tls.enabled=false \
     --wait --timeout 5m

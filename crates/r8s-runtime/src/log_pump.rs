@@ -14,6 +14,7 @@
 use std::ffi::CString;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -48,8 +49,7 @@ pub fn start(paths: &LogPaths) -> std::io::Result<()> {
     if let Some(parent) = paths.log_file.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    // Truncate any prior log so we don't blend old + new bytes on restart.
-    // (--previous needs us to rotate instead of truncate; that's a separate task.)
+    // Truncate any prior log so a restart doesn't blend old + new bytes.
     let _ = std::fs::remove_file(&paths.log_file);
 
     mkfifo(&paths.stdout_fifo, 0o600)?;
@@ -64,6 +64,34 @@ pub fn start(paths: &LogPaths) -> std::io::Result<()> {
     spawn_pump(paths.stdout_fifo.clone(), "stdout", writer.clone());
     spawn_pump(paths.stderr_fifo.clone(), "stderr", writer);
     Ok(())
+}
+
+/// Release the pump threads and unlink the fifos. Use when the task's writer
+/// never materialized (e.g. `tasks.create` failed) so the pumps would block on
+/// their fifo open forever.
+pub fn abort(paths: &LogPaths) {
+    let paths = paths.clone();
+    std::thread::spawn(move || {
+        release_reader(&paths.stdout_fifo);
+        release_reader(&paths.stderr_fifo);
+        paths.remove();
+    });
+}
+
+/// Open the write end so the pump's blocking `O_RDONLY` open returns, then drop
+/// it for EOF. Bounded retry: the pump may not have reached its open yet.
+fn release_reader(fifo: &Path) {
+    for _ in 0..50 {
+        if std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(fifo)
+            .is_ok()
+        {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
 }
 
 fn mkfifo(path: &Path, mode: u32) -> std::io::Result<()> {
@@ -129,8 +157,8 @@ fn write_entry(
 ) -> std::io::Result<()> {
     let ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
     let tag = if full { 'F' } else { 'P' };
-    // Build the full record once and emit with a single write_all under the
-    // mutex so stdout/stderr lines never interleave mid-record.
+    // Emit the whole record with one write_all under the mutex so stdout/stderr
+    // never interleave mid-record.
     let mut out = Vec::with_capacity(content.len() + 64);
     out.extend_from_slice(ts.as_bytes());
     out.push(b' ');

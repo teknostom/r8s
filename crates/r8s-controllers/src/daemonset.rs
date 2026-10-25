@@ -1,7 +1,13 @@
+//! DaemonSet controller.
+//!
+//! A DaemonSet runs one pod per eligible node. r8s is single-node by design, so
+//! the desired count is always exactly 1 and there's no node-affinity/taint
+//! scheduling to model — the reconciler keeps a single owned pod alive and reaps
+//! any extras. `desiredNumberScheduled` is reported as 1 accordingly. This is
+//! deliberate policy, not a stub.
+
 use r8s_store::{Store, backend::ResourceRef, watch::WatchEventType};
-use r8s_types::{
-    DaemonSetStatus, GroupVersionResource, ObjectMeta, OwnerReference, Pod, PodTemplateSpec,
-};
+use r8s_types::{DaemonSetStatus, GroupVersionResource, ObjectMeta, Pod, PodTemplateSpec};
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
@@ -37,7 +43,7 @@ pub async fn run(store: Store, shutdown: CancellationToken) -> anyhow::Result<()
             event = pod_rx.recv() => {
                 match event {
                     Ok(event) if matches!(event.event_type, WatchEventType::Deleted) => {
-                        let pod: Pod = match serde_json::from_value(event.object) {
+                        let pod: Pod = match serde_json::from_value(event.object.as_ref().clone()) {
                             Ok(p) => p,
                             Err(_) => continue,
                         };
@@ -98,6 +104,12 @@ fn reconcile_ds(store: &Store, ds_value: &serde_json::Value) -> anyhow::Result<(
         None => return Ok(()),
     };
     let current_uid = current.metadata.uid.as_deref().unwrap_or(ds_uid);
+    if current_uid.is_empty() {
+        // Without a uid every ownership check degenerates to matching the empty
+        // string, which would adopt unrelated pods. Wait for the stamped object.
+        tracing::warn!("ds '{ds_name}': missing uid; skipping");
+        return Ok(());
+    }
     let current_spec = current
         .spec
         .as_ref()
@@ -137,14 +149,7 @@ fn reconcile_ds(store: &Store, ds_value: &serde_json::Value) -> anyhow::Result<(
         .filter(|p| is_owned_by(&p.metadata, current_uid))
         .collect();
     let current_num = final_owned.len() as i32;
-    let ready = final_owned
-        .iter()
-        .filter(|p| {
-            p.status
-                .as_ref()
-                .is_some_and(|s| s.phase.as_deref() == Some("Running"))
-        })
-        .count() as i32;
+    let ready = final_owned.iter().filter(|p| crate::pod_ready(p)).count() as i32;
     update_ds_status(store, ds_name, ds_ns, current_num, ready)?;
 
     Ok(())
@@ -164,14 +169,12 @@ fn create_pod(
             name: Some(pod_name.clone()),
             namespace: namespace.map(String::from),
             labels,
-            owner_references: Some(vec![OwnerReference {
-                api_version: "apps/v1".into(),
-                kind: "DaemonSet".into(),
-                name: ds_name.into(),
-                uid: ds_uid.into(),
-                controller: Some(true),
-                block_owner_deletion: Some(true),
-            }]),
+            owner_references: Some(vec![crate::owner_reference(
+                "apps/v1",
+                "DaemonSet",
+                ds_name,
+                ds_uid,
+            )]),
             ..Default::default()
         },
         spec: template.spec.clone(),

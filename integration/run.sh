@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
-# Run every integration suite in `integration/*/`.
+# Run integration suites from `integration/*/`.
+#
+# Usage:
+#   ./run.sh               run every suite
+#   ./run.sh redis kafka   run only the named suites, in the order given
 #
 # Each suite is a directory with four required scripts run in order:
 #   setup.sh   → prerequisites (namespaces, CRDs, registry creds, etc.)
@@ -81,8 +85,25 @@ cleanup_suite() {
     drain_pods
 }
 
-for chart_dir in "$ROOT_DIR"/*/; do
-    [[ -d "$chart_dir" ]] || continue
+# Suites to run: every directory by default, or just the ones named on the
+# command line. Unknown names fail fast, before anything is installed.
+SUITES=()
+if [[ $# -gt 0 ]]; then
+    for name in "$@"; do
+        if [[ ! -d "$ROOT_DIR/$name" ]]; then
+            echo "unknown suite '$name'. available:" >&2
+            for d in "$ROOT_DIR"/*/; do echo "  $(basename "$d")" >&2; done
+            exit 2
+        fi
+        SUITES+=("$ROOT_DIR/$name/")
+    done
+else
+    for d in "$ROOT_DIR"/*/; do
+        [[ -d "$d" ]] && SUITES+=("$d")
+    done
+fi
+
+for chart_dir in "${SUITES[@]}"; do
     name="$(basename "$chart_dir")"
     echo ""
     echo "================================================================"

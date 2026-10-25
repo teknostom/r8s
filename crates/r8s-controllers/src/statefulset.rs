@@ -1,6 +1,6 @@
 use r8s_store::{Store, backend::ResourceRef, watch::WatchEventType};
 use r8s_types::{
-    GroupVersionResource, ObjectMeta, OwnerReference, PersistentVolumeClaim,
+    GroupVersionResource, ObjectMeta, PersistentVolumeClaim,
     PersistentVolumeClaimVolumeSource, Pod, PodTemplateSpec, StatefulSetStatus, Volume,
 };
 use tokio::sync::broadcast;
@@ -25,20 +25,24 @@ pub async fn run(store: Store, shutdown: CancellationToken) -> anyhow::Result<()
             }
             event = sts_rx.recv() => {
                 match event {
-                    Ok(event) if !matches!(event.event_type, WatchEventType::Deleted) => {
+                    Ok(event) if matches!(event.event_type, WatchEventType::Deleted) => {
+                        if let Err(e) = handle_sts_deleted(&store, &event.object) {
+                            tracing::warn!("sts deletion cleanup error: {e}");
+                        }
+                    }
+                    Ok(event) => {
                         if let Err(e) = reconcile_sts(&store, &event.object) {
                             tracing::warn!("sts reconcile error: {e}");
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => reconcile_all(&store),
                     Err(broadcast::error::RecvError::Closed) => return Ok(()),
-                    _ => {}
                 }
             }
             event = pod_rx.recv() => {
                 match event {
                     Ok(event) if matches!(event.event_type, WatchEventType::Deleted | WatchEventType::Modified) => {
-                        let pod: Pod = match serde_json::from_value(event.object) {
+                        let pod: Pod = match serde_json::from_value(event.object.as_ref().clone()) {
                             Ok(p) => p,
                             Err(_) => continue,
                         };
@@ -121,41 +125,73 @@ fn reconcile_sts(store: &Store, sts_value: &serde_json::Value) -> anyhow::Result
     owned.sort_by_key(pod_ordinal);
 
     let current_count = owned.len() as u64;
+    // OrderedReady (the default) rolls out one pod at a time, gated on the
+    // predecessor's readiness; Parallel acts on every ordinal at once.
+    let ordered = current_spec.pod_management_policy.as_deref() != Some("Parallel");
+    let when_scaled = current_spec
+        .persistent_volume_claim_retention_policy
+        .as_ref()
+        .and_then(|p| p.when_scaled.as_deref())
+        .unwrap_or("Retain");
 
     if current_count < desired {
-        let existing_ordinals: rustc_hash::FxHashSet<u64> = owned.iter().map(pod_ordinal).collect();
-        let mut created = 0u64;
-        let mut ordinal = 0u64;
-        while created < desired - current_count {
-            if !existing_ordinals.contains(&ordinal) {
-                create_pod(
-                    store,
-                    sts_name,
-                    current_uid,
-                    sts_ns,
-                    template,
-                    vcts,
-                    ordinal,
-                    &current_spec.service_name,
-                )?;
-                created += 1;
+        if ordered {
+            // Walk ordinals in order: create the first gap, but only once every
+            // lower ordinal is Ready. A not-ready predecessor stops the rollout
+            // here — the next pod's Modified event resumes it.
+            for ordinal in 0..desired {
+                match owned.iter().find(|p| pod_ordinal(p) == ordinal) {
+                    Some(pod) if crate::pod_ready(pod) => continue,
+                    Some(_) => break,
+                    None => {
+                        create_pod(
+                            store,
+                            sts_name,
+                            current_uid,
+                            sts_ns,
+                            template,
+                            vcts,
+                            ordinal,
+                            &current_spec.service_name,
+                        )?;
+                        tracing::info!("sts '{sts_name}': created pod ordinal {ordinal} (ordered)");
+                        break;
+                    }
+                }
             }
-            ordinal += 1;
+        } else {
+            let existing: rustc_hash::FxHashSet<u64> = owned.iter().map(pod_ordinal).collect();
+            let mut created = 0u64;
+            for ordinal in 0..desired {
+                if !existing.contains(&ordinal) {
+                    create_pod(
+                        store,
+                        sts_name,
+                        current_uid,
+                        sts_ns,
+                        template,
+                        vcts,
+                        ordinal,
+                        &current_spec.service_name,
+                    )?;
+                    created += 1;
+                }
+            }
+            tracing::info!("sts '{sts_name}': created {created} pods (parallel)");
         }
-        tracing::info!("sts '{sts_name}': created {created} pods ({current_count} -> {desired})");
     } else if current_count > desired {
-        let to_delete = current_count - desired;
-        for pod in owned.iter().rev().take(to_delete as usize) {
-            if let Some(pod_name) = pod.metadata.name.as_deref() {
-                let pod_ref = ResourceRef {
-                    gvr: &pod_gvr,
-                    namespace: sts_ns,
-                    name: pod_name,
-                };
-                store.delete(&pod_ref)?;
+        // Everything at ordinal >= desired must go, highest first.
+        let mut removable: Vec<&Pod> = owned.iter().filter(|p| pod_ordinal(p) >= desired).collect();
+        removable.sort_by_key(|p| pod_ordinal(p));
+        if ordered {
+            if let Some(pod) = removable.last() {
+                scale_down_pod(store, pod, sts_ns, sts_name, vcts, when_scaled)?;
+            }
+        } else {
+            for pod in &removable {
+                scale_down_pod(store, pod, sts_ns, sts_name, vcts, when_scaled)?;
             }
         }
-        tracing::info!("sts '{sts_name}': deleted {to_delete} pods ({current_count} -> {desired})");
     }
 
     let final_owned: Vec<Pod> = store
@@ -164,21 +200,20 @@ fn reconcile_sts(store: &Store, sts_value: &serde_json::Value) -> anyhow::Result
         .filter(|p| is_owned_by(&p.metadata, current_uid))
         .collect();
     let total = final_owned.len() as i32;
-    let ready = final_owned.iter().filter(|p| pod_ready(p)).count() as i32;
-    update_sts_status(store, sts_name, sts_ns, total, ready, current.metadata.generation)?;
+    let ready = final_owned
+        .iter()
+        .filter(|p| crate::pod_ready(p))
+        .count() as i32;
+    update_sts_status(
+        store,
+        sts_name,
+        sts_ns,
+        total,
+        ready,
+        current.metadata.generation,
+    )?;
 
     Ok(())
-}
-
-/// A pod counts as ready only when its `Ready` condition is `True` — not merely
-/// when its phase is `Running`. A crash-looping container is `Running`/`0/1`,
-/// and counting it as ready makes `kubectl get sts` lie and lets `helm --wait`
-/// believe a broken rollout succeeded.
-fn pod_ready(pod: &Pod) -> bool {
-    pod.status
-        .as_ref()
-        .and_then(|s| s.conditions.as_ref())
-        .is_some_and(|cs| cs.iter().any(|c| c.type_ == "Ready" && c.status == "True"))
 }
 
 fn pod_ordinal(pod: &Pod) -> u64 {
@@ -188,6 +223,95 @@ fn pod_ordinal(pod: &Pod) -> u64 {
         .and_then(|n| n.rsplit('-').next())
         .and_then(|s| s.parse().ok())
         .unwrap_or(u64::MAX)
+}
+
+/// Delete a pod scaled beyond the replica count, and — when
+/// `persistentVolumeClaimRetentionPolicy.whenScaled` is `Delete` — its per-ordinal
+/// PVCs. By default PVCs are retained so the data survives a later scale-up.
+fn scale_down_pod(
+    store: &Store,
+    pod: &Pod,
+    namespace: Option<&str>,
+    sts_name: &str,
+    vcts: &[PersistentVolumeClaim],
+    when_scaled: &str,
+) -> anyhow::Result<()> {
+    let Some(pod_name) = pod.metadata.name.as_deref() else {
+        return Ok(());
+    };
+    let ordinal = pod_ordinal(pod);
+    let pod_gvr = GroupVersionResource::pods();
+    store.delete(&ResourceRef {
+        gvr: &pod_gvr,
+        namespace,
+        name: pod_name,
+    })?;
+
+    if when_scaled == "Delete" {
+        let pvc_gvr = GroupVersionResource::persistent_volume_claims();
+        for vct in vcts {
+            if let Some(tmpl) = vct.metadata.name.as_deref() {
+                let pvc_name = format!("{tmpl}-{sts_name}-{ordinal}");
+                let _ = store.delete(&ResourceRef {
+                    gvr: &pvc_gvr,
+                    namespace,
+                    name: &pvc_name,
+                });
+            }
+        }
+        tracing::info!("sts '{sts_name}': scaled down {pod_name} + PVCs (whenScaled=Delete)");
+    } else {
+        tracing::info!("sts '{sts_name}': scaled down {pod_name}");
+    }
+    Ok(())
+}
+
+/// On StatefulSet deletion, honor `persistentVolumeClaimRetentionPolicy.whenDeleted`.
+/// PVCs aren't owned by the STS (so they survive pod churn), so `Delete` must reap
+/// them here explicitly; the default `Retain` leaves them.
+fn handle_sts_deleted(store: &Store, sts_value: &serde_json::Value) -> anyhow::Result<()> {
+    let sts: r8s_types::StatefulSet = serde_json::from_value(sts_value.clone())?;
+    let spec = match sts.spec.as_ref() {
+        Some(s) => s,
+        None => return Ok(()),
+    };
+    let when_deleted = spec
+        .persistent_volume_claim_retention_policy
+        .as_ref()
+        .and_then(|p| p.when_deleted.as_deref())
+        .unwrap_or("Retain");
+    if when_deleted != "Delete" {
+        return Ok(());
+    }
+    let Some(sts_name) = sts.metadata.name.as_deref() else {
+        return Ok(());
+    };
+    let ns = sts.metadata.namespace.as_deref();
+    let vcts = spec.volume_claim_templates.as_deref().unwrap_or_default();
+
+    let pvc_gvr = GroupVersionResource::persistent_volume_claims();
+    let all_pvcs = store.list_as::<PersistentVolumeClaim>(&pvc_gvr, ns)?;
+    for vct in vcts {
+        let Some(tmpl) = vct.metadata.name.as_deref() else {
+            continue;
+        };
+        let prefix = format!("{tmpl}-{sts_name}-");
+        for pvc in &all_pvcs {
+            if let Some(name) = pvc.metadata.name.as_deref()
+                && name
+                    .strip_prefix(&prefix)
+                    .is_some_and(|suffix| suffix.parse::<u64>().is_ok())
+            {
+                let _ = store.delete(&ResourceRef {
+                    gvr: &pvc_gvr,
+                    namespace: ns,
+                    name,
+                });
+                tracing::info!("sts '{sts_name}': deleted PVC {name} (whenDeleted=Delete)");
+            }
+        }
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -257,14 +381,12 @@ fn create_pod(
             name: Some(pod_name.clone()),
             namespace: namespace.map(String::from),
             labels: Some(labels),
-            owner_references: Some(vec![OwnerReference {
-                api_version: "apps/v1".into(),
-                kind: "StatefulSet".into(),
-                name: sts_name.into(),
-                uid: sts_uid.into(),
-                controller: Some(true),
-                block_owner_deletion: Some(true),
-            }]),
+            owner_references: Some(vec![crate::owner_reference(
+                "apps/v1",
+                "StatefulSet",
+                sts_name,
+                sts_uid,
+            )]),
             ..Default::default()
         },
         spec,
@@ -368,5 +490,262 @@ fn update_sts_status(
             tracing::debug!("sts status update conflict for '{sts_name}': {e}");
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::{Value, json};
+
+    fn store() -> (tempfile::TempDir, Store) {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(&dir.path().join("t.db")).unwrap();
+        (dir, s)
+    }
+
+    fn sts_gvr() -> GroupVersionResource {
+        GroupVersionResource::stateful_sets()
+    }
+    fn pods_gvr() -> GroupVersionResource {
+        GroupVersionResource::pods()
+    }
+    fn pvcs_gvr() -> GroupVersionResource {
+        GroupVersionResource::persistent_volume_claims()
+    }
+
+    fn create_sts(store: &Store, name: &str, spec: Value) -> Value {
+        store
+            .create(
+                ResourceRef {
+                    gvr: &sts_gvr(),
+                    namespace: Some("default"),
+                    name,
+                },
+                &json!({
+                    "apiVersion": "apps/v1", "kind": "StatefulSet",
+                    "metadata": {"name": name, "namespace": "default"},
+                    "spec": spec,
+                }),
+            )
+            .unwrap()
+    }
+
+    fn create_owned_pod(store: &Store, name: &str, uid: &str, ready: bool) {
+        store
+            .create(
+                ResourceRef {
+                    gvr: &pods_gvr(),
+                    namespace: Some("default"),
+                    name,
+                },
+                &json!({
+                    "apiVersion": "v1", "kind": "Pod",
+                    "metadata": {
+                        "name": name, "namespace": "default",
+                        "ownerReferences": [{
+                            "apiVersion": "apps/v1", "kind": "StatefulSet",
+                            "name": "web", "uid": uid, "controller": true
+                        }]
+                    },
+                    "spec": {"containers": []},
+                    "status": {
+                        "phase": "Running",
+                        "conditions": [{"type": "Ready", "status": if ready {"True"} else {"False"}}]
+                    }
+                }),
+            )
+            .unwrap();
+    }
+
+    fn create_pvc(store: &Store, name: &str) {
+        store
+            .create(
+                ResourceRef {
+                    gvr: &pvcs_gvr(),
+                    namespace: Some("default"),
+                    name,
+                },
+                &json!({
+                    "apiVersion": "v1", "kind": "PersistentVolumeClaim",
+                    "metadata": {"name": name, "namespace": "default"},
+                    "spec": {"resources": {"requests": {"storage": "1Gi"}}}
+                }),
+            )
+            .unwrap();
+    }
+
+    fn exists(store: &Store, gvr: &GroupVersionResource, name: &str) -> bool {
+        store
+            .get(&ResourceRef {
+                gvr,
+                namespace: Some("default"),
+                name,
+            })
+            .unwrap()
+            .is_some()
+    }
+
+    fn owned_pod_names(store: &Store, uid: &str) -> Vec<String> {
+        let mut v: Vec<String> = store
+            .list_as::<Pod>(&pods_gvr(), Some("default"))
+            .unwrap()
+            .iter()
+            .filter(|p| is_owned_by(&p.metadata, uid))
+            .filter_map(|p| p.metadata.name.clone())
+            .collect();
+        v.sort();
+        v
+    }
+
+    fn spec(replicas: i32, extra: Value) -> Value {
+        let mut base = json!({
+            "replicas": replicas,
+            "serviceName": "svc",
+            "selector": {"matchLabels": {"app": "x"}},
+            "template": {
+                "metadata": {"labels": {"app": "x"}},
+                "spec": {"containers": [{"name": "c", "image": "img"}]}
+            }
+        });
+        if let (Some(b), Some(e)) = (base.as_object_mut(), extra.as_object()) {
+            for (k, val) in e {
+                b.insert(k.clone(), val.clone());
+            }
+        }
+        base
+    }
+
+    fn uid_of(sts: &Value) -> String {
+        sts["metadata"]["uid"].as_str().unwrap().to_string()
+    }
+
+    #[test]
+    fn ordered_scale_up_creates_first_ordinal_only() {
+        let (_d, store) = store();
+        let sts = create_sts(&store, "web", spec(3, json!({})));
+        reconcile_sts(&store, &sts).unwrap();
+        assert_eq!(owned_pod_names(&store, &uid_of(&sts)), vec!["web-0"]);
+    }
+
+    #[test]
+    fn ordered_scale_up_advances_when_predecessor_ready() {
+        let (_d, store) = store();
+        let sts = create_sts(&store, "web", spec(3, json!({})));
+        let uid = uid_of(&sts);
+        create_owned_pod(&store, "web-0", &uid, true);
+        reconcile_sts(&store, &sts).unwrap();
+        assert_eq!(owned_pod_names(&store, &uid), vec!["web-0", "web-1"]);
+    }
+
+    #[test]
+    fn ordered_scale_up_waits_when_predecessor_not_ready() {
+        let (_d, store) = store();
+        let sts = create_sts(&store, "web", spec(3, json!({})));
+        let uid = uid_of(&sts);
+        create_owned_pod(&store, "web-0", &uid, false);
+        reconcile_sts(&store, &sts).unwrap();
+        assert_eq!(owned_pod_names(&store, &uid), vec!["web-0"]);
+    }
+
+    #[test]
+    fn parallel_creates_all_at_once() {
+        let (_d, store) = store();
+        let sts = create_sts(&store, "web", spec(3, json!({"podManagementPolicy": "Parallel"})));
+        reconcile_sts(&store, &sts).unwrap();
+        assert_eq!(
+            owned_pod_names(&store, &uid_of(&sts)),
+            vec!["web-0", "web-1", "web-2"]
+        );
+    }
+
+    #[test]
+    fn when_scaled_delete_removes_pvc() {
+        let (_d, store) = store();
+        let sts = create_sts(
+            &store,
+            "web",
+            spec(
+                1,
+                json!({
+                    "volumeClaimTemplates": [{
+                        "metadata": {"name": "data"},
+                        "spec": {"resources": {"requests": {"storage": "1Gi"}}}
+                    }],
+                    "persistentVolumeClaimRetentionPolicy": {
+                        "whenScaled": "Delete", "whenDeleted": "Retain"
+                    }
+                }),
+            ),
+        );
+        let uid = uid_of(&sts);
+        create_owned_pod(&store, "web-0", &uid, true);
+        create_owned_pod(&store, "web-1", &uid, true);
+        create_pvc(&store, "data-web-1");
+
+        reconcile_sts(&store, &sts).unwrap();
+
+        assert!(!exists(&store, &pods_gvr(), "web-1"), "highest ordinal reaped");
+        assert!(exists(&store, &pods_gvr(), "web-0"), "kept replica survives");
+        assert!(
+            !exists(&store, &pvcs_gvr(), "data-web-1"),
+            "whenScaled=Delete reaps the PVC"
+        );
+    }
+
+    #[test]
+    fn when_deleted_delete_removes_all_pvcs() {
+        let (_d, store) = store();
+        let sts = create_sts(
+            &store,
+            "web",
+            spec(
+                2,
+                json!({
+                    "volumeClaimTemplates": [{
+                        "metadata": {"name": "data"},
+                        "spec": {"resources": {"requests": {"storage": "1Gi"}}}
+                    }],
+                    "persistentVolumeClaimRetentionPolicy": {"whenDeleted": "Delete"}
+                }),
+            ),
+        );
+        create_pvc(&store, "data-web-0");
+        create_pvc(&store, "data-web-1");
+
+        handle_sts_deleted(&store, &sts).unwrap();
+
+        assert!(!exists(&store, &pvcs_gvr(), "data-web-0"));
+        assert!(!exists(&store, &pvcs_gvr(), "data-web-1"));
+    }
+
+    #[test]
+    fn retain_is_the_default_on_scale_down() {
+        let (_d, store) = store();
+        let sts = create_sts(
+            &store,
+            "web",
+            spec(
+                1,
+                json!({
+                    "volumeClaimTemplates": [{
+                        "metadata": {"name": "data"},
+                        "spec": {"resources": {"requests": {"storage": "1Gi"}}}
+                    }]
+                }),
+            ),
+        );
+        let uid = uid_of(&sts);
+        create_owned_pod(&store, "web-0", &uid, true);
+        create_owned_pod(&store, "web-1", &uid, true);
+        create_pvc(&store, "data-web-1");
+
+        reconcile_sts(&store, &sts).unwrap();
+
+        assert!(!exists(&store, &pods_gvr(), "web-1"));
+        assert!(
+            exists(&store, &pvcs_gvr(), "data-web-1"),
+            "default retention keeps the PVC"
+        );
     }
 }

@@ -101,9 +101,35 @@ fn generate_front_proxy_cert(
     let cert = params.signed_by(&key, &ca_cert, &ca_key)?;
 
     std::fs::write(cert_dir.join(FRONT_PROXY_CERT_FILE), cert.pem())?;
-    std::fs::write(cert_dir.join(FRONT_PROXY_KEY_FILE), key.serialize_pem())?;
+    write_private_key(&cert_dir.join(FRONT_PROXY_KEY_FILE), &key.serialize_pem())?;
     tracing::info!("generated front-proxy client cert");
     Ok(())
+}
+
+/// Write a PEM private key readable only by its owner. These keys are the
+/// cluster's root of trust; left world-readable (the default `fs::write` mode)
+/// any local user could read `ca.key` and mint certs the apiserver trusts. On
+/// unix the mode is set on the open handle before the bytes land, so the key is
+/// never briefly world-readable — and an existing key from an older build is
+/// re-tightened on the next boot.
+fn write_private_key(path: &Path, pem: &str) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        f.write_all(pem.as_bytes())
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, pem)
+    }
 }
 
 fn all_present(paths: &[&PathBuf]) -> bool {
@@ -132,7 +158,7 @@ fn generate(cert_dir: &Path) -> anyhow::Result<()> {
         "kubernetes.default.svc.cluster.local",
         "localhost",
     ];
-    let ip_sans = ["10.96.0.1", "10.244.0.1", "127.0.0.1"];
+    let ip_sans = ["10.96.0.1", r8s_types::NODE_INTERNAL_IP, "127.0.0.1"];
     let mut server_params = CertificateParams::new(Vec::<String>::new())?;
     server_params
         .distinguished_name
@@ -155,9 +181,9 @@ fn generate(cert_dir: &Path) -> anyhow::Result<()> {
     let server_cert = server_params.signed_by(&server_key, &ca_cert, &ca_key)?;
 
     std::fs::write(cert_dir.join(CA_CERT_FILE), ca_cert.pem())?;
-    std::fs::write(cert_dir.join(CA_KEY_FILE), ca_key.serialize_pem())?;
+    write_private_key(&cert_dir.join(CA_KEY_FILE), &ca_key.serialize_pem())?;
     std::fs::write(cert_dir.join(SERVER_CERT_FILE), server_cert.pem())?;
-    std::fs::write(cert_dir.join(SERVER_KEY_FILE), server_key.serialize_pem())?;
+    write_private_key(&cert_dir.join(SERVER_KEY_FILE), &server_key.serialize_pem())?;
     tracing::info!(
         "generated cluster TLS material under {}",
         cert_dir.display()

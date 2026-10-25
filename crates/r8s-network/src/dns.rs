@@ -1,10 +1,14 @@
 use std::net::Ipv4Addr;
+use std::sync::Arc;
 
 use r8s_store::Store;
 use r8s_store::backend::ResourceRef;
-use r8s_types::{Endpoints, GroupVersionResource, Service};
+use r8s_types::{GroupVersionResource, NODE_INTERNAL_IP, Service};
 use tokio::net::UdpSocket;
 use tokio_util::sync::CancellationToken;
+
+use crate::endpoints::ready_endpoint_addresses;
+use crate::error::Result;
 
 const QTYPE_A: u16 = 1;
 
@@ -12,14 +16,14 @@ pub async fn run_dns_server(
     store: Store,
     shutdown: CancellationToken,
     data_dir: std::path::PathBuf,
-) -> anyhow::Result<()> {
+) -> Result<()> {
     let upstream = std::fs::read_to_string(data_dir.join("upstream_dns"))
         .unwrap_or_else(|_| "8.8.8.8".to_string());
     let upstream = upstream.trim().to_string();
 
-    let socket = UdpSocket::bind("10.244.0.1:53").await?;
-    let fwd_socket = UdpSocket::bind("0.0.0.0:0").await?;
-    tracing::info!(upstream, "DNS server listening on 10.244.0.1:53");
+    let bind_addr = format!("{NODE_INTERNAL_IP}:53");
+    let socket = Arc::new(UdpSocket::bind(bind_addr.as_str()).await?);
+    tracing::info!(upstream, %bind_addr, "DNS server listening");
 
     let mut buf = [0u8; 512];
     loop {
@@ -30,27 +34,35 @@ pub async fn run_dns_server(
             }
             result = socket.recv_from(&mut buf) => {
                 let (len, src) = result?;
-                let query = &buf[..len];
+                let query = buf[..len].to_vec();
 
-                // Anything under `cluster.local` is our zone and answered
-                // authoritatively — including NXDOMAIN. Forwarding those
-                // upstream would leak cluster names and add a 2s-timeout
-                // round-trip to every ndots:5 search expansion of an external
-                // lookup (`github.com.cluster.local` and friends).
-                let response = match parse_query(query) {
-                    Some((name, qtype)) if is_cluster_local(&name) => {
-                        answer_cluster_query(&store, query, &name, qtype)
-                    }
-                    _ => match forward_query(query, &upstream, &fwd_socket).await {
-                        Ok(r) => r,
-                        Err(e) => {
-                            tracing::debug!("DNS forward error: {e}");
-                            build_nxdomain(query)
+                // Handle each query on its own task: a forwarded lookup can take
+                // up to the 2s upstream timeout, and answering inline would stall
+                // every other query — including the fast authoritative ones —
+                // behind it. Cluster-local answers stay synchronous and cheap.
+                let store = store.clone();
+                let socket = socket.clone();
+                let upstream = upstream.clone();
+                tokio::spawn(async move {
+                    // Anything under `cluster.local` is our zone and answered
+                    // authoritatively — including NXDOMAIN. Forwarding those
+                    // upstream would leak cluster names and add a 2s-timeout
+                    // round-trip to every ndots:5 search expansion of an external
+                    // lookup (`github.com.cluster.local` and friends).
+                    let response = match parse_query(&query) {
+                        Some((name, qtype)) if is_cluster_local(&name) => {
+                            answer_cluster_query(&store, &query, &name, qtype)
                         }
-                    },
-                };
-
-                let _ = socket.send_to(&response, src).await;
+                        _ => match forward_query(&query, &upstream).await {
+                            Ok(r) => r,
+                            Err(e) => {
+                                tracing::debug!("DNS forward error: {e}");
+                                build_nxdomain(&query)
+                            }
+                        },
+                    };
+                    let _ = socket.send_to(&response, src).await;
+                });
             }
         }
     }
@@ -153,30 +165,14 @@ fn non_empty(ips: Vec<Ipv4Addr>) -> Option<Vec<Ipv4Addr>> {
 /// hostname when the pod's `subdomain` names this Service, so per-pod records
 /// stay scoped to the governing Service exactly like upstream k8s.
 fn endpoint_ips(store: &Store, ns: &str, svc: &str, hostname: Option<&str>) -> Vec<Ipv4Addr> {
-    let gvr = GroupVersionResource::endpoints();
-    let rref = ResourceRef {
-        gvr: &gvr,
-        namespace: Some(ns),
-        name: svc,
-    };
-    let Ok(Some(ep)) = store.get_as::<Endpoints>(&rref) else {
-        return Vec::new();
-    };
-
-    let mut ips = Vec::new();
-    for subset in ep.subsets.unwrap_or_default() {
-        for addr in subset.addresses.unwrap_or_default() {
-            if let Some(want) = hostname
-                && addr.hostname.as_deref() != Some(want)
-            {
-                continue;
-            }
-            if let Ok(ip) = addr.ip.parse::<Ipv4Addr>() {
-                ips.push(ip);
-            }
-        }
-    }
-    ips
+    ready_endpoint_addresses(store, Some(ns), svc)
+        .into_iter()
+        .filter(|a| match hostname {
+            Some(want) => a.hostname.as_deref() == Some(want),
+            None => true,
+        })
+        .map(|a| a.ip)
+        .collect()
 }
 
 /// Build a NOERROR response carrying one A record per IP. With no IPs this is
@@ -258,13 +254,24 @@ fn build_nxdomain(query: &[u8]) -> Vec<u8> {
     resp
 }
 
-async fn forward_query(query: &[u8], upstream: &str, sock: &UdpSocket) -> anyhow::Result<Vec<u8>> {
+/// Forward a query to the upstream resolver over a fresh ephemeral socket, so
+/// concurrent forwards never read each other's replies. Returns a timeout error
+/// after 2s rather than blocking the task indefinitely.
+async fn forward_query(query: &[u8], upstream: &str) -> std::io::Result<Vec<u8>> {
+    let sock = UdpSocket::bind("0.0.0.0:0").await?;
     sock.send_to(query, format!("{upstream}:53")).await?;
 
     let mut buf = [0u8; 512];
-    let timeout = tokio::time::timeout(std::time::Duration::from_secs(2), sock.recv_from(&mut buf));
-    let (len, _) = timeout.await??;
-    Ok(buf[..len].to_vec())
+    match tokio::time::timeout(std::time::Duration::from_secs(2), sock.recv_from(&mut buf)).await {
+        Ok(r) => {
+            let (len, _) = r?;
+            Ok(buf[..len].to_vec())
+        }
+        Err(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "upstream DNS timeout",
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -278,7 +285,13 @@ mod tests {
         (dir, store)
     }
 
-    fn create(store: &Store, gvr: &GroupVersionResource, ns: &str, name: &str, value: serde_json::Value) {
+    fn create(
+        store: &Store,
+        gvr: &GroupVersionResource,
+        ns: &str,
+        name: &str,
+        value: serde_json::Value,
+    ) {
         store
             .create(
                 ResourceRef {
@@ -398,7 +411,10 @@ mod tests {
         let (_dir, store) = temp_store();
         seed_headless_redis(&store);
 
-        let q = query_packet("redis-master-0.redis-headless.redis.svc.cluster.local", QTYPE_A);
+        let q = query_packet(
+            "redis-master-0.redis-headless.redis.svc.cluster.local",
+            QTYPE_A,
+        );
         let (name, qtype) = parse_query(&q).unwrap();
         let resp = answer_cluster_query(&store, &q, &name, qtype);
 
@@ -411,7 +427,10 @@ mod tests {
         let (_dir, store) = temp_store();
         seed_headless_redis(&store);
 
-        let q = query_packet("redis-master-7.redis-headless.redis.svc.cluster.local", QTYPE_A);
+        let q = query_packet(
+            "redis-master-7.redis-headless.redis.svc.cluster.local",
+            QTYPE_A,
+        );
         let (name, qtype) = parse_query(&q).unwrap();
         let resp = answer_cluster_query(&store, &q, &name, qtype);
 

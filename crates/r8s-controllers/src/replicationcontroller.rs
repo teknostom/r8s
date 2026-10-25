@@ -10,7 +10,7 @@
 //! so there's no template-hash bookkeeping.
 
 use r8s_store::{Store, backend::ResourceRef, watch::WatchEventType};
-use r8s_types::{GroupVersionResource, ObjectMeta, OwnerReference, Pod, PodTemplateSpec};
+use r8s_types::{GroupVersionResource, ObjectMeta, Pod, PodTemplateSpec};
 use serde_json::Value;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
@@ -48,7 +48,7 @@ pub async fn run(store: Store, shutdown: CancellationToken) -> anyhow::Result<()
             event = pod_rx.recv() => {
                 match event {
                     Ok(event) if !matches!(event.event_type, WatchEventType::Added) => {
-                        let pod: Pod = match serde_json::from_value(event.object) {
+                        let pod: Pod = match serde_json::from_value(event.object.as_ref().clone()) {
                             Ok(p) => p,
                             Err(_) => continue,
                         };
@@ -107,6 +107,11 @@ fn reconcile_rc(store: &Store, rc_value: &Value) -> anyhow::Result<()> {
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
+    if rc_uid.is_empty() {
+        // Ownership is matched by uid; an empty uid would adopt unrelated pods.
+        tracing::warn!("rc '{rc_name}': missing uid; skipping");
+        return Ok(());
+    }
 
     let gvr = GroupVersionResource::new("", "v1", "replicationcontrollers");
     let rref = ResourceRef {
@@ -154,9 +159,7 @@ fn reconcile_rc(store: &Store, rc_value: &Value) -> anyhow::Result<()> {
         for _ in 0..to_create {
             create_pod(store, &rc_name, &rc_uid, rc_ns, &template)?;
         }
-        tracing::info!(
-            "rc '{rc_name}': created {to_create} pods ({current_count} -> {desired})"
-        );
+        tracing::info!("rc '{rc_name}': created {to_create} pods ({current_count} -> {desired})");
     } else if current_count > desired {
         let to_delete = current_count - desired;
         for pod in owned.iter().rev().take(to_delete as usize) {
@@ -169,9 +172,7 @@ fn reconcile_rc(store: &Store, rc_value: &Value) -> anyhow::Result<()> {
                 store.delete(&pod_ref)?;
             }
         }
-        tracing::info!(
-            "rc '{rc_name}': deleted {to_delete} pods ({current_count} -> {desired})"
-        );
+        tracing::info!("rc '{rc_name}': deleted {to_delete} pods ({current_count} -> {desired})");
     }
 
     // Recompute status with the final pod set.
@@ -181,16 +182,7 @@ fn reconcile_rc(store: &Store, rc_value: &Value) -> anyhow::Result<()> {
         .filter(|p| is_owned_by(&p.metadata, &rc_uid))
         .collect();
     let replicas = final_pods.len() as i32;
-    let ready = final_pods
-        .iter()
-        .filter(|pod| {
-            pod.status
-                .as_ref()
-                .and_then(|s| s.conditions.as_ref())
-                .and_then(|c| c.iter().find(|c| c.type_ == "Ready"))
-                .is_some_and(|c| c.status == "True")
-        })
-        .count() as i32;
+    let ready = final_pods.iter().filter(|p| crate::pod_ready(p)).count() as i32;
     update_rc_status(store, &rc_name, rc_ns, replicas, ready)?;
 
     Ok(())
@@ -210,14 +202,12 @@ fn create_pod(
             name: Some(pod_name.clone()),
             namespace: namespace.map(String::from),
             labels,
-            owner_references: Some(vec![OwnerReference {
-                api_version: "v1".into(),
-                kind: "ReplicationController".into(),
-                name: rc_name.into(),
-                uid: rc_uid.into(),
-                controller: Some(true),
-                block_owner_deletion: Some(true),
-            }]),
+            owner_references: Some(vec![crate::owner_reference(
+                "v1",
+                "ReplicationController",
+                rc_name,
+                rc_uid,
+            )]),
             ..Default::default()
         },
         spec: template.spec.clone(),

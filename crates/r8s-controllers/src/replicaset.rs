@@ -1,6 +1,6 @@
 use r8s_store::{Store, backend::ResourceRef, watch::WatchEventType};
 use r8s_types::{
-    GroupVersionResource, ObjectMeta, OwnerReference, Pod, PodTemplateSpec, ReplicaSetStatus,
+    GroupVersionResource, ObjectMeta, Pod, PodTemplateSpec, ReplicaSetStatus,
 };
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
@@ -40,7 +40,7 @@ pub async fn run(store: Store, shutdown: CancellationToken) -> anyhow::Result<()
                         // Handle pod deletions (maintain replica count) and updates
                         // (readiness changes affect ready_replicas). Ignore pod adds
                         // since those are initiated by this controller.
-                        let pod: Pod = match serde_json::from_value(event.object) {
+                        let pod: Pod = match serde_json::from_value(event.object.as_ref().clone()) {
                             Ok(p) => p,
                             Err(_) => continue,
                         };
@@ -107,6 +107,11 @@ fn reconcile_rs(store: &Store, rs_value: &serde_json::Value) -> anyhow::Result<(
         return Ok(());
     }
     let current_uid = current.metadata.uid.as_deref().unwrap_or(rs_uid);
+    if current_uid.is_empty() {
+        // Ownership is matched by uid; an empty uid would adopt unrelated pods.
+        tracing::warn!("rs '{rs_name}': missing uid; skipping");
+        return Ok(());
+    }
     let current_spec = current
         .spec
         .as_ref()
@@ -153,16 +158,7 @@ fn reconcile_rs(store: &Store, rs_value: &serde_json::Value) -> anyhow::Result<(
         .filter(|p| is_owned_by(&p.metadata, current_uid))
         .collect();
     let final_count = final_pods.len() as i32;
-    let ready_count = final_pods
-        .iter()
-        .filter(|pod| {
-            pod.status
-                .as_ref()
-                .and_then(|s| s.conditions.as_ref())
-                .and_then(|c| c.iter().find(|c| c.type_ == "Ready"))
-                .is_some_and(|c| c.status == "True")
-        })
-        .count() as i32;
+    let ready_count = final_pods.iter().filter(|p| crate::pod_ready(p)).count() as i32;
     update_rs_status(store, rs_name, rs_ns, final_count, ready_count)?;
 
     Ok(())
@@ -182,14 +178,12 @@ fn create_pod(
             name: Some(pod_name.clone()),
             namespace: namespace.map(String::from),
             labels,
-            owner_references: Some(vec![OwnerReference {
-                api_version: "apps/v1".into(),
-                kind: "ReplicaSet".into(),
-                name: rs_name.into(),
-                uid: rs_uid.into(),
-                controller: Some(true),
-                block_owner_deletion: Some(true),
-            }]),
+            owner_references: Some(vec![crate::owner_reference(
+                "apps/v1",
+                "ReplicaSet",
+                rs_name,
+                rs_uid,
+            )]),
             ..Default::default()
         },
         spec: template.spec.clone(),

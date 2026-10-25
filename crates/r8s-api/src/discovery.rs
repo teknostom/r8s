@@ -19,7 +19,8 @@ use r8s_types::registry::ResourceRegistry;
 /// from the legacy `APIGroupList`/`APIVersions` shape to the aggregated one
 /// and the response Content-Type echoes the negotiated value back. Real k8s
 /// also serves `v2beta1`; we accept either to be lenient with older clients.
-const AGGREGATED_MEDIA_TYPE: &str = "application/json;g=apidiscovery.k8s.io;v=v2;as=APIGroupDiscoveryList";
+const AGGREGATED_MEDIA_TYPE: &str =
+    "application/json;g=apidiscovery.k8s.io;v=v2;as=APIGroupDiscoveryList";
 
 fn wants_aggregated_discovery(headers: &HeaderMap) -> Option<&'static str> {
     headers
@@ -87,6 +88,17 @@ pub async fn get_version() -> Response {
     }))
 }
 
+/// Liveness/readiness/health probes (`/livez`, `/readyz`, `/healthz`).
+///
+/// In-cluster clients verify API connectivity by GETting these and treat a
+/// non-200 as "apiserver is down". kube-state-metrics, for instance, pings
+/// `/livez` from its own liveness handler; a 404 there fails its probe and
+/// crashloops the pod. Real apiservers answer with a plaintext `ok` (plus a
+/// checklist under `?verbose`); a bare `ok` is all any client we run needs.
+pub async fn healthz() -> &'static str {
+    "ok"
+}
+
 pub async fn get_api_versions(headers: HeaderMap, State(state): State<AppState>) -> Response {
     if let Some(media) = wants_aggregated_discovery(&headers) {
         return aggregated_response(media, aggregated_legacy_group(&state));
@@ -133,8 +145,10 @@ pub async fn get_api_groups(headers: HeaderMap, State(state): State<AppState>) -
         if rt.gvr.group.is_empty() || !seen.insert(rt.gvr.group.clone()) {
             continue;
         }
-        let mut versions: Vec<String> =
-            versions_by_group.get(&rt.gvr.group).cloned().unwrap_or_default();
+        let mut versions: Vec<String> = versions_by_group
+            .get(&rt.gvr.group)
+            .cloned()
+            .unwrap_or_default();
         versions.sort();
         versions.dedup();
         let version_objs: Vec<serde_json::Value> = versions
@@ -144,7 +158,10 @@ pub async fn get_api_groups(headers: HeaderMap, State(state): State<AppState>) -
                 serde_json::json!({"groupVersion": gv, "version": v})
             })
             .collect();
-        let preferred = versions.last().cloned().unwrap_or_else(|| rt.gvr.version.clone());
+        let preferred = versions
+            .last()
+            .cloned()
+            .unwrap_or_else(|| rt.gvr.version.clone());
         let preferred_gv = format!("{}/{preferred}", rt.gvr.group);
         groups.push(serde_json::json!({
             "name": rt.gvr.group,
@@ -185,12 +202,16 @@ pub(crate) fn aggregated_api_groups(state: &ApiState) -> Vec<(String, String)> {
     };
     let mut out = Vec::new();
     for item in &list.items {
-        let Some(spec) = item.get("spec") else { continue };
+        let Some(spec) = item.get("spec") else {
+            continue;
+        };
         if spec.get("service").and_then(|v| v.as_object()).is_none() {
             continue;
         }
         let (Some(g), Some(v)) = (
-            spec.get("group").and_then(|v| v.as_str()).filter(|s| !s.is_empty()),
+            spec.get("group")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty()),
             spec.get("version").and_then(|v| v.as_str()),
         ) else {
             continue;
@@ -266,9 +287,15 @@ pub async fn get_group_version_resources(
         .is_empty()
     {
         let path = format!("/apis/{group}/{version}");
-        if let Some(resp) =
-            crate::aggregation::try_proxy(&state, &axum::http::Method::GET, &path, None, &headers, &[])
-                .await
+        if let Some(resp) = crate::aggregation::try_proxy(
+            &state,
+            &axum::http::Method::GET,
+            &path,
+            None,
+            &headers,
+            &[],
+        )
+        .await
         {
             return resp;
         }

@@ -1,32 +1,25 @@
-use std::{
-    path::Path,
-    sync::{Arc, RwLock},
-};
+use std::{ops::Bound, path::Path, sync::Arc};
 
 use base64::prelude::*;
-use r8s_types::{GroupVersionResource, ObjectMeta};
+use parking_lot::RwLock;
+use r8s_types::GroupVersionResource;
 use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition};
+use serde::{Serialize, de::DeserializeOwned};
 use tokio::sync::broadcast;
 
 use crate::{
-    error::StoreError,
-    index::{FieldSelector, LabelIndex, LabelSelector},
+    error::{Result, StoreError},
+    index::{FieldSelector, LabelSelector},
     revision::RevisionCounter,
     watch::{WatchEvent, WatchEventType, WatchHub},
 };
 
-const RESOURCES: TableDefinition<&str, &[u8]> = TableDefinition::new("resources");
-const REVISIONS: TableDefinition<u64, &[u8]> = TableDefinition::new("revisions");
+pub(crate) const RESOURCES: TableDefinition<&str, &[u8]> = TableDefinition::new("resources");
+pub(crate) const REVISIONS: TableDefinition<u64, &[u8]> = TableDefinition::new("revisions");
 
-// History window for the REVISIONS table. Each write prunes the entry
-// `KEEP_REVISIONS` behind the new one, so the table stays bounded without
-// a background task.
-//
-// TODO(410-gone): nothing reads REVISIONS yet. When watch-from-resourceVersion
-// and resourceVersionMatch=Exact list reads are wired up, requests referencing
-// any RV older than `current - KEEP_REVISIONS` must return HTTP 410 Gone
-// (status reason "Expired"). There is a single threshold — the oldest
-// retained RV — checked per request; clients respond by relisting.
+/// Number of trailing revisions retained for watch replay. A watch resuming
+/// from a `resourceVersion` older than this window is answered with
+/// [`StoreError::TooOld`].
 const KEEP_REVISIONS: u64 = 1000;
 
 #[derive(Clone)]
@@ -34,7 +27,9 @@ pub struct Store {
     db: Arc<Database>,
     revision: RevisionCounter,
     watches: WatchHub,
-    index: LabelIndex,
+    /// Serializes writes against the snapshot taken by reads, so that a list's
+    /// `resourceVersion` and the events delivered to a concurrently-opened
+    /// watch never overlap or skip.
     view_lock: Arc<RwLock<()>>,
 }
 
@@ -42,6 +37,12 @@ pub struct ListResult {
     pub items: Vec<serde_json::Value>,
     pub resource_version: u64,
     pub continue_token: Option<String>,
+}
+
+pub struct StoreStats {
+    pub current_revision: u64,
+    pub revision_entries: u64,
+    pub resource_count: u64,
 }
 
 pub struct ResourceRef<'a> {
@@ -59,108 +60,94 @@ impl ResourceRef<'_> {
     }
 }
 
+/// One entry in the durable revision log, as written to the `REVISIONS` table.
+#[derive(Serialize)]
+struct RevisionEntryRef<'a> {
+    #[serde(rename = "type")]
+    event_type: WatchEventType,
+    key: &'a str,
+    object: &'a serde_json::Value,
+}
+
+#[derive(serde::Deserialize)]
+struct RevisionEntry {
+    #[serde(rename = "type")]
+    event_type: WatchEventType,
+    key: String,
+    object: serde_json::Value,
+}
+
 impl Store {
-    pub fn open(path: &Path) -> anyhow::Result<Self> {
+    pub fn open(path: &Path) -> Result<Self> {
         let db = Database::create(path)?;
-        let w_transaction = db.begin_write()?;
         {
-            let _table = w_transaction.open_table(RESOURCES)?;
-            let _table = w_transaction.open_table(REVISIONS)?;
+            let txn = db.begin_write()?;
+            txn.open_table(RESOURCES)?;
+            txn.open_table(REVISIONS)?;
+            txn.commit()?;
         }
-        w_transaction.commit()?;
 
-        let r_transaction = db.begin_read()?;
-        let table = r_transaction.open_table(REVISIONS)?;
+        let max_revision = {
+            let txn = db.begin_read()?;
+            let table = txn.open_table(REVISIONS)?;
+            table.last()?.map(|(k, _)| k.value()).unwrap_or(0)
+        };
 
-        let max_revision = table.last()?.map(|(k, _)| k.value()).unwrap_or(0);
-
-        let store = Self {
+        Ok(Self {
             db: Arc::new(db),
             revision: RevisionCounter::new(max_revision),
             watches: WatchHub::default(),
-            index: LabelIndex::default(),
             view_lock: Arc::new(RwLock::new(())),
-        };
-
-        Ok(store)
+        })
     }
 
     pub fn create(
         &self,
         resource: ResourceRef,
         object: &serde_json::Value,
-    ) -> anyhow::Result<serde_json::Value> {
+    ) -> Result<serde_json::Value> {
         let key = resource.key();
-        let _view_guard = self.view_lock.write().expect("view_lock poisoned");
-        let w_transaction = self.db.begin_write()?;
+        let gvr_prefix = resource.gvr.key_prefix();
+
         let mut obj = object.clone();
-        let rev = self.revision.next();
         let metadata = obj
             .get_mut("metadata")
             .and_then(|v| v.as_object_mut())
-            .ok_or_else(|| anyhow::anyhow!("metadata must be an object"))?;
-
-        metadata.insert(
-            "resourceVersion".to_string(),
-            serde_json::json!(rev.to_string()),
-        );
-        metadata.insert(
-            "uid".to_string(),
-            serde_json::json!(uuid::Uuid::new_v4().to_string()),
-        );
-        metadata.insert(
-            "creationTimestamp".to_string(),
-            serde_json::json!(chrono::Utc::now().to_rfc3339()),
-        );
-
+            .ok_or(StoreError::InvalidMetadata)?;
+        if metadata.get("uid").and_then(|v| v.as_str()).is_none() {
+            metadata.insert("uid".into(), uuid::Uuid::new_v4().to_string().into());
+        }
+        if metadata
+            .get("creationTimestamp")
+            .and_then(|v| v.as_str())
+            .is_none()
         {
-            let mut table = w_transaction.open_table(RESOURCES)?;
+            metadata.insert("creationTimestamp".into(), chrono::Utc::now().to_rfc3339().into());
+        }
 
+        let _guard = self.view_lock.write();
+        let txn = self.db.begin_write()?;
+
+        let rev = {
+            let mut table = txn.open_table(RESOURCES)?;
             if table.get(key.as_str())?.is_some() {
                 return Err(StoreError::AlreadyExists {
-                    gvr: resource.gvr.key_prefix(),
+                    gvr: gvr_prefix,
                     name: resource.name.to_string(),
-                }
-                .into());
+                });
             }
-
+            let rev = self.revision.next();
+            set_resource_version(&mut obj, rev);
             table.insert(key.as_str(), serde_json::to_vec(&obj)?.as_slice())?;
-        }
+            rev
+        };
 
-        {
-            let mut table = w_transaction.open_table(REVISIONS)?;
-            let rev_entry = serde_json::json!({
-                "type": "ADDED",
-                "key": key,
-                "object": obj,
-            });
-            table.insert(rev, serde_json::to_vec(&rev_entry)?.as_slice())?;
-            prune_revision(&mut table, rev)?;
-        }
-
-        w_transaction.commit()?;
-
-        let meta: ObjectMeta =
-            serde_json::from_value(obj.get("metadata").cloned().unwrap_or_default())
-                .unwrap_or_default();
-        let labels = meta.labels.unwrap_or_default();
-        self.index.update(&resource.gvr.key_prefix(), &key, &labels);
-
-        self.watches.notify(
-            &resource.gvr.key_prefix(),
-            WatchEvent {
-                event_type: WatchEventType::Added,
-                resource_version: rev,
-                object: obj.clone(),
-            },
-        );
-
-        Ok(obj)
+        self.record(txn, &gvr_prefix, &key, rev, WatchEventType::Added, obj)
     }
 
-    pub fn get(&self, resource: &ResourceRef) -> anyhow::Result<Option<serde_json::Value>> {
-        let r_transaction = self.db.begin_read()?;
-        let table = r_transaction.open_table(RESOURCES)?;
+    pub fn get(&self, resource: &ResourceRef) -> Result<Option<serde_json::Value>> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(RESOURCES)?;
         match table.get(resource.key().as_str())? {
             Some(guard) => Ok(Some(serde_json::from_slice(guard.value())?)),
             None => Ok(None),
@@ -171,122 +158,60 @@ impl Store {
         &self,
         resource: &ResourceRef,
         object: &serde_json::Value,
-    ) -> anyhow::Result<serde_json::Value> {
+    ) -> Result<serde_json::Value> {
         let key = resource.key();
-        let _view_guard = self.view_lock.write().expect("view_lock poisoned");
-        let w_transaction = self.db.begin_write()?;
-        let existing: serde_json::Value = {
-            let table = w_transaction.open_table(RESOURCES)?;
+        let gvr_prefix = resource.gvr.key_prefix();
 
+        let _guard = self.view_lock.write();
+        let txn = self.db.begin_write()?;
+
+        let existing: serde_json::Value = {
+            let table = txn.open_table(RESOURCES)?;
             match table.get(key.as_str())? {
                 Some(guard) => serde_json::from_slice(guard.value())?,
                 None => {
                     return Err(StoreError::NotFound {
-                        gvr: resource.gvr.key_prefix(),
+                        gvr: gvr_prefix,
                         name: resource.name.to_string(),
-                    }
-                    .into());
+                    });
                 }
             }
         };
 
-        let incoming_meta: ObjectMeta =
-            serde_json::from_value(object.get("metadata").cloned().unwrap_or_default())
-                .unwrap_or_default();
-        let stored_meta: ObjectMeta =
-            serde_json::from_value(existing.get("metadata").cloned().unwrap_or_default())
-                .unwrap_or_default();
-        let incoming_rv = incoming_meta.resource_version.as_deref().unwrap_or("");
-        let stored_rv = stored_meta.resource_version.as_deref().unwrap_or("");
-        // An empty incoming resourceVersion means "blind update" — accept the
-        // current stored version. K8s semantics: only enforce the version check
-        // when the client explicitly sent one.
+        let stored_rv = resource_version(&existing);
+        let incoming_rv = resource_version(object);
         if !incoming_rv.is_empty() && incoming_rv != stored_rv {
             return Err(StoreError::Conflict {
-                gvr: resource.gvr.key_prefix(),
+                gvr: gvr_prefix,
                 name: resource.name.to_string(),
-                message: format!(
-                    "resourceVersion mismatch: stored={stored_rv}, incoming={incoming_rv}"
-                ),
-            }
-            .into());
+                message: format!("resourceVersion mismatch: stored={stored_rv}, incoming={incoming_rv}"),
+            });
         }
 
-        // No-op update: if the incoming object is identical to what's stored
-        // (ignoring the server-managed resourceVersion), don't bump the
-        // revision or emit a watch event — matching apiserver semantics.
-        // Without this, a controller that re-Updates an unchanged object
-        // (e.g. cert-manager's cainjector rewriting the same caBundle) gets a
-        // MODIFIED event back, re-reconciles, and spins in a tight loop.
-        {
-            let strip_rv = |v: &serde_json::Value| -> serde_json::Value {
-                let mut v = v.clone();
-                if let Some(m) = v.get_mut("metadata").and_then(|m| m.as_object_mut()) {
-                    m.remove("resourceVersion");
-                }
-                v
-            };
-            if strip_rv(object) == strip_rv(&existing) {
-                return Ok(existing);
-            }
+        if equal_ignoring_revision(object, &existing) {
+            return Ok(existing);
         }
 
         let rev = self.revision.next();
-
         let mut obj = object.clone();
-        let metadata = obj
-            .get_mut("metadata")
-            .and_then(|v| v.as_object_mut())
-            .ok_or_else(|| anyhow::anyhow!("metadata must be an object"))?;
-
-        metadata.insert(
-            "resourceVersion".to_string(),
-            serde_json::json!(rev.to_string()),
-        );
-
+        set_resource_version(&mut obj, rev);
         {
-            let mut table = w_transaction.open_table(RESOURCES)?;
+            let mut table = txn.open_table(RESOURCES)?;
             table.insert(key.as_str(), serde_json::to_vec(&obj)?.as_slice())?;
         }
 
-        {
-            let mut table = w_transaction.open_table(REVISIONS)?;
-            let rev_entry = serde_json::json!({
-                "type": "MODIFIED",
-                "key": key,
-                "object": obj,
-            });
-            table.insert(rev, serde_json::to_vec(&rev_entry)?.as_slice())?;
-            prune_revision(&mut table, rev)?;
-        }
-
-        w_transaction.commit()?;
-
-        let meta: ObjectMeta =
-            serde_json::from_value(obj.get("metadata").cloned().unwrap_or_default())
-                .unwrap_or_default();
-        let labels = meta.labels.unwrap_or_default();
-        self.index.update(&resource.gvr.key_prefix(), &key, &labels);
-
-        self.watches.notify(
-            &resource.gvr.key_prefix(),
-            WatchEvent {
-                event_type: WatchEventType::Modified,
-                resource_version: rev,
-                object: obj.clone(),
-            },
-        );
-
-        Ok(obj)
+        self.record(txn, &gvr_prefix, &key, rev, WatchEventType::Modified, obj)
     }
 
-    pub fn delete(&self, resource: &ResourceRef) -> anyhow::Result<Option<serde_json::Value>> {
+    pub fn delete(&self, resource: &ResourceRef) -> Result<Option<serde_json::Value>> {
         let key = resource.key();
-        let _view_guard = self.view_lock.write().expect("view_lock poisoned");
-        let w_transaction = self.db.begin_write()?;
+        let gvr_prefix = resource.gvr.key_prefix();
 
-        let obj: serde_json::Value = {
-            let mut table = w_transaction.open_table(RESOURCES)?;
+        let _guard = self.view_lock.write();
+        let txn = self.db.begin_write()?;
+
+        let object: serde_json::Value = {
+            let mut table = txn.open_table(RESOURCES)?;
             match table.remove(key.as_str())? {
                 Some(guard) => serde_json::from_slice(guard.value())?,
                 None => return Ok(None),
@@ -294,32 +219,44 @@ impl Store {
         };
 
         let rev = self.revision.next();
+        let object = self.record(txn, &gvr_prefix, &key, rev, WatchEventType::Deleted, object)?;
+        Ok(Some(object))
+    }
 
+    /// Commits the revision-log entry for an already-staged resource mutation,
+    /// then publishes the event to live watchers. Runs under the write guard
+    /// held by the calling mutation.
+    fn record(
+        &self,
+        txn: redb::WriteTransaction,
+        gvr_prefix: &str,
+        key: &str,
+        rev: u64,
+        event_type: WatchEventType,
+        object: serde_json::Value,
+    ) -> Result<serde_json::Value> {
         {
-            let mut table = w_transaction.open_table(REVISIONS)?;
-            let rev_entry = serde_json::json!({
-                "type": "DELETED",
-                "key": key,
-                "object": obj,
-            });
-            table.insert(rev, serde_json::to_vec(&rev_entry)?.as_slice())?;
-            prune_revision(&mut table, rev)?;
+            let mut table = txn.open_table(REVISIONS)?;
+            let entry = serde_json::to_vec(&RevisionEntryRef {
+                event_type,
+                key,
+                object: &object,
+            })?;
+            table.insert(rev, entry.as_slice())?;
+            prune_revisions(&mut table, rev)?;
         }
+        txn.commit()?;
 
-        w_transaction.commit()?;
-
-        self.index.remove(&resource.gvr.key_prefix(), &key);
-
+        let object = Arc::new(object);
         self.watches.notify(
-            &resource.gvr.key_prefix(),
+            gvr_prefix,
             WatchEvent {
-                event_type: WatchEventType::Deleted,
+                event_type,
                 resource_version: rev,
-                object: obj.clone(),
+                object: object.clone(),
             },
         );
-
-        Ok(Some(obj))
+        Ok(Arc::unwrap_or_clone(object))
     }
 
     pub fn list(
@@ -330,84 +267,17 @@ impl Store {
         field_selector: Option<&FieldSelector>,
         limit: Option<usize>,
         continue_token: Option<&str>,
-    ) -> anyhow::Result<ListResult> {
-        let scan_prefix = match namespace {
-            Some(ns) => format!("{}/{}/", gvr.key_prefix(), ns),
-            None => format!("{}/", gvr.key_prefix()),
-        };
-
-        let _view_guard = self.view_lock.write().expect("view_lock poisoned");
-        let resource_version = self.revision.current();
-
-        let r_transaction = self.db.begin_read()?;
-
-        let table = r_transaction.open_table(RESOURCES)?;
-
-        let mut items = Vec::new();
-        let mut last_key: Option<String> = None;
-
-        let candidates = label_selector.and_then(|s| self.index.matches(&gvr.key_prefix(), s));
-        drop(_view_guard);
-
-        let range_start = match continue_token {
-            Some(token) => String::from_utf8(
-                BASE64_STANDARD
-                    .decode(token)
-                    .map_err(|e| anyhow::anyhow!("invalid continue token: {e}"))?,
-            )
-            .map_err(|e| anyhow::anyhow!("invalid continue token: {e}"))?,
-            None => scan_prefix.clone(),
-        };
-
-        let mut skipped_first = continue_token.is_none();
-
-        for entry in table.range(range_start.as_str()..)? {
-            let (key, value) = entry?;
-            if !key.value().starts_with(scan_prefix.as_str()) {
-                break;
-            }
-
-            if !skipped_first {
-                skipped_first = true;
-                continue;
-            }
-
-            if let Some(ref candidates) = candidates
-                && !candidates.contains(key.value())
-            {
-                continue;
-            }
-            let item: serde_json::Value = serde_json::from_slice(value.value())?;
-            if let Some(ls) = label_selector
-                && !ls.matches(&item)
-            {
-                continue;
-            }
-            if let Some(fs) = field_selector
-                && !fs.matches(&item, &gvr.key_prefix())
-            {
-                continue;
-            }
-            last_key = Some(key.value().to_string());
-            items.push(item);
-
-            if let Some(limit) = limit
-                && items.len() >= limit
-            {
-                break;
-            }
-        }
-
-        let continue_token = if let Some(limit) = limit {
-            if items.len() >= limit {
-                last_key.map(|k| BASE64_STANDARD.encode(k))
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
+    ) -> Result<ListResult> {
+        let (txn, resource_version) = self.snapshot()?;
+        let (items, continue_token) = list_scan(
+            &txn,
+            gvr,
+            namespace,
+            label_selector,
+            field_selector,
+            limit,
+            continue_token,
+        )?;
         Ok(ListResult {
             items,
             resource_version,
@@ -415,66 +285,267 @@ impl Store {
         })
     }
 
-    pub fn stats(&self) -> anyhow::Result<(u64, u64, u64)> {
-        let current_rev = self.revision.current();
-        let r_transaction = self.db.begin_read()?;
-        let rev_table = r_transaction.open_table(REVISIONS)?;
-        let rev_count = rev_table.len()?;
-        let res_table = r_transaction.open_table(RESOURCES)?;
-        let res_count = res_table.len()?;
-        Ok((current_rev, rev_count, res_count))
+    pub fn stats(&self) -> Result<StoreStats> {
+        let current_revision = self.revision.current();
+        let txn = self.db.begin_read()?;
+        let revision_entries = txn.open_table(REVISIONS)?.len()?;
+        let resource_count = txn.open_table(RESOURCES)?.len()?;
+        Ok(StoreStats {
+            current_revision,
+            revision_entries,
+            resource_count,
+        })
     }
 
-    pub fn get_as<T: serde::de::DeserializeOwned>(
-        &self,
-        resource: &ResourceRef,
-    ) -> anyhow::Result<Option<T>> {
+    pub fn get_as<T: DeserializeOwned>(&self, resource: &ResourceRef) -> Result<Option<T>> {
         match self.get(resource)? {
             Some(v) => Ok(Some(serde_json::from_value(v)?)),
             None => Ok(None),
         }
     }
 
-    pub fn list_as<T: serde::de::DeserializeOwned>(
+    pub fn list_as<T: DeserializeOwned>(
         &self,
         gvr: &GroupVersionResource,
         namespace: Option<&str>,
-    ) -> anyhow::Result<Vec<T>> {
+    ) -> Result<Vec<T>> {
         let result = self.list(gvr, namespace, None, None, None, None)?;
-        Ok(result
+        result
             .items
             .into_iter()
-            .filter_map(|v| serde_json::from_value(v).ok())
-            .collect())
+            .map(|v| serde_json::from_value(v).map_err(StoreError::from))
+            .collect()
     }
 
+    /// Subscribe to live events for `gvr`, starting now.
     pub fn watch(&self, gvr: &GroupVersionResource) -> broadcast::Receiver<WatchEvent> {
         self.watches.subscribe(&gvr.key_prefix())
     }
 
-    /// Open a watch with history: returns every recently-buffered event with
-    /// `resource_version > since_rv` followed by a live receiver. Pass 0 for
-    /// `since_rv` to request no history.
+    /// Atomically snapshot the current state of `gvr` and subscribe to its live
+    /// stream. The receiver delivers exactly the events following the returned
+    /// snapshot, with no overlap or gap.
+    pub fn list_and_watch(
+        &self,
+        gvr: &GroupVersionResource,
+        namespace: Option<&str>,
+        label_selector: Option<&LabelSelector>,
+        field_selector: Option<&FieldSelector>,
+    ) -> Result<(ListResult, broadcast::Receiver<WatchEvent>)> {
+        let (txn, resource_version, receiver) = {
+            let _guard = self.view_lock.read();
+            let receiver = self.watches.subscribe(&gvr.key_prefix());
+            let resource_version = self.revision.current();
+            let txn = self.db.begin_read()?;
+            (txn, resource_version, receiver)
+        };
+        let (items, continue_token) =
+            list_scan(&txn, gvr, namespace, label_selector, field_selector, None, None)?;
+        Ok((
+            ListResult {
+                items,
+                resource_version,
+                continue_token,
+            },
+            receiver,
+        ))
+    }
+
+    /// Replay the events for `gvr` with `resourceVersion` greater than
+    /// `since_rv`, then subscribe to the live stream continuing from there.
+    /// Returns [`StoreError::TooOld`] when `since_rv` predates the retained
+    /// revision window.
     pub fn watch_from(
         &self,
         gvr: &GroupVersionResource,
         since_rv: u64,
-    ) -> Result<(Vec<WatchEvent>, broadcast::Receiver<WatchEvent>), crate::watch::TooOld> {
-        self.watches.subscribe_with_history(&gvr.key_prefix(), since_rv)
+    ) -> Result<(Vec<WatchEvent>, broadcast::Receiver<WatchEvent>)> {
+        let gvr_prefix = gvr.key_prefix();
+
+        let (txn, current, receiver) = {
+            let _guard = self.view_lock.read();
+            let receiver = self.watches.subscribe(&gvr_prefix);
+            let current = self.revision.current();
+            let txn = self.db.begin_read()?;
+            (txn, current, receiver)
+        };
+
+        if since_rv >= current {
+            return Ok((Vec::new(), receiver));
+        }
+
+        let watermark = current.saturating_sub(KEEP_REVISIONS);
+        if since_rv > 0 && since_rv < watermark {
+            return Err(StoreError::TooOld {
+                requested: since_rv,
+                oldest_available: watermark + 1,
+            });
+        }
+
+        let events = replay_since(&txn, &gvr_prefix, since_rv)?;
+        Ok((events, receiver))
+    }
+
+    /// Acquire a consistent read snapshot together with the matching
+    /// `resourceVersion`. The snapshot is pinned before the guard is released,
+    /// so the long scan that follows runs lock-free.
+    fn snapshot(&self) -> Result<(redb::ReadTransaction, u64)> {
+        let _guard = self.view_lock.read();
+        let resource_version = self.revision.current();
+        let txn = self.db.begin_read()?;
+        Ok((txn, resource_version))
     }
 }
 
-/// Remove the revision entry that just fell out of the keep window. Called
-/// inside the same write transaction that inserts `new_rev`, so history stays
-/// bounded at `KEEP_REVISIONS` entries without a separate compaction pass.
-fn prune_revision(
-    table: &mut redb::Table<'_, u64, &[u8]>,
-    new_rev: u64,
-) -> anyhow::Result<()> {
-    if let Some(stale) = new_rev.checked_sub(KEEP_REVISIONS) {
-        if stale > 0 {
-            table.remove(stale)?;
+fn list_scan(
+    txn: &redb::ReadTransaction,
+    gvr: &GroupVersionResource,
+    namespace: Option<&str>,
+    label_selector: Option<&LabelSelector>,
+    field_selector: Option<&FieldSelector>,
+    limit: Option<usize>,
+    continue_token: Option<&str>,
+) -> Result<(Vec<serde_json::Value>, Option<String>)> {
+    let gvr_prefix = gvr.key_prefix();
+    let scan_prefix = match namespace {
+        Some(ns) => format!("{gvr_prefix}/{ns}/"),
+        None => format!("{gvr_prefix}/"),
+    };
+
+    // The continue token is the last key of the previous page. Start strictly
+    // after it: if that key still exists it was already returned, and if it was
+    // deleted between pages the next key is correctly included rather than skipped.
+    let resume_after = continue_token.map(decode_continue_token).transpose()?;
+    let lower = match &resume_after {
+        Some(key) => Bound::Excluded(key.as_str()),
+        None => Bound::Included(scan_prefix.as_str()),
+    };
+
+    let table = txn.open_table(RESOURCES)?;
+    let mut items = Vec::new();
+    let mut last_key: Option<String> = None;
+
+    for entry in table.range::<&str>((lower, Bound::Unbounded))? {
+        let (key, value) = entry?;
+        let key = key.value();
+        if !key.starts_with(scan_prefix.as_str()) {
+            break;
+        }
+
+        let item: serde_json::Value = serde_json::from_slice(value.value())?;
+        if let Some(selector) = label_selector
+            && !selector.matches(&item)
+        {
+            continue;
+        }
+        if let Some(selector) = field_selector
+            && !selector.matches(&item, &gvr_prefix)
+        {
+            continue;
+        }
+
+        last_key = Some(key.to_string());
+        items.push(item);
+        if let Some(limit) = limit
+            && items.len() >= limit
+        {
+            break;
         }
     }
+
+    let continue_token = match limit {
+        Some(limit) if items.len() >= limit => last_key.map(encode_continue_token),
+        _ => None,
+    };
+    Ok((items, continue_token))
+}
+
+fn replay_since(
+    txn: &redb::ReadTransaction,
+    gvr_prefix: &str,
+    since_rv: u64,
+) -> Result<Vec<WatchEvent>> {
+    let key_prefix = format!("{gvr_prefix}/");
+    let table = txn.open_table(REVISIONS)?;
+    let mut events = Vec::new();
+    for entry in table.range(since_rv.saturating_add(1)..)? {
+        let (rev, bytes) = entry?;
+        let stored: RevisionEntry = serde_json::from_slice(bytes.value())?;
+        if !stored.key.starts_with(&key_prefix) {
+            continue;
+        }
+        events.push(WatchEvent {
+            event_type: stored.event_type,
+            resource_version: rev.value(),
+            object: Arc::new(stored.object),
+        });
+    }
+    Ok(events)
+}
+
+fn prune_revisions(table: &mut redb::Table<'_, u64, &[u8]>, current_rev: u64) -> Result<()> {
+    let watermark = current_rev.saturating_sub(KEEP_REVISIONS);
+    if watermark == 0 {
+        return Ok(());
+    }
+    let stale: Vec<u64> = table
+        .range(..=watermark)?
+        .map(|entry| entry.map(|(key, _)| key.value()))
+        .collect::<std::result::Result<_, redb::StorageError>>()?;
+    for key in stale {
+        table.remove(key)?;
+    }
     Ok(())
+}
+
+fn set_resource_version(obj: &mut serde_json::Value, rev: u64) {
+    if let Some(metadata) = obj.get_mut("metadata").and_then(|v| v.as_object_mut()) {
+        metadata.insert("resourceVersion".into(), rev.to_string().into());
+    }
+}
+
+fn resource_version(obj: &serde_json::Value) -> &str {
+    obj.get("metadata")
+        .and_then(|m| m.get("resourceVersion"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+}
+
+/// Whether two objects are equal once `metadata.resourceVersion` is disregarded
+/// on both sides. Compares structurally without cloning, since this runs on
+/// every update to detect no-op writes.
+fn equal_ignoring_revision(a: &serde_json::Value, b: &serde_json::Value) -> bool {
+    let (serde_json::Value::Object(a), serde_json::Value::Object(b)) = (a, b) else {
+        return a == b;
+    };
+    a.len() == b.len()
+        && a.iter().all(|(key, value)| match b.get(key) {
+            Some(other) if key == "metadata" => equal_metadata_ignoring_revision(value, other),
+            Some(other) => value == other,
+            None => false,
+        })
+}
+
+fn equal_metadata_ignoring_revision(a: &serde_json::Value, b: &serde_json::Value) -> bool {
+    let (serde_json::Value::Object(a), serde_json::Value::Object(b)) = (a, b) else {
+        return a == b;
+    };
+    let significant = |m: &serde_json::Map<String, serde_json::Value>| {
+        m.len() - usize::from(m.contains_key("resourceVersion"))
+    };
+    significant(a) == significant(b)
+        && a.iter()
+            .filter(|(key, _)| key.as_str() != "resourceVersion")
+            .all(|(key, value)| b.get(key) == Some(value))
+}
+
+fn encode_continue_token(key: String) -> String {
+    BASE64_STANDARD.encode(key)
+}
+
+fn decode_continue_token(token: &str) -> Result<String> {
+    let bytes = BASE64_STANDARD
+        .decode(token)
+        .map_err(|_| StoreError::InvalidContinueToken)?;
+    String::from_utf8(bytes).map_err(|_| StoreError::InvalidContinueToken)
 }

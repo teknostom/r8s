@@ -11,7 +11,6 @@ use hyper::StatusCode;
 use r8s_store::{
     backend::ResourceRef,
     index::{FieldSelector, LabelSelector},
-    watch::WatchEventType,
 };
 use r8s_types::ResourceType;
 use serde::Deserialize;
@@ -48,8 +47,7 @@ fn admission_error_response(err: AdmissionError) -> Response {
             // 2. Return a complete metav1.Status (kind/apiVersion/status:
             //    Failure), not the webhook's bare status fragment — otherwise
             //    client-go can't decode it and reports a generic "unknown".
-            let wrapped =
-                format!("admission webhook \"{webhook}\" denied the request: {message}");
+            let wrapped = format!("admission webhook \"{webhook}\" denied the request: {message}");
             let code = status
                 .as_ref()
                 .and_then(|s| s.get("code"))
@@ -61,8 +59,10 @@ fn admission_error_response(err: AdmissionError) -> Response {
                     obj.insert("kind".into(), serde_json::json!("Status"));
                     obj.insert("apiVersion".into(), serde_json::json!("v1"));
                     obj.insert("status".into(), serde_json::json!("Failure"));
-                    obj.entry("metadata").or_insert_with(|| serde_json::json!({}));
-                    obj.entry("reason").or_insert_with(|| serde_json::json!("Forbidden"));
+                    obj.entry("metadata")
+                        .or_insert_with(|| serde_json::json!({}));
+                    obj.entry("reason")
+                        .or_insert_with(|| serde_json::json!("Forbidden"));
                     obj.insert("message".into(), serde_json::json!(wrapped));
                     obj.entry("code").or_insert_with(|| serde_json::json!(code));
                     response::json_response(code, &serde_json::Value::Object(obj))
@@ -84,11 +84,9 @@ fn admission_error_response(err: AdmissionError) -> Response {
             "InternalError",
             &format!("admission webhook '{webhook}' returned invalid response: {error}"),
         ),
-        AdmissionError::Internal(msg) => response::status_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "InternalError",
-            &msg,
-        ),
+        AdmissionError::Internal(msg) => {
+            response::status_error(StatusCode::INTERNAL_SERVER_ERROR, "InternalError", &msg)
+        }
     }
 }
 
@@ -160,11 +158,9 @@ pub(crate) fn render_cri_log(raw: &str, timestamps: bool, tail_lines: Option<u64
         current.push_str(content);
         if tag == "F" {
             let mut out = String::new();
-            if timestamps {
-                if let Some(t) = current_ts {
-                    out.push_str(t);
-                    out.push(' ');
-                }
+            if timestamps && let Some(t) = current_ts {
+                out.push_str(t);
+                out.push(' ');
             }
             out.push_str(&current);
             entries.push(out);
@@ -175,11 +171,9 @@ pub(crate) fn render_cri_log(raw: &str, timestamps: bool, tail_lines: Option<u64
     // Trailing partial fragment (container hasn't flushed a newline yet).
     if !current.is_empty() {
         let mut out = String::new();
-        if timestamps {
-            if let Some(t) = current_ts {
-                out.push_str(t);
-                out.push(' ');
-            }
+        if timestamps && let Some(t) = current_ts {
+            out.push_str(t);
+            out.push(' ');
         }
         out.push_str(&current);
         entries.push(out);
@@ -285,19 +279,21 @@ pub(crate) fn require_json(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     if content_type.contains("protobuf") {
-        // We have hand-rolled protobuf-to-JSON converters for a small set of
-        // resource types (currently just CustomResourceDefinition — see
-        // `r8s_types::k8s_pb_serde::decode_k8s_protobuf_to_json`). For
-        // unsupported GVKs return 415 so the client falls back to JSON; a
-        // partial decode would silently drop `spec`/`status` and we'd rather
-        // be loud than wrong.
-        return r8s_types::k8s_pb_serde::decode_k8s_protobuf_to_json(body).ok_or_else(|| {
-            status_error(
+        // Decode to JSON: unknown GVKs get 415 (client retries with JSON),
+        // malformed bodies get 400.
+        use r8s_types::k8s_pb_serde::DecodeError;
+        return r8s_types::k8s_pb_serde::decode_k8s_protobuf_to_json(body).map_err(|e| match e {
+            DecodeError::UnsupportedGvk { .. } => status_error(
                 StatusCode::UNSUPPORTED_MEDIA_TYPE,
                 "UnsupportedMediaType",
                 "r8s does not yet accept application/vnd.kubernetes.protobuf request bodies \
                  for this resource type; retry with application/json",
-            )
+            ),
+            DecodeError::Malformed => status_error(
+                StatusCode::BAD_REQUEST,
+                "BadRequest",
+                "malformed application/vnd.kubernetes.protobuf request body",
+            ),
         });
     }
     serde_json::from_slice(body).map_err(|e| {
@@ -441,6 +437,26 @@ fn maybe_allocate_cluster_ip(state: &AppState, ctx: &RouteContext, body: &mut se
     }
 }
 
+/// Fill the system-owned metadata on create, mirroring upstream's
+/// `FillObjectMetaSystemFields`: after mutating admission, before validating
+/// admission. Ordering is load-bearing — validating webhooks must see the
+/// object as it will be persisted (ingress-nginx's validator rejects any
+/// Ingress whose UID isn't a well-formed UUID), while mutating webhooks run
+/// pre-UID exactly like upstream. Client-supplied values are overwritten;
+/// these fields are the server's, and the store keeps what's set here.
+fn fill_system_fields_on_create(body: &mut serde_json::Value) {
+    if let Some(meta) = body.get_mut("metadata").and_then(|v| v.as_object_mut()) {
+        meta.insert(
+            "uid".to_string(),
+            serde_json::json!(uuid::Uuid::new_v4().to_string()),
+        );
+        meta.insert(
+            "creationTimestamp".to_string(),
+            serde_json::json!(chrono::Utc::now().to_rfc3339()),
+        );
+    }
+}
+
 /// Default ServicePort fields the apiserver fills in but clients commonly
 /// omit: `protocol` → `TCP`, and `targetPort` → the `port` value. The protocol
 /// default in particular matters because controllers match a Service's ports
@@ -477,8 +493,11 @@ fn default_service_ports(ctx: &RouteContext, body: &mut serde_json::Value) {
 /// prometheus-operator reads `spec.scrapeInterval` expecting the CRD default
 /// `30s`, and emits an invalid `scrape_interval: ""` without it.
 fn default_cr(ctx: &RouteContext, body: &mut serde_json::Value) {
-    if r8s_types::openapi::spec_bytes_for(&ctx.resource_type.gvr.group, &ctx.resource_type.gvr.version)
-        .is_some()
+    if r8s_types::openapi::spec_bytes_for(
+        &ctx.resource_type.gvr.group,
+        &ctx.resource_type.gvr.version,
+    )
+    .is_some()
     {
         return;
     }
@@ -491,14 +510,15 @@ fn default_cr(ctx: &RouteContext, body: &mut serde_json::Value) {
 /// Skipped for built-in resources (their vendored schemas are very strict and
 /// we don't currently want to reject otherwise-valid input there).
 fn validate_cr(ctx: &RouteContext, body: &serde_json::Value) -> Option<Response> {
-    if r8s_types::openapi::spec_bytes_for(&ctx.resource_type.gvr.group, &ctx.resource_type.gvr.version)
-        .is_some()
+    if r8s_types::openapi::spec_bytes_for(
+        &ctx.resource_type.gvr.group,
+        &ctx.resource_type.gvr.version,
+    )
+    .is_some()
     {
         return None;
     }
-    let Some(schema) = ctx.resource_type.schema.as_ref() else {
-        return None;
-    };
+    let schema = ctx.resource_type.schema.as_ref()?;
     match crate::schema_validate::validate(body, schema) {
         Ok(()) => None,
         Err(msg) => Some(status_error(
@@ -604,6 +624,7 @@ pub(crate) async fn create_impl(
     if let Err(e) = admission::invoke_mutating(&admission_ctx, &mut body, None).await {
         return admission_error_response(e);
     }
+    fill_system_fields_on_create(&mut body);
     if let Err(e) = admission::invoke_validating(&admission_ctx, &body, None).await {
         return admission_error_response(e);
     }
@@ -616,12 +637,8 @@ pub(crate) async fn create_impl(
     // hard limit in the namespace. Cluster-scoped resources skip the check
     // entirely (quotas only constrain namespaced state).
     if let Some(ns) = namespace
-        && let Err(msg) = r8s_controllers::quota::check_admission(
-            &state.store,
-            &ctx.resource_type.gvr,
-            ns,
-            &body,
-        )
+        && let Err(msg) =
+            r8s_controllers::quota::check_admission(&state.store, &ctx.resource_type.gvr, ns, &body)
     {
         return response::status_error(StatusCode::FORBIDDEN, "Forbidden", &msg);
     }
@@ -713,14 +730,11 @@ pub(crate) async fn update_impl(
         dry_run,
         user_info: serde_json::json!({}),
     };
-    if let Err(e) =
-        admission::invoke_mutating(&admission_ctx, &mut body, old_object.as_ref()).await
+    if let Err(e) = admission::invoke_mutating(&admission_ctx, &mut body, old_object.as_ref()).await
     {
         return admission_error_response(e);
     }
-    if let Err(e) =
-        admission::invoke_validating(&admission_ctx, &body, old_object.as_ref()).await
-    {
+    if let Err(e) = admission::invoke_validating(&admission_ctx, &body, old_object.as_ref()).await {
         return admission_error_response(e);
     }
     if let Some(resp) = validate_cr(ctx, &body) {
@@ -778,7 +792,7 @@ pub(crate) async fn delete_collection_impl(
         .field_selector
         .as_deref()
         .filter(|s| !s.is_empty())
-        .map(FieldSelector::parse)
+        .map(parse_field_selector)
         .transpose()
     {
         Ok(s) => s,
@@ -906,7 +920,10 @@ pub(crate) fn status_put_impl(
         }
         Err(err) => return response::anyhow_error_response(err),
     };
-    let new_status = body.get("status").cloned().unwrap_or(serde_json::Value::Null);
+    let new_status = body
+        .get("status")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
     if let Some(obj) = current.as_object_mut() {
         if matches!(new_status, serde_json::Value::Null) {
             obj.remove("status");
@@ -1033,7 +1050,8 @@ pub(crate) fn extract_propagation_policy(
         }
     }
     // 2. JSON body (DELETE may carry a DeleteOptions object).
-    if !body.is_empty() && !content_type.contains("protobuf")
+    if !body.is_empty()
+        && !content_type.contains("protobuf")
         && let Ok(v) = serde_json::from_slice::<serde_json::Value>(body)
     {
         if let Some(p) = v
@@ -1064,10 +1082,7 @@ fn orphan_dependents(state: &AppState, uid: &str) {
         return;
     }
     for rt in state.registry.iter() {
-        let items = match state
-            .store
-            .list(&rt.gvr, None, None, None, None, None)
-        {
+        let items = match state.store.list(&rt.gvr, None, None, None, None, None) {
             Ok(r) => r.items,
             Err(_) => continue,
         };
@@ -1110,7 +1125,10 @@ fn orphan_dependents(state: &AppState, uid: &str) {
                 if new_refs.is_empty() {
                     meta.remove("ownerReferences");
                 } else {
-                    meta.insert("ownerReferences".to_string(), serde_json::Value::Array(new_refs));
+                    meta.insert(
+                        "ownerReferences".to_string(),
+                        serde_json::Value::Array(new_refs),
+                    );
                 }
                 // Blind write — the store would otherwise reject if a
                 // controller raced our list-snapshot with another update.
@@ -1167,9 +1185,7 @@ pub(crate) async fn delete_impl(
         dry_run,
         user_info: serde_json::json!({}),
     };
-    if let Err(e) =
-        admission::invoke_validating(&admission_ctx, &existing, Some(&existing)).await
-    {
+    if let Err(e) = admission::invoke_validating(&admission_ctx, &existing, Some(&existing)).await {
         return admission_error_response(e);
     }
 
@@ -1250,9 +1266,11 @@ fn mark_foreground_deletion(obj: &mut serde_json::Value) -> bool {
     if let Some(arr) = finalizers.as_array_mut() {
         let has = arr
             .iter()
-            .any(|v| v.as_str() == Some("foregroundDeletion"));
+            .any(|v| v.as_str() == Some(r8s_types::FOREGROUND_FINALIZER));
         if !has {
-            arr.push(serde_json::Value::String("foregroundDeletion".into()));
+            arr.push(serde_json::Value::String(
+                r8s_types::FOREGROUND_FINALIZER.into(),
+            ));
             changed = true;
         }
     }
@@ -1354,8 +1372,8 @@ pub(crate) async fn patch_impl(
             } else {
                 json_merge_patch(&mut current, &patch);
             }
-            if !patch_carries_rv && let Some(meta) =
-                current.get_mut("metadata").and_then(|v| v.as_object_mut())
+            if !patch_carries_rv
+                && let Some(meta) = current.get_mut("metadata").and_then(|v| v.as_object_mut())
             {
                 meta.remove("resourceVersion");
             }
@@ -1370,8 +1388,7 @@ pub(crate) async fn patch_impl(
                 user_info: serde_json::json!({}),
             };
             if let Err(e) =
-                admission::invoke_mutating(&admission_ctx, &mut current, Some(&old_object))
-                    .await
+                admission::invoke_mutating(&admission_ctx, &mut current, Some(&old_object)).await
             {
                 return admission_error_response(e);
             }
@@ -1415,7 +1432,7 @@ pub(crate) async fn patch_impl(
                 obj.insert("metadata".to_string(), serde_json::Value::Object(meta));
             }
             maybe_allocate_cluster_ip(state, ctx, &mut body);
-    default_service_ports(ctx, &mut body);
+            default_service_ports(ctx, &mut body);
             default_cr(ctx, &mut body);
             let admission_ctx = AdmissionCtx {
                 store: &state.store,
@@ -1430,6 +1447,7 @@ pub(crate) async fn patch_impl(
             if let Err(e) = admission::invoke_mutating(&admission_ctx, &mut body, None).await {
                 return admission_error_response(e);
             }
+            fill_system_fields_on_create(&mut body);
             if let Err(e) = admission::invoke_validating(&admission_ctx, &body, None).await {
                 return admission_error_response(e);
             }
@@ -1521,7 +1539,7 @@ pub(crate) fn list_impl(
         .field_selector
         .as_deref()
         .filter(|s| !s.is_empty())
-        .map(FieldSelector::parse)
+        .map(parse_field_selector)
         .transpose();
     let field_sel = match field_sel {
         Ok(s) => s,
@@ -1549,7 +1567,11 @@ pub(crate) fn list_impl(
                     Some(result.resource_version),
                 )
             } else if wants_partial_metadata(headers) {
-                let items: Vec<_> = result.items.iter().map(to_partial_object_metadata).collect();
+                let items: Vec<_> = result
+                    .items
+                    .iter()
+                    .map(to_partial_object_metadata)
+                    .collect();
                 response::list_response(
                     "meta.k8s.io/v1",
                     "PartialObjectMetadata",
@@ -1569,6 +1591,22 @@ pub(crate) fn list_impl(
         }
         Err(err) => response::anyhow_error_response(err),
     }
+}
+
+/// Field-default policy for built-in Kubernetes types: the value to assume when
+/// an object omits a selectable field, mirroring apiserver defaulting. The store
+/// is type-agnostic and injects this when building a field selector.
+fn k8s_field_defaults(gvr: &str, field: &str) -> Option<String> {
+    match (gvr, field) {
+        ("/v1/nodes", "spec.unschedulable") => Some("false".to_string()),
+        ("/v1/pods", "spec.nodeName") => Some(String::new()),
+        _ => None,
+    }
+}
+
+/// Parse a field selector and attach this distribution's field defaults.
+fn parse_field_selector(raw: &str) -> r8s_store::error::Result<FieldSelector> {
+    FieldSelector::parse(raw).map(|selector| selector.with_defaults(k8s_field_defaults))
 }
 
 /// Apply the namespace path component plus the optional label/field selectors
@@ -1629,7 +1667,7 @@ fn watch_impl(
     };
     let field_sel = match field_selector
         .filter(|s| !s.is_empty())
-        .map(FieldSelector::parse)
+        .map(parse_field_selector)
         .transpose()
     {
         Ok(s) => s.map(std::sync::Arc::new),
@@ -1663,33 +1701,19 @@ fn watch_impl(
     };
 
     let (items, rv, history, rx) = if replay_initial {
-        let rx = state.store.watch(&ctx.resource_type.gvr);
-        let (items, rv) = state
-            .store
-            .list(
-                &ctx.resource_type.gvr,
-                namespace,
-                label_sel.as_deref(),
-                field_sel.as_deref(),
-                None,
-                None,
-            )
-            .map(|r| (r.items, r.resource_version))
-            .unwrap_or_default();
-        (items, rv, Vec::new(), rx)
+        match state.store.list_and_watch(
+            &ctx.resource_type.gvr,
+            namespace,
+            label_sel.as_deref(),
+            field_sel.as_deref(),
+        ) {
+            Ok((result, rx)) => (result.items, result.resource_version, Vec::new(), rx),
+            Err(err) => return response::store_error_response(&err),
+        }
     } else {
         match state.store.watch_from(&ctx.resource_type.gvr, since_rv) {
             Ok((history, rx)) => (Vec::new(), since_rv, history, rx),
-            Err(too_old) => {
-                return response::status_error(
-                    StatusCode::GONE,
-                    "Expired",
-                    &format!(
-                        "too old resource version: {} ({})",
-                        too_old.requested, too_old.oldest_available
-                    ),
-                );
-            }
+            Err(err) => return response::store_error_response(&err),
         }
     };
 
@@ -1736,11 +1760,7 @@ fn watch_impl(
         ) {
             return None;
         }
-        let type_str = match event.event_type {
-            WatchEventType::Added => "ADDED",
-            WatchEventType::Modified => "MODIFIED",
-            WatchEventType::Deleted => "DELETED",
-        };
+        let type_str = event.event_type.as_k8s_str();
         let payload = format_history(&event.object);
         Some(Ok::<_, std::io::Error>(response::watch_event_line(
             type_str, &payload,
@@ -1775,9 +1795,10 @@ fn watch_impl(
             "metadata": bookmark_meta,
         });
         let bookmark_formatted = format_object(&bookmark_obj);
-        tokio_stream::iter(Some(Ok::<_, std::io::Error>(
-            response::watch_event_line("BOOKMARK", &bookmark_formatted),
-        )))
+        tokio_stream::iter(Some(Ok::<_, std::io::Error>(response::watch_event_line(
+            "BOOKMARK",
+            &bookmark_formatted,
+        ))))
     } else {
         tokio_stream::iter(None)
     };
@@ -1800,11 +1821,7 @@ fn watch_impl(
             ) {
                 return None;
             }
-            let type_str = match event.event_type {
-                WatchEventType::Added => "ADDED",
-                WatchEventType::Modified => "MODIFIED",
-                WatchEventType::Deleted => "DELETED",
-            };
+            let type_str = event.event_type.as_k8s_str();
             let payload = format_object(&event.object);
             Some(Ok::<_, std::io::Error>(response::watch_event_line(
                 type_str, &payload,
@@ -1929,4 +1946,31 @@ pub async fn pod_logs_ns(
         .header("content-type", "text/plain")
         .body(Body::from(output))
         .expect("valid response")
+}
+
+#[cfg(test)]
+mod field_default_tests {
+    use super::parse_field_selector;
+
+    #[test]
+    fn node_unschedulable_defaults_to_false() {
+        let sel = parse_field_selector("spec.unschedulable=false").unwrap();
+        let node = serde_json::json!({"metadata": {"name": "n1"}, "spec": {}});
+        assert!(
+            sel.matches(&node, "/v1/nodes"),
+            "absent spec.unschedulable on a Node must match `=false`"
+        );
+
+        let cordoned =
+            serde_json::json!({"metadata": {"name": "n2"}, "spec": {"unschedulable": true}});
+        assert!(!sel.matches(&cordoned, "/v1/nodes"));
+    }
+
+    #[test]
+    fn defaults_do_not_leak_across_types() {
+        // The node default must not apply to an unrelated type.
+        let sel = parse_field_selector("spec.unschedulable=false").unwrap();
+        let other = serde_json::json!({"metadata": {"name": "x"}, "spec": {}});
+        assert!(!sel.matches(&other, "/v1/configmaps"));
+    }
 }

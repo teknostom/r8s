@@ -1,14 +1,10 @@
-//! Vendored upstream Kubernetes OpenAPI v3 schemas, matching the k8s version
-//! pinned by k8s_openapi (currently v1.32). Used to attach a schema to each
-//! built-in ResourceType so the API server can serve /openapi/v3 and validate
-//! incoming objects at admission time.
+//! Vendored Kubernetes OpenAPI v3 schemas (k8s v1.32), used to attach a schema
+//! to each built-in ResourceType for /openapi/v3 and admission validation.
 
 use rustc_hash::FxHashMap;
 use std::sync::OnceLock;
 
-/// Spec files vendored from kubernetes/kubernetes@release-1.32, paired with
-/// the (group, version) they describe so /openapi/v3 handlers can find them.
-/// One entry per group/version that r8s exposes a built-in resource for.
+/// Vendored spec files, keyed by the (group, version) they describe.
 pub const SPEC_FILES: &[(&str, &str, &[u8])] = &[
     (
         "",
@@ -57,8 +53,7 @@ pub const SPEC_FILES: &[(&str, &str, &[u8])] = &[
     ),
 ];
 
-/// Returns the raw vendored OpenAPI v3 spec bytes for a built-in (group, version),
-/// or `None` if r8s has no vendored spec for that GV (e.g. a CRD group).
+/// Raw OpenAPI v3 spec bytes for a (group, version); `None` if not vendored.
 pub fn spec_bytes_for(group: &str, version: &str) -> Option<&'static [u8]> {
     SPEC_FILES
         .iter()
@@ -66,9 +61,7 @@ pub fn spec_bytes_for(group: &str, version: &str) -> Option<&'static [u8]> {
         .map(|(_, _, b)| *b)
 }
 
-/// Vendored OpenAPI v2 (Swagger 2.0) spec covering every built-in resource in
-/// this k8s version. CRD schemas are merged into a clone of this at request
-/// time by the API server.
+/// Vendored OpenAPI v2 (Swagger 2.0) spec for all built-in resources.
 pub const SWAGGER_V2_JSON: &[u8] = include_bytes!("../openapi/v2/swagger.json");
 
 /// Key: (group, version, kind). Empty string for the core group.
@@ -78,11 +71,10 @@ static INDEX: OnceLock<FxHashMap<GvkKey, serde_json::Value>> = OnceLock::new();
 
 fn build_index() -> FxHashMap<GvkKey, serde_json::Value> {
     let mut index = FxHashMap::default();
-    for &(_, _, bytes) in SPEC_FILES {
-        let spec: serde_json::Value = match serde_json::from_slice(bytes) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
+    for &(group, version, bytes) in SPEC_FILES {
+        let spec: serde_json::Value = serde_json::from_slice(bytes).unwrap_or_else(|e| {
+            panic!("vendored OpenAPI spec for {group}/{version} is invalid JSON: {e}")
+        });
         let schemas = match spec
             .get("components")
             .and_then(|c| c.get("schemas"))
@@ -120,8 +112,7 @@ fn build_index() -> FxHashMap<GvkKey, serde_json::Value> {
     index
 }
 
-/// Look up the OpenAPI v3 schema for a built-in resource by GVK. Returns
-/// `None` for kinds we don't have a vendored spec for (e.g. CRDs).
+/// OpenAPI v3 schema for a built-in resource by GVK; `None` if not vendored.
 pub fn schema_for(group: &str, version: &str, kind: &str) -> Option<serde_json::Value> {
     let index = INDEX.get_or_init(build_index);
     index

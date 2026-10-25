@@ -6,8 +6,9 @@
 //! we stand up a tiny HTTPS server here that reads the same numbers from
 //! cgroup v2 (per container, via its PID) and `/proc` (node total).
 //!
-//! Bind address / port must match the node's `status.addresses` +
-//! `daemonEndpoints` (see r8s-scheduler's register_node).
+//! Bind address and port come from `r8s_types::{NODE_INTERNAL_IP,
+//! KUBELET_PORT}`, the same constants the node advertises in `status.addresses`
+//! and `daemonEndpoints`.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -16,11 +17,8 @@ use axum::{Router, extract::State, response::IntoResponse, routing::get};
 use axum_server::tls_rustls::RustlsConfig;
 use r8s_runtime::{ContainerId, ContainerRuntime};
 use r8s_store::Store;
-use r8s_types::GroupVersionResource;
+use r8s_types::{GroupVersionResource, KUBELET_PORT, NODE_INTERNAL_IP};
 
-/// Node InternalIP / kubelet port — must match r8s-scheduler::register_node.
-const BIND_IP: &str = "10.244.0.1";
-const BIND_PORT: u16 = 10250;
 /// USER_HZ on Linux (clock ticks per second for /proc/stat).
 const USER_HZ: f64 = 100.0;
 
@@ -46,7 +44,7 @@ pub async fn run<R: ContainerRuntime + 'static>(
         // metrics-server also probes /healthz on some paths; be friendly.
         .route("/healthz", get(|| async { "ok" }))
         .with_state(state);
-    let addr: SocketAddr = format!("{BIND_IP}:{BIND_PORT}").parse()?;
+    let addr: SocketAddr = format!("{NODE_INTERNAL_IP}:{KUBELET_PORT}").parse()?;
     tracing::info!(%addr, "kubelet metrics server listening");
     axum_server::bind_rustls(addr, config)
         .serve(app.into_make_service())
@@ -66,7 +64,9 @@ async fn metrics_resource<R: ContainerRuntime + 'static>(
     if let Some(cpu) = node_cpu_seconds() {
         out.push_str(&format!("node_cpu_usage_seconds_total {cpu} {ts}\n"));
     }
-    out.push_str("# HELP node_memory_working_set_bytes [ALPHA] Current working set of the node in bytes\n");
+    out.push_str(
+        "# HELP node_memory_working_set_bytes [ALPHA] Current working set of the node in bytes\n",
+    );
     out.push_str("# TYPE node_memory_working_set_bytes gauge\n");
     if let Some(mem) = node_memory_working_set() {
         out.push_str(&format!("node_memory_working_set_bytes {mem} {ts}\n"));
@@ -86,16 +86,18 @@ async fn metrics_resource<R: ContainerRuntime + 'static>(
         let Some((cpu, mem)) = container_cgroup_stats(pid) else {
             continue;
         };
-        let labels = format!("{{container=\"{container}\",namespace=\"{namespace}\",pod=\"{pod}\"}}");
-        out.push_str(&format!("container_cpu_usage_seconds_total{labels} {cpu} {ts}\n"));
-        mem_lines.push_str(&format!("container_memory_working_set_bytes{labels} {mem} {ts}\n"));
+        let labels =
+            format!("{{container=\"{container}\",namespace=\"{namespace}\",pod=\"{pod}\"}}");
+        out.push_str(&format!(
+            "container_cpu_usage_seconds_total{labels} {cpu} {ts}\n"
+        ));
+        mem_lines.push_str(&format!(
+            "container_memory_working_set_bytes{labels} {mem} {ts}\n"
+        ));
     }
     out.push_str(&mem_lines);
 
-    (
-        [("content-type", "text/plain; version=0.0.4")],
-        out,
-    )
+    ([("content-type", "text/plain; version=0.0.4")], out)
 }
 
 /// (namespace, pod, container, container_id) for every running container.

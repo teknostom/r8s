@@ -18,6 +18,7 @@ rustc-hash.workspace = true
 rand.workspace = true
 chrono.workspace = true
 base64.workspace = true
+chrono-tz.workspace = true
 rcgen.workspace = true
 time.workspace = true # pin-only: constrains rcgen's transitive time dep (<0.3.48); see root Cargo.toml
 

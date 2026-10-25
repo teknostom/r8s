@@ -264,7 +264,7 @@ async fn deployment_rolling_update_respects_surge() {
             if !is_owned_by(&event.object, &deploy_uid) {
                 continue;
             }
-            break event.object;
+            break event.object.as_ref().clone();
         }
     })
     .await

@@ -1,19 +1,13 @@
+use std::net::Ipv4Addr;
 use std::process::Command;
 
 use r8s_store::Store;
-use r8s_types::{Endpoints, GroupVersionResource, IntOrString, Service};
+use r8s_types::{BRIDGE_NAME, GroupVersionResource, IntOrString, POD_CIDR, Service, nft_table_name};
 
-/// nft identifier rules are `[A-Za-z][A-Za-z0-9_]*`; data-dir basenames can
-/// contain dashes/dots. Return a per-cluster table name that always parses.
-pub fn nft_table_name(cluster: &str) -> String {
-    let sanitized: String = cluster
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-        .collect();
-    format!("r8s_{sanitized}")
-}
+use crate::endpoints::ready_endpoint_addresses;
+use crate::error::{NetworkError, Result};
 
-pub fn setup_nat_table(cluster: &str) -> anyhow::Result<()> {
+pub fn setup_nat_table(cluster: &str) -> Result<()> {
     let table = nft_table_name(cluster);
     let _ = nft(&["delete", "table", "ip", &table]);
 
@@ -52,10 +46,10 @@ pub fn setup_nat_table(cluster: &str) -> anyhow::Result<()> {
         "postrouting",
         "ip",
         "saddr",
-        "10.244.0.0/24",
+        POD_CIDR,
         "oifname",
         "!=",
-        "r8s0",
+        BRIDGE_NAME,
         "masquerade",
     ])?;
 
@@ -69,12 +63,12 @@ pub fn setup_nat_table(cluster: &str) -> anyhow::Result<()> {
         "postrouting",
         "ip",
         "saddr",
-        "10.244.0.0/24",
+        POD_CIDR,
         "ip",
         "daddr",
-        "10.244.0.0/24",
+        POD_CIDR,
         "oifname",
-        "r8s0",
+        BRIDGE_NAME,
         "masquerade",
     ])?;
 
@@ -82,7 +76,7 @@ pub fn setup_nat_table(cluster: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn sync_service_rules(store: &Store, cluster: &str) -> anyhow::Result<()> {
+pub fn sync_service_rules(store: &Store, cluster: &str) -> Result<()> {
     let table = nft_table_name(cluster);
     // Flush only DNAT chains -- postrouting masquerade rules live in a separate chain
     let _ = nft(&["flush", "chain", "ip", &table, "prerouting"]);
@@ -175,7 +169,7 @@ pub fn sync_service_rules(store: &Store, cluster: &str) -> anyhow::Result<()> {
                     "prerouting",
                     "iifname",
                     "!=",
-                    "r8s0",
+                    BRIDGE_NAME,
                     &proto,
                     "dport",
                     &svc_port_str,
@@ -209,29 +203,14 @@ pub fn cleanup(cluster: &str) {
     tracing::info!(table, "nftables table removed");
 }
 
-fn endpoint_ips(store: &Store, namespace: Option<&str>, service_name: &str) -> Vec<String> {
-    let gvr = GroupVersionResource::endpoints();
-    let ep_ref = r8s_store::backend::ResourceRef {
-        gvr: &gvr,
-        namespace,
-        name: service_name,
-    };
-
-    let ep: Endpoints = match store.get_as::<Endpoints>(&ep_ref) {
-        Ok(Some(ep)) => ep,
-        _ => return Vec::new(),
-    };
-
-    ep.subsets
-        .as_deref()
-        .unwrap_or_default()
-        .iter()
-        .flat_map(|s| s.addresses.as_deref().unwrap_or_default().iter())
-        .map(|a| a.ip.clone())
+fn endpoint_ips(store: &Store, namespace: Option<&str>, service_name: &str) -> Vec<Ipv4Addr> {
+    ready_endpoint_addresses(store, namespace, service_name)
+        .into_iter()
+        .map(|a| a.ip)
         .collect()
 }
 
-fn build_dnat_target(pod_ips: &[String], target_port: u64) -> String {
+fn build_dnat_target(pod_ips: &[Ipv4Addr], target_port: u64) -> String {
     if pod_ips.len() == 1 {
         return format!("{}:{target_port}", pod_ips[0]);
     }
@@ -247,11 +226,14 @@ fn build_dnat_target(pod_ips: &[String], target_port: u64) -> String {
     )
 }
 
-fn nft(args: &[&str]) -> anyhow::Result<()> {
+fn nft(args: &[&str]) -> Result<()> {
     let output = Command::new("nft").args(args).output()?;
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("nft {}: {stderr}", args.join(" "));
+        return Err(NetworkError::Command {
+            cmd: "nft".to_string(),
+            args: args.join(" "),
+            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        });
     }
     Ok(())
 }
@@ -260,10 +242,21 @@ fn nft(args: &[&str]) -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
+    fn ip(n: u8) -> Ipv4Addr {
+        Ipv4Addr::new(10, 244, 0, n)
+    }
+
     #[test]
-    fn nft_table_name_sanitizes() {
-        assert_eq!(nft_table_name("default"), "r8s_default");
-        assert_eq!(nft_table_name("my-cluster.1"), "r8s_my_cluster_1");
-        assert_eq!(nft_table_name(""), "r8s_");
+    fn single_backend_is_a_plain_dnat_target() {
+        assert_eq!(build_dnat_target(&[ip(10)], 8080), "10.244.0.10:8080");
+    }
+
+    #[test]
+    fn multiple_backends_load_balance_via_numgen_map() {
+        let got = build_dnat_target(&[ip(10), ip(11), ip(12)], 80);
+        assert_eq!(
+            got,
+            "numgen inc mod 3 map { 0 : 10.244.0.10:80, 1 : 10.244.0.11:80, 2 : 10.244.0.12:80 }"
+        );
     }
 }

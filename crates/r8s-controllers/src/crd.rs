@@ -27,7 +27,7 @@ pub async fn run(
                 match event {
                     Ok(event) => {
                         let crd: Result<CustomResourceDefinition, _> =
-                            serde_json::from_value(event.object);
+                            serde_json::from_value(event.object.as_ref().clone());
                         let Ok(crd) = crd else { continue };
                         match event.event_type {
                             WatchEventType::Added | WatchEventType::Modified => {
@@ -40,6 +40,7 @@ pub async fn run(
                                 mark_established(&store, &crd);
                             }
                             WatchEventType::Deleted => {
+                                delete_instances(&store, &crd);
                                 unregister_crd(&registry, &crd);
                             }
                         }
@@ -160,6 +161,44 @@ fn register_crd(registry: &ResourceRegistry, crd: &CustomResourceDefinition) {
     }
 }
 
+/// Delete every stored custom resource of a CRD being removed. Upstream GCs a
+/// CRD's instances when the definition goes away; without this they'd linger in
+/// the store under a GVR nothing can serve or reach.
+fn delete_instances(store: &Store, crd: &CustomResourceDefinition) {
+    let spec = &crd.spec;
+    let mut deleted = 0u32;
+    for ver in &spec.versions {
+        let gvr = GroupVersionResource::new(&spec.group, &ver.name, &spec.names.plural);
+        let items = match store.list(&gvr, None, None, None, None, None) {
+            Ok(r) => r.items,
+            Err(_) => continue,
+        };
+        for item in &items {
+            let meta = item.get("metadata");
+            let Some(name) = meta.and_then(|m| m.get("name")).and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let namespace = meta.and_then(|m| m.get("namespace")).and_then(|v| v.as_str());
+            if matches!(
+                store.delete(&ResourceRef {
+                    gvr: &gvr,
+                    namespace,
+                    name,
+                }),
+                Ok(Some(_))
+            ) {
+                deleted += 1;
+            }
+        }
+    }
+    if deleted > 0 {
+        tracing::info!(
+            "crd '{}' deleted: removed {deleted} custom resource(s)",
+            crd.metadata.name.as_deref().unwrap_or("")
+        );
+    }
+}
+
 fn unregister_crd(registry: &ResourceRegistry, crd: &CustomResourceDefinition) {
     let spec = &crd.spec;
     // Sweep every GVR matching this CRD's (group, plural) — not just the
@@ -179,5 +218,54 @@ fn unregister_crd(registry: &ResourceRegistry, crd: &CustomResourceDefinition) {
             gvr.resource,
         );
         registry.unregister(&gvr);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn crd_deletion_reaps_instances() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("s.db")).unwrap();
+
+        let crd: CustomResourceDefinition = serde_json::from_value(json!({
+            "apiVersion": "apiextensions.k8s.io/v1", "kind": "CustomResourceDefinition",
+            "metadata": {"name": "widgets.example.com"},
+            "spec": {
+                "group": "example.com",
+                "names": {"plural": "widgets", "singular": "widget", "kind": "Widget"},
+                "scope": "Namespaced",
+                "versions": [{"name": "v1", "served": true, "storage": true}]
+            }
+        }))
+        .unwrap();
+
+        let gvr = GroupVersionResource::new("example.com", "v1", "widgets");
+        for name in ["w1", "w2"] {
+            store
+                .create(
+                    ResourceRef {
+                        gvr: &gvr,
+                        namespace: Some("default"),
+                        name,
+                    },
+                    &json!({
+                        "apiVersion": "example.com/v1", "kind": "Widget",
+                        "metadata": {"name": name, "namespace": "default"}
+                    }),
+                )
+                .unwrap();
+        }
+
+        delete_instances(&store, &crd);
+
+        assert_eq!(
+            store.list(&gvr, None, None, None, None, None).unwrap().items.len(),
+            0,
+            "all custom resources reaped on CRD deletion"
+        );
     }
 }

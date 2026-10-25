@@ -71,13 +71,7 @@ pub async fn exec_probe<R: ContainerRuntime>(
     true
 }
 
-async fn http_get_probe(
-    host: &str,
-    port: i32,
-    path: &str,
-    timeout: Duration,
-    https: bool,
-) -> bool {
+async fn http_get_probe(host: &str, port: i32, path: &str, timeout: Duration, https: bool) -> bool {
     let addr = format!("{host}:{port}");
     let result = tokio::time::timeout(timeout, async {
         let tcp = TcpStream::connect(&addr).await?;
@@ -187,4 +181,3 @@ async fn tcp_probe(host: &str, port: i32, timeout: Duration) -> bool {
         .await
         .is_ok_and(|r| r.is_ok())
 }
-

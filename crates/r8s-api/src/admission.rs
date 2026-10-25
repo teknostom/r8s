@@ -305,11 +305,7 @@ fn matches_rules(rules: Option<&Value>, ctx: &AdmissionCtx<'_>) -> bool {
         let ops = rule
             .get("operations")
             .and_then(|v| v.as_array())
-            .map(|a| {
-                a.iter()
-                    .filter_map(|v| v.as_str())
-                    .collect::<Vec<_>>()
-            })
+            .map(|a| a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>())
             .unwrap_or_default();
         if !ops.iter().any(|s| *s == "*" || *s == op) {
             continue;
@@ -319,10 +315,7 @@ fn matches_rules(rules: Option<&Value>, ctx: &AdmissionCtx<'_>) -> bool {
             continue;
         }
         let versions = string_list(rule.get("apiVersions"));
-        if !versions
-            .iter()
-            .any(|s| s == "*" || s == &ctx.gvr.version)
-        {
+        if !versions.iter().any(|s| s == "*" || s == &ctx.gvr.version) {
             continue;
         }
         let resources = string_list(rule.get("resources"));
@@ -467,8 +460,12 @@ async fn call_webhook(
     let review = build_admission_review(&uid, ctx, object, old_object);
     let body = serde_json::to_vec(&review).map_err(|e| AdmissionError::Internal(e.to_string()))?;
 
-    let (ip, port) =
-        resolve_service_endpoint(ctx.store, &m.service_namespace, &m.service_name, m.service_port)?;
+    let (ip, port) = resolve_service_endpoint(
+        ctx.store,
+        &m.service_namespace,
+        &m.service_name,
+        m.service_port,
+    )?;
     let host = format!("{}.{}.svc", m.service_name, m.service_namespace);
 
     let raw = timeout(
@@ -485,22 +482,22 @@ async fn call_webhook(
         error: e,
     })?;
 
-    let parsed: Value = serde_json::from_slice(&raw).map_err(|e| {
-        AdmissionError::InvalidResponse {
+    let parsed: Value =
+        serde_json::from_slice(&raw).map_err(|e| AdmissionError::InvalidResponse {
             webhook: m.name.clone(),
             error: format!("body json: {e}"),
-        }
-    })?;
-    let response = parsed.get("response").ok_or_else(|| AdmissionError::InvalidResponse {
-        webhook: m.name.clone(),
-        error: "missing 'response'".into(),
-    })?;
-    let resp: WebhookResp = serde_json::from_value(response.clone()).map_err(|e| {
-        AdmissionError::InvalidResponse {
+        })?;
+    let response = parsed
+        .get("response")
+        .ok_or_else(|| AdmissionError::InvalidResponse {
+            webhook: m.name.clone(),
+            error: "missing 'response'".into(),
+        })?;
+    let resp: WebhookResp =
+        serde_json::from_value(response.clone()).map_err(|e| AdmissionError::InvalidResponse {
             webhook: m.name.clone(),
             error: format!("response shape: {e}"),
-        }
-    })?;
+        })?;
     Ok(ParsedResponse {
         allowed: resp.allowed,
         patch: resp.patch,
@@ -617,8 +614,7 @@ pub(crate) fn resolve_service_endpoint(
         .cloned()
         .unwrap_or(Value::from(svc_port));
 
-    let slice_gvr =
-        GroupVersionResource::new("discovery.k8s.io", "v1", "endpointslices");
+    let slice_gvr = GroupVersionResource::new("discovery.k8s.io", "v1", "endpointslices");
     let slices = store
         .list(&slice_gvr, Some(ns), None, None, None, None)
         .map_err(|e| AdmissionError::Internal(format!("list endpointslices: {e}")))?;
@@ -634,9 +630,7 @@ pub(crate) fn resolve_service_endpoint(
                 == Some(name)
         })
         .ok_or_else(|| {
-            AdmissionError::Internal(format!(
-                "no endpointslice for service {ns}/{name}"
-            ))
+            AdmissionError::Internal(format!("no endpointslice for service {ns}/{name}"))
         })?;
     let endpoint = slice
         .get("endpoints")
@@ -697,7 +691,12 @@ pub(crate) fn resolve_service_endpoint(
             .and_then(|c| c.as_array())
             .into_iter()
             .flatten()
-            .flat_map(|c| c.get("ports").and_then(|p| p.as_array()).cloned().unwrap_or_default())
+            .flat_map(|c| {
+                c.get("ports")
+                    .and_then(|p| p.as_array())
+                    .cloned()
+                    .unwrap_or_default()
+            })
             .find(|p| p.get("name").and_then(|v| v.as_str()) == Some(port_name))
             .and_then(|p| p.get("containerPort").and_then(|v| v.as_u64()))
             .ok_or_else(|| {
@@ -724,8 +723,8 @@ async fn do_https_post(
 ) -> Result<Vec<u8>, String> {
     let cfg = tls_config(ca_pem)?;
     let connector = TlsConnector::from(Arc::new(cfg));
-    let server_name = ServerName::try_from(host.to_string())
-        .map_err(|e| format!("invalid sni '{host}': {e}"))?;
+    let server_name =
+        ServerName::try_from(host.to_string()).map_err(|e| format!("invalid sni '{host}': {e}"))?;
 
     let tcp = TcpStream::connect((ip, port))
         .await
@@ -752,10 +751,7 @@ async fn do_https_post(
         .write_all(body)
         .await
         .map_err(|e| format!("write body: {e}"))?;
-    stream
-        .flush()
-        .await
-        .map_err(|e| format!("flush: {e}"))?;
+    stream.flush().await.map_err(|e| format!("flush: {e}"))?;
 
     let mut raw = Vec::new();
     stream
@@ -790,7 +786,11 @@ fn extract_http_body(raw: &[u8]) -> Result<Vec<u8>, String> {
         }
     }
     let body = &raw[split + sep.len()..];
-    if chunked { dechunk(body) } else { Ok(body.to_vec()) }
+    if chunked {
+        dechunk(body)
+    } else {
+        Ok(body.to_vec())
+    }
 }
 
 fn dechunk(input: &[u8]) -> Result<Vec<u8>, String> {
@@ -828,9 +828,7 @@ pub(crate) fn tls_config(ca_pem: Option<&[u8]>) -> Result<ClientConfig, String> 
         let mut cursor = Cursor::new(pem);
         for cert in rustls_pemfile::certs(&mut cursor) {
             let der: CertificateDer<'static> = cert.map_err(|e| format!("ca pem: {e}"))?;
-            roots
-                .add(der)
-                .map_err(|e| format!("add ca: {e}"))?;
+            roots.add(der).map_err(|e| format!("add ca: {e}"))?;
         }
     }
     if roots.is_empty() {
@@ -853,11 +851,22 @@ fn uuid_like() -> String {
     let bytes: [u8; 16] = rng.random();
     format!(
         "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-        bytes[0], bytes[1], bytes[2], bytes[3],
-        bytes[4], bytes[5],
-        bytes[6], bytes[7],
-        bytes[8], bytes[9],
-        bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15],
+        bytes[0],
+        bytes[1],
+        bytes[2],
+        bytes[3],
+        bytes[4],
+        bytes[5],
+        bytes[6],
+        bytes[7],
+        bytes[8],
+        bytes[9],
+        bytes[10],
+        bytes[11],
+        bytes[12],
+        bytes[13],
+        bytes[14],
+        bytes[15],
     )
 }
 
@@ -941,7 +950,10 @@ mod tests {
     #[test]
     fn label_selector_match_labels_only() {
         let sel = json!({"matchLabels": {"team": "core"}});
-        assert!(label_selector_matches(&sel, &json!({"team": "core", "x": "y"})));
+        assert!(label_selector_matches(
+            &sel,
+            &json!({"team": "core", "x": "y"})
+        ));
         assert!(!label_selector_matches(&sel, &json!({"team": "ops"})));
         assert!(!label_selector_matches(&sel, &json!({})));
     }

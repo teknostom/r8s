@@ -66,12 +66,19 @@ pub fn store_error_response(err: &StoreError) -> Response {
         StoreError::AlreadyExists { .. } => (StatusCode::CONFLICT, "AlreadyExists"),
         StoreError::NotFound { .. } => (StatusCode::NOT_FOUND, "NotFound"),
         StoreError::Conflict { .. } => (StatusCode::CONFLICT, "Conflict"),
-        StoreError::Internal(..) => (StatusCode::INTERNAL_SERVER_ERROR, "InternalError"),
+        StoreError::TooOld { .. } => (StatusCode::GONE, "Expired"),
+        StoreError::InvalidMetadata
+        | StoreError::InvalidContinueToken
+        | StoreError::InvalidSelector(..) => (StatusCode::BAD_REQUEST, "BadRequest"),
+        StoreError::Storage(..) | StoreError::Serialization(..) => {
+            (StatusCode::INTERNAL_SERVER_ERROR, "InternalError")
+        }
     };
     status_error(status, reason, &err.to_string())
 }
 
-pub fn anyhow_error_response(err: anyhow::Error) -> Response {
+pub fn anyhow_error_response(err: impl Into<anyhow::Error>) -> Response {
+    let err = err.into();
     match err.downcast_ref::<StoreError>() {
         Some(store_err) => store_error_response(store_err),
         None => status_error(
