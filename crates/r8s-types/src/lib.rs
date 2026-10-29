@@ -3,8 +3,10 @@ pub mod k8s_pb_serde;
 pub mod net;
 pub mod openapi;
 pub mod openapi_proto;
+pub mod quantity;
 pub mod registry;
 pub mod resource;
+pub mod sa_token;
 pub mod well_known;
 
 pub use net::{
@@ -25,15 +27,20 @@ pub use k8s_openapi::api::core::v1::{
     PodTemplateSpec, Probe, Secret, SecretVolumeSource, Service, ServiceAccount, ServicePort,
     ServiceSpec, TCPSocketAction, Volume, VolumeMount,
 };
+pub use k8s_openapi::api::core::v1::{
+    DownwardAPIVolumeFile, HostIP, KeyToPath, LifecycleHandler, ResourceFieldSelector,
+    ServiceAccountTokenProjection,
+};
 
 pub use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 pub use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
 
 pub use k8s_openapi::api::apps::v1::{
-    DaemonSet, DaemonSetSpec, DaemonSetStatus, Deployment, DeploymentCondition, DeploymentSpec,
-    DeploymentStatus, DeploymentStrategy, ReplicaSet, ReplicaSetSpec, ReplicaSetStatus,
-    RollingUpdateDeployment, StatefulSet, StatefulSetSpec, StatefulSetStatus,
+    ControllerRevision, DaemonSet, DaemonSetSpec, DaemonSetStatus, Deployment, DeploymentCondition,
+    DeploymentSpec, DeploymentStatus, DeploymentStrategy, ReplicaSet, ReplicaSetSpec,
+    ReplicaSetStatus, RollingUpdateDeployment, StatefulSet, StatefulSetSpec, StatefulSetStatus,
 };
+pub use k8s_openapi::apimachinery::pkg::runtime::RawExtension;
 
 pub use k8s_openapi::api::batch::v1::{
     CronJob, CronJobSpec, CronJobStatus, Job, JobCondition, JobSpec, JobStatus, JobTemplateSpec,
@@ -49,7 +56,11 @@ pub use k8s_openapi::api::discovery::v1::{
 };
 
 pub use k8s_openapi::apimachinery::pkg::apis::meta::v1::{
-    LabelSelector, ObjectMeta, OwnerReference,
+    Condition, LabelSelector, ObjectMeta, OwnerReference,
+};
+
+pub use k8s_openapi::api::policy::v1::{
+    Eviction, PodDisruptionBudget, PodDisruptionBudgetSpec, PodDisruptionBudgetStatus,
 };
 
 pub use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;

@@ -6,25 +6,30 @@ use axum::{
     extract::{DefaultBodyLimit, Query, Request, State},
     http::HeaderMap,
     response::Response,
-    routing::{get, post},
+    routing::{get, post, put},
 };
 use hyper::{Method, StatusCode};
 use r8s_store::Store;
 use r8s_types::{GroupVersionResource, registry::ResourceRegistry};
 
 use crate::{
-    auth::{self_subject_access_review, self_subject_rules_review, subject_access_review},
+    auth::{
+        local_subject_access_review, openid_configuration, openid_jwks, self_subject_access_review,
+        self_subject_rules_review, subject_access_review, token_review,
+    },
     discovery::{
         ApiState, AppState, get_api_groups, get_api_versions, get_core_v1_resources,
         get_group_version_resources, get_single_api_group, get_version, healthz,
     },
+    field_validation,
     handler::{
-        RouteContext, create_cluster, create_impl, create_ns, delete_cluster,
-        delete_collection_cluster, delete_collection_ns, delete_impl, delete_ns,
-        extract_propagation_policy, get_cluster, get_impl, get_ns, get_status_cluster,
-        get_status_ns, list_all_ns, list_cluster, list_impl, list_ns, patch_cluster, patch_impl,
-        patch_ns, patch_status_cluster, patch_status_ns, pod_logs_ns, put_status_cluster,
-        put_status_ns, require_json, status_put_impl, update_cluster, update_impl, update_ns,
+        RouteContext, create_cluster, create_impl, create_ns, decode_body, delete_cluster,
+        delete_collection_cluster, delete_collection_impl, delete_collection_ns, delete_impl,
+        delete_ns, ephemeral_containers_put_impl, extract_propagation_policy, finalize_cluster,
+        get_cluster, get_impl, get_ns, get_status_cluster, get_status_ns, list_all_ns,
+        list_cluster, list_impl, list_ns, patch_cluster, patch_impl, patch_ns,
+        patch_status_cluster, patch_status_ns, pod_logs_ns, put_status_cluster, put_status_ns,
+        require_json, status_put_impl, update_cluster, update_impl, update_ns,
     },
     openapi_v2::get_openapi_v2,
     openapi_v3::{get_openapi_v3_core, get_openapi_v3_discovery, get_openapi_v3_group},
@@ -33,11 +38,21 @@ use crate::{
     scale::{get_scale, patch_scale, put_scale},
 };
 
+/// One line per request with its status and the time to the response head;
+/// for a watch or a streamed log that is the time until the stream opened.
 async fn log_requests(req: Request, next: axum::middleware::Next) -> axum::response::Response {
     let method = req.method().clone();
     let uri = req.uri().clone();
+    let started = std::time::Instant::now();
     let resp = next.run(req).await;
-    tracing::info!("{} {} -> {}", method, uri, resp.status());
+    let elapsed = started.elapsed();
+    tracing::info!(
+        "{} {} -> {} ({:.1}ms)",
+        method,
+        uri,
+        resp.status(),
+        elapsed.as_secs_f64() * 1000.0
+    );
     resp
 }
 
@@ -153,44 +168,91 @@ async fn dynamic_dispatch(
     if api_path.subresource.as_deref() == Some("status") {
         let ns = api_path.namespace.as_deref();
         return match (method, api_path.name.as_deref()) {
-            (Method::GET, Some(name)) => get_impl(&state, &ctx, ns, name, &headers),
+            (Method::GET, Some(name)) => get_impl(&state, &ctx, ns, name, &headers).await,
             (Method::PUT, Some(name)) => match require_json(&headers, &body) {
-                Ok(json) => status_put_impl(&state, &ctx, ns, name, json),
+                Ok(json) => status_put_impl(&state, &ctx, ns, name, json).await,
                 Err(resp) => resp,
             },
             (Method::PATCH, Some(name)) => {
-                patch_impl(&state, &ctx, ns, name, &headers, body, false).await
+                patch_impl(
+                    &state,
+                    &ctx,
+                    ns,
+                    name,
+                    &headers,
+                    body,
+                    Some("status"),
+                    field_validation::Mode::Ignore,
+                    false,
+                )
+                .await
+            }
+            _ => not_found(),
+        };
+    }
+
+    // `pods/{name}/ephemeralcontainers`: only spec.ephemeralContainers may
+    // change, and only by appending.
+    if api_path.subresource.as_deref() == Some("ephemeralcontainers")
+        && ctx.resource_type.gvr.resource == "pods"
+        && ctx.resource_type.gvr.group.is_empty()
+    {
+        let ns = api_path.namespace.as_deref();
+        return match (method, api_path.name.as_deref()) {
+            (Method::GET, Some(name)) => get_impl(&state, &ctx, ns, name, &headers).await,
+            (Method::PUT, Some(name)) => match require_json(&headers, &body) {
+                Ok(json) => ephemeral_containers_put_impl(&state, &ctx, ns, name, json).await,
+                Err(resp) => resp,
+            },
+            (Method::PATCH, Some(name)) => {
+                patch_impl(
+                    &state,
+                    &ctx,
+                    ns,
+                    name,
+                    &headers,
+                    body,
+                    Some("ephemeralcontainers"),
+                    field_validation::Mode::Ignore,
+                    false,
+                )
+                .await
             }
             _ => not_found(),
         };
     }
 
     match (method, api_path.name) {
-        (Method::GET, None) => list_impl(
-            &state,
-            &ctx,
-            api_path.namespace.as_deref(),
-            params,
-            &headers,
-        ),
+        (Method::GET, None) => {
+            list_impl(
+                &state,
+                &ctx,
+                api_path.namespace.as_deref(),
+                params,
+                &headers,
+            )
+            .await
+        }
         (Method::POST, None) => {
-            let json = match require_json(&headers, &body) {
+            let (json, findings) = match decode_body(&ctx, &headers, raw_query.as_deref(), &body) {
                 Ok(v) => v,
                 Err(resp) => return resp,
             };
             let dry_run = parse_dry_run_query(raw_query.as_deref());
-            create_impl(&state, &ctx, api_path.namespace.as_deref(), json, dry_run).await
+            let resp =
+                create_impl(&state, &ctx, api_path.namespace.as_deref(), json, dry_run).await;
+            field_validation::attach_warnings(resp, &findings)
         }
         (Method::GET, Some(ref name)) => {
-            get_impl(&state, &ctx, api_path.namespace.as_deref(), name, &headers)
+            get_impl(&state, &ctx, api_path.namespace.as_deref(), name, &headers).await
         }
         (Method::PUT, Some(ref name)) => {
-            let json = match require_json(&headers, &body) {
+            let (json, findings) = match decode_body(&ctx, &headers, raw_query.as_deref(), &body) {
                 Ok(v) => v,
                 Err(resp) => return resp,
             };
             let dry_run = parse_dry_run_query(raw_query.as_deref());
-            update_impl(
+            let resp = update_impl(
                 &state,
                 &ctx,
                 api_path.namespace.as_deref(),
@@ -198,7 +260,8 @@ async fn dynamic_dispatch(
                 json,
                 dry_run,
             )
-            .await
+            .await;
+            field_validation::attach_warnings(resp, &findings)
         }
         (Method::PATCH, Some(ref name)) => {
             let dry_run = parse_dry_run_query(raw_query.as_deref());
@@ -209,9 +272,20 @@ async fn dynamic_dispatch(
                 name,
                 &headers,
                 body,
+                None,
+                field_validation::mode(raw_query.as_deref()),
                 dry_run,
             )
             .await
+        }
+        (Method::DELETE, None) => {
+            let content_type = headers
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            let policy = extract_propagation_policy(raw_query.as_deref(), &body, content_type);
+            delete_collection_impl(&state, &ctx, api_path.namespace.as_deref(), &params, policy)
+                .await
         }
         (Method::DELETE, Some(ref name)) => {
             let content_type = headers
@@ -294,7 +368,24 @@ impl ApiServer {
                 post(subject_access_review),
             )
             .route(
+                "/apis/authorization.k8s.io/v1/namespaces/{ns}/localsubjectaccessreviews",
+                post(local_subject_access_review),
+            )
+            .route(
+                "/apis/authentication.k8s.io/v1/tokenreviews",
+                post(token_review),
+            )
+            .route(
+                "/.well-known/openid-configuration",
+                get(openid_configuration),
+            )
+            .route("/openid/v1/jwks", get(openid_jwks))
+            .route(
                 "/apis/apps/v1/namespaces/{ns}/{resource}/{name}/scale",
+                get(get_scale).put(put_scale).patch(patch_scale),
+            )
+            .route(
+                "/api/v1/namespaces/{ns}/{resource}/{name}/scale",
                 get(get_scale).put(put_scale).patch(patch_scale),
             );
         for rt in self.state.registry.iter() {
@@ -313,6 +404,8 @@ impl ApiServer {
                 ("authorization.k8s.io", "v1", "selfsubjectaccessreviews")
                     | ("authorization.k8s.io", "v1", "selfsubjectrulesreviews")
                     | ("authorization.k8s.io", "v1", "subjectaccessreviews")
+                    | ("authorization.k8s.io", "v1", "localsubjectaccessreviews")
+                    | ("authentication.k8s.io", "v1", "tokenreviews")
             );
             if is_special_review {
                 continue;
@@ -358,14 +451,94 @@ impl ApiServer {
                             .layer(Extension(ctx.clone())),
                     )
                     .route(&all_ns, get(list_all_ns).layer(Extension(ctx)));
+                if rt.gvr.resource == "services" {
+                    let proxy_root = format!("{base}/namespaces/{{ns}}/services/{{name}}/proxy");
+                    router = router
+                        .route(
+                            &proxy_root,
+                            axum::routing::any(crate::podproxy::service_proxy_root),
+                        )
+                        .route(
+                            &format!("{proxy_root}/"),
+                            axum::routing::any(crate::podproxy::service_proxy_root),
+                        )
+                        .route(
+                            &format!("{proxy_root}/{{*rest}}"),
+                            axum::routing::any(crate::podproxy::service_proxy_path),
+                        );
+                }
                 if rt.gvr.resource == "pods" {
                     let log_route =
                         format!("{base}/namespaces/{{ns}}/{}/{{name}}/log", rt.gvr.resource);
                     router = router.route(&log_route, get(pod_logs_ns));
-                    // `kubectl exec` upgrades this GET to a WebSocket.
+                    // `kubectl exec` upgrades this GET to a WebSocket; client-go's
+                    // SPDY executor POSTs with `Upgrade: SPDY/3.1`.
                     let exec_route =
                         format!("{base}/namespaces/{{ns}}/{}/{{name}}/exec", rt.gvr.resource);
-                    router = router.route(&exec_route, get(crate::exec::pod_exec));
+                    router = router.route(
+                        &exec_route,
+                        get(crate::exec::pod_exec).post(crate::exec::pod_exec_spdy),
+                    );
+                    // `kubectl attach` tries WebSocket (GET) then SPDY (POST).
+                    let attach_route = format!(
+                        "{base}/namespaces/{{ns}}/{}/{{name}}/attach",
+                        rt.gvr.resource
+                    );
+                    router = router.route(
+                        &attach_route,
+                        get(crate::exec::pod_attach).post(crate::exec::pod_attach),
+                    );
+                    let proxy_root = format!(
+                        "{base}/namespaces/{{ns}}/{}/{{name}}/proxy",
+                        rt.gvr.resource
+                    );
+                    let proxy_path = format!(
+                        "{base}/namespaces/{{ns}}/{}/{{name}}/proxy/{{*rest}}",
+                        rt.gvr.resource
+                    );
+                    router = router
+                        .route(
+                            &proxy_root,
+                            axum::routing::any(crate::podproxy::pod_proxy_root),
+                        )
+                        .route(
+                            &format!("{proxy_root}/"),
+                            axum::routing::any(crate::podproxy::pod_proxy_root),
+                        )
+                        .route(
+                            &proxy_path,
+                            axum::routing::any(crate::podproxy::pod_proxy_path),
+                        );
+                    let eviction_route = format!(
+                        "{base}/namespaces/{{ns}}/{}/{{name}}/eviction",
+                        rt.gvr.resource
+                    );
+                    router = router.route(
+                        &eviction_route,
+                        post(crate::eviction::evict_pod).layer(Extension(RouteContext {
+                            resource_type: Arc::clone(&rt),
+                        })),
+                    );
+                    let ephemeral_route = format!(
+                        "{base}/namespaces/{{ns}}/{}/{{name}}/ephemeralcontainers",
+                        rt.gvr.resource
+                    );
+                    router = router.route(
+                        &ephemeral_route,
+                        get(get_status_ns)
+                            .put(crate::handler::put_ephemeral_containers_ns)
+                            .patch(crate::handler::patch_ephemeral_containers_ns)
+                            .layer(Extension(RouteContext {
+                                resource_type: Arc::clone(&rt),
+                            })),
+                    );
+                }
+                if rt.gvr.resource == "serviceaccounts" {
+                    let token_route = format!(
+                        "{base}/namespaces/{{ns}}/{}/{{name}}/token",
+                        rt.gvr.resource
+                    );
+                    router = router.route(&token_route, post(crate::auth::token_request));
                 }
             } else {
                 let collection = format!("{base}/{}", rt.gvr.resource);
@@ -392,8 +565,26 @@ impl ApiServer {
                         get(get_status_cluster)
                             .put(put_status_cluster)
                             .patch(patch_status_cluster)
+                            .layer(Extension(ctx.clone())),
+                    );
+                if rt.gvr.group.is_empty() && rt.gvr.resource == "namespaces" {
+                    let finalize = format!("{base}/{}/{{name}}/finalize", rt.gvr.resource);
+                    router = router.route(
+                        &finalize,
+                        put(finalize_cluster).layer(Extension(ctx.clone())),
+                    );
+                }
+                // A CSR's approval is its status's conditions.
+                if rt.subresources.iter().any(|s| s == "approval") {
+                    let approval = format!("{base}/{}/{{name}}/approval", rt.gvr.resource);
+                    router = router.route(
+                        &approval,
+                        get(get_status_cluster)
+                            .put(put_status_cluster)
+                            .patch(patch_status_cluster)
                             .layer(Extension(ctx)),
                     );
+                }
             }
         }
 

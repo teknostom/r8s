@@ -54,6 +54,66 @@ pub const SPEC_FILES: &[(&str, &str, &[u8])] = &[
         "v1",
         include_bytes!("../openapi/v3/apis__rbac.authorization.k8s.io__v1_openapi.json"),
     ),
+    (
+        "flowcontrol.apiserver.k8s.io",
+        "v1",
+        include_bytes!("../openapi/v3/apis__flowcontrol.apiserver.k8s.io__v1_openapi.json"),
+    ),
+    (
+        "apiregistration.k8s.io",
+        "v1",
+        include_bytes!("../openapi/v3/apis__apiregistration.k8s.io__v1_openapi.json"),
+    ),
+    (
+        "coordination.k8s.io",
+        "v1",
+        include_bytes!("../openapi/v3/apis__coordination.k8s.io__v1_openapi.json"),
+    ),
+    (
+        "scheduling.k8s.io",
+        "v1",
+        include_bytes!("../openapi/v3/apis__scheduling.k8s.io__v1_openapi.json"),
+    ),
+    (
+        "node.k8s.io",
+        "v1",
+        include_bytes!("../openapi/v3/apis__node.k8s.io__v1_openapi.json"),
+    ),
+    (
+        "storage.k8s.io",
+        "v1",
+        include_bytes!("../openapi/v3/apis__storage.k8s.io__v1_openapi.json"),
+    ),
+    (
+        "admissionregistration.k8s.io",
+        "v1",
+        include_bytes!("../openapi/v3/apis__admissionregistration.k8s.io__v1_openapi.json"),
+    ),
+    (
+        "certificates.k8s.io",
+        "v1",
+        include_bytes!("../openapi/v3/apis__certificates.k8s.io__v1_openapi.json"),
+    ),
+    (
+        "events.k8s.io",
+        "v1",
+        include_bytes!("../openapi/v3/apis__events.k8s.io__v1_openapi.json"),
+    ),
+    (
+        "authentication.k8s.io",
+        "v1",
+        include_bytes!("../openapi/v3/apis__authentication.k8s.io__v1_openapi.json"),
+    ),
+    (
+        "authorization.k8s.io",
+        "v1",
+        include_bytes!("../openapi/v3/apis__authorization.k8s.io__v1_openapi.json"),
+    ),
+    (
+        "autoscaling",
+        "v1",
+        include_bytes!("../openapi/v3/apis__autoscaling__v1_openapi.json"),
+    ),
 ];
 
 /// Raw OpenAPI v3 spec bytes for a (group, version); `None` if not vendored.
@@ -233,14 +293,14 @@ mod tests {
     }
 
     #[test]
-    fn definition_for_covers_groups_without_v3_doc() {
+    fn definition_for_covers_every_vendored_group() {
         assert!(
             schema_for(
                 "admissionregistration.k8s.io",
                 "v1",
                 "ValidatingWebhookConfiguration"
             )
-            .is_none()
+            .is_some()
         );
         let s = definition_for(
             "admissionregistration.k8s.io",

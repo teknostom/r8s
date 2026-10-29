@@ -468,3 +468,152 @@ async fn api_apply_patch_creates_when_missing() {
     assert_eq!(created["data"], serde_json::json!({"k": "v"}));
     assert!(created["metadata"]["uid"].as_str().is_some());
 }
+
+/// The apiextensions watch-cache primer: create through one served version,
+/// delete, then watch from the created resourceVersion through every served
+/// version and expect the DELETED event on each.
+#[tokio::test]
+async fn api_multi_version_crd_shares_storage_across_versions() {
+    use r8s_store::backend::ResourceRef;
+    use r8s_types::GroupVersionResource;
+    use std::time::Duration;
+
+    let cluster = TestCluster::start().await;
+    let app = cluster.api_router();
+
+    let schema = serde_json::json!({
+        "openAPIV3Schema": {"type": "object", "x-kubernetes-preserve-unknown-fields": true}
+    });
+    let crd = serde_json::json!({
+        "apiVersion": "apiextensions.k8s.io/v1",
+        "kind": "CustomResourceDefinition",
+        "metadata": {"name": "probes.mygroup.example.com"},
+        "spec": {
+            "group": "mygroup.example.com",
+            "scope": "Cluster",
+            "names": {"plural": "probes", "singular": "probe", "kind": "Probe", "listKind": "ProbeList"},
+            "versions": [
+                {"name": "v1beta1", "served": true, "storage": false, "schema": schema},
+                {"name": "v1", "served": true, "storage": true, "schema": schema}
+            ]
+        }
+    });
+    let crd_gvr = GroupVersionResource::crds();
+    cluster
+        .store
+        .create(
+            ResourceRef {
+                gvr: &crd_gvr,
+                namespace: None,
+                name: "probes.mygroup.example.com",
+            },
+            &crd,
+        )
+        .unwrap();
+    let v1 = GroupVersionResource::new("mygroup.example.com", "v1", "probes");
+    for _ in 0..100 {
+        if cluster.registry.get_by_gvr(&v1).is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        cluster.registry.get_by_gvr(&v1).is_some(),
+        "CRD versions registered"
+    );
+
+    let resp = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/apis/mygroup.example.com/v1beta1/probes",
+            Some(serde_json::json!({
+                "apiVersion": "mygroup.example.com/v1beta1",
+                "kind": "Probe",
+                "metadata": {"name": "setup-instance"}
+            })),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let rv = response_json(resp).await["metadata"]["resourceVersion"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let resp = app
+        .clone()
+        .oneshot(json_request(
+            "GET",
+            "/apis/mygroup.example.com/v1/probes/setup-instance",
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "object written via v1beta1 is readable via v1"
+    );
+    assert_eq!(
+        response_json(resp).await["apiVersion"],
+        "mygroup.example.com/v1"
+    );
+
+    let resp = app
+        .clone()
+        .oneshot(json_request(
+            "DELETE",
+            "/apis/mygroup.example.com/v1beta1/probes/setup-instance",
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let resp = app
+        .clone()
+        .oneshot(json_request(
+            "GET",
+            &format!("/apis/mygroup.example.com/v1/probes?watch=true&resourceVersion={rv}"),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let mut body = resp.into_body();
+    let frame = tokio::time::timeout(Duration::from_secs(5), body.frame())
+        .await
+        .expect("a replayed watch event within 5s")
+        .expect("watch stream open")
+        .expect("watch frame");
+    let event: serde_json::Value =
+        serde_json::from_slice(&frame.into_data().expect("data frame")).unwrap();
+    assert_eq!(event["type"], "DELETED");
+    assert_eq!(event["object"]["apiVersion"], "mygroup.example.com/v1");
+    assert_eq!(event["object"]["metadata"]["name"], "setup-instance");
+
+    cluster.shutdown().await;
+}
+
+/// `application/apply-patch+yaml` bodies are YAML; the e2e field-validation
+/// tests send them that way rather than as JSON.
+#[tokio::test]
+async fn api_apply_patch_accepts_yaml_body() {
+    let cluster = TestCluster::start().await;
+    let app = cluster.api_router();
+
+    let yaml = "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: yaml-applied\n  namespace: default\ndata:\n  k: v\n";
+    let req = axum::http::Request::builder()
+        .method("PATCH")
+        .uri("/api/v1/namespaces/default/configmaps/yaml-applied?fieldManager=e2e")
+        .header("content-type", "application/apply-patch+yaml")
+        .body(Body::from(yaml))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), 201);
+    let created = response_json(resp).await;
+    assert_eq!(created["data"]["k"], "v");
+
+    cluster.shutdown().await;
+}

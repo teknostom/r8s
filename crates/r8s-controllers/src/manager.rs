@@ -82,6 +82,8 @@ impl ControllerManager {
         spawn_controller!("job", super::job::run);
         spawn_controller!("cronjob", super::cronjob::run);
         spawn_controller!("quota", super::quota::run);
+        spawn_controller!("disruption", super::disruption::run);
+        spawn_controller!("taint-eviction", super::taint_eviction::run);
 
         // Provisioner needs the data dir to carve out hostPath-backed PVs.
         {

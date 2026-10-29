@@ -51,6 +51,32 @@ drain_pods() {
     kubectl get pods -A 2>/dev/null || true
 }
 
+diagnose_suite() {
+    # Workloads, pod descriptions, container logs and the daemon's recent
+    # warnings for every non-system namespace, before cleanup removes them.
+    local name="$1"
+    echo "  ---- diagnostics: $name ----"
+    kubectl get pods -A -o wide 2>/dev/null || true
+    kubectl get events -A 2>/dev/null | tail -n 30 || true
+    for ns in $(kubectl get ns -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
+        [[ "$PROTECTED_NS" == *" $ns "* ]] && continue
+        echo "  ---- $ns: workloads ----"
+        kubectl -n "$ns" get deploy,sts,ds,jobs,svc,endpoints 2>&1 || true
+        echo "  ---- $ns: describe pods ----"
+        kubectl -n "$ns" describe pods 2>&1 | head -n 400 || true
+        for pod in $(kubectl -n "$ns" get pods -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
+            echo "  ---- $ns/$pod: logs (tail) ----"
+            kubectl -n "$ns" logs "$pod" --all-containers --tail=80 2>&1 | tail -n 80 || true
+        done
+    done
+    # The daemon log sits next to the kubeconfig; CI uploads the whole file.
+    local log="${R8SD_LOG:-$(dirname "${KUBECONFIG:-/nonexistent}")/r8sd.log}"
+    if [[ -r "$log" ]]; then
+        echo "  ---- r8sd.log: last WARN/ERROR lines ----"
+        grep -aE 'WARN|ERROR' "$log" | tail -n 60 || true
+    fi
+}
+
 cleanup_suite() {
     local chart_dir="$1" name="$2"
     echo "  ---- cleanup: $name ----"
@@ -117,10 +143,7 @@ for chart_dir in "${SUITES[@]}"; do
     else
         echo "FAIL: $name"
         FAILED+=("$name")
-        # Capture state in the CI log before cleanup wipes it.
-        echo "  ---- diagnostics: $name ----"
-        kubectl get pods -A -o wide 2>/dev/null || true
-        kubectl get events -A 2>/dev/null | tail -n 30 || true
+        diagnose_suite "$name"
     fi
     cleanup_suite "$chart_dir" "$name"
 done

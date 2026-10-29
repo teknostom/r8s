@@ -131,6 +131,7 @@ mod generic {
             "apps/v1" => "k8s.io.api.apps.v1",
             "coordination.k8s.io/v1" => "k8s.io.api.coordination.v1",
             "admissionregistration.k8s.io/v1" => "k8s.io.api.admissionregistration.v1",
+            "apiregistration.k8s.io/v1" => "k8s.io.kube_aggregator.pkg.apis.apiregistration.v1",
             _ => return None,
         };
         Some(format!("{pkg}.{kind}"))
@@ -178,10 +179,26 @@ mod generic {
                 obj.extend(inner_obj);
                 continue;
             }
+            // gogo sends Go's non-pointer strings even when empty; JSON omits them.
+            if matches!(value, PbValue::String(s) if s.is_empty())
+                && !KEEP_EMPTY_FIELDS.contains(&jname)
+            {
+                continue;
+            }
             obj.insert(jname.to_string(), value_to_json(value));
+        }
+        // ObjectMeta's non-nullable scalars arrive even when empty; JSON
+        // omits them.
+        if msg.descriptor().full_name() == "k8s.io.apimachinery.pkg.apis.meta.v1.ObjectMeta" {
+            obj.retain(|k, v| {
+                v.as_str() != Some("") && !(k == "generation" && v.as_i64() == Some(0))
+            });
         }
         Value::Object(obj)
     }
+
+    /// json_names of `*string` fields where `""` differs from unset.
+    const KEEP_EMPTY_FIELDS: &[&str] = &["storageClassName", "volumeAttributesClassName"];
 
     /// json_names of embedded message fields k8s flattens into the parent
     /// (`json:",inline"`) rather than nesting.
@@ -189,6 +206,8 @@ mod generic {
         "volumeSource",
         "persistentVolumeSource",
         "localObjectReference",
+        "handler",
+        "ephemeralContainerCommon",
     ];
 
     fn value_to_json(v: &PbValue) -> Value {
@@ -838,19 +857,23 @@ fn crd_status_to_json(s: &pbapi::CustomResourceDefinitionStatus) -> Value {
 
 fn object_meta_to_json(m: &pbmeta::ObjectMeta) -> Value {
     let mut obj = Map::new();
-    if let Some(v) = &m.name {
+    // Non-nullable scalars arrive even when empty; JSON omits them.
+    fn set(v: &Option<String>) -> Option<&str> {
+        v.as_deref().filter(|s| !s.is_empty())
+    }
+    if let Some(v) = set(&m.name) {
         obj.insert("name".into(), json!(v));
     }
-    if let Some(v) = &m.generate_name {
+    if let Some(v) = set(&m.generate_name) {
         obj.insert("generateName".into(), json!(v));
     }
-    if let Some(v) = &m.namespace {
+    if let Some(v) = set(&m.namespace) {
         obj.insert("namespace".into(), json!(v));
     }
-    if let Some(v) = &m.uid {
+    if let Some(v) = set(&m.uid) {
         obj.insert("uid".into(), json!(v));
     }
-    if let Some(v) = &m.resource_version {
+    if let Some(v) = set(&m.resource_version) {
         obj.insert("resourceVersion".into(), json!(v));
     }
     if let Some(t) = m.creation_timestamp.as_ref() {
@@ -1311,6 +1334,45 @@ mod tests {
     }
 
     #[test]
+    fn object_meta_drops_empty_omitempty_scalars() {
+        let crd = pbapi::CustomResourceDefinition {
+            metadata: Some(pbmeta::ObjectMeta {
+                name: Some("foos.example.com".into()),
+                generate_name: Some("".into()),
+                namespace: Some("".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let body = envelope(
+            "apiextensions.k8s.io/v1",
+            "CustomResourceDefinition",
+            crd.encode_to_vec(),
+        );
+        let v = decode_k8s_protobuf_to_json(&body).expect("decode");
+        assert_eq!(v["metadata"]["name"], "foos.example.com");
+        assert!(v["metadata"].get("namespace").is_none());
+        assert!(v["metadata"].get("generateName").is_none());
+
+        use crate::k8s_pb::core_v1 as pbcore;
+        let svc = pbcore::Service {
+            metadata: Some(pbmeta::ObjectMeta {
+                name: Some("svc".into()),
+                namespace: Some("".into()),
+                generation: Some(0),
+                ..Default::default()
+            }),
+            spec: None,
+            status: None,
+        };
+        let body = envelope("v1", "Service", svc.encode_to_vec());
+        let v = decode_k8s_protobuf_to_json(&body).expect("decode");
+        assert_eq!(v["metadata"]["name"], "svc");
+        assert!(v["metadata"].get("namespace").is_none());
+        assert!(v["metadata"].get("generation").is_none());
+    }
+
+    #[test]
     fn generic_decodes_service_with_intorstring() {
         use crate::k8s_pb::{core_v1 as pbcore, intstr};
 
@@ -1404,6 +1466,82 @@ mod tests {
             v["spec"]["volumes"][0]["volumeSource"].is_null(),
             "the volumeSource wrapper must be gone (inlined)"
         );
+    }
+
+    #[test]
+    fn generic_keeps_env_value_from() {
+        use crate::k8s_pb::core_v1 as pbcore;
+
+        let pod = pbcore::Pod {
+            metadata: Some(pbmeta::ObjectMeta {
+                name: Some("p".into()),
+                ..Default::default()
+            }),
+            spec: Some(pbcore::PodSpec {
+                containers: vec![pbcore::Container {
+                    name: Some("c".into()),
+                    env: vec![pbcore::EnvVar {
+                        name: Some("POD_IP".into()),
+                        value: Some(String::new()),
+                        value_from: Some(pbcore::EnvVarSource {
+                            field_ref: Some(pbcore::ObjectFieldSelector {
+                                api_version: Some("v1".into()),
+                                field_path: Some("status.podIP".into()),
+                            }),
+                            ..Default::default()
+                        }),
+                    }],
+                    liveness_probe: Some(pbcore::Probe {
+                        handler: Some(pbcore::ProbeHandler {
+                            exec: Some(pbcore::ExecAction {
+                                command: vec!["cat".into(), "/tmp/health".into()],
+                            }),
+                            ..Default::default()
+                        }),
+                        failure_threshold: Some(1),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            status: None,
+        };
+        let body = envelope("v1", "Pod", pod.encode_to_vec());
+
+        let v = decode_k8s_protobuf_to_json(&body).expect("decode");
+        let container = &v["spec"]["containers"][0];
+        let env = &container["env"][0];
+        assert_eq!(env["name"], "POD_IP");
+        assert_eq!(env["valueFrom"]["fieldRef"]["fieldPath"], "status.podIP");
+        assert!(env.get("value").is_none(), "{env}");
+        let probe = &container["livenessProbe"];
+        assert_eq!(probe["exec"]["command"][0], "cat", "{probe}");
+        assert!(probe["handler"].is_null());
+        assert_eq!(probe["failureThreshold"], 1);
+    }
+
+    #[test]
+    fn generic_keeps_empty_storage_class() {
+        use crate::k8s_pb::core_v1 as pbcore;
+
+        let pvc = pbcore::PersistentVolumeClaim {
+            metadata: Some(pbmeta::ObjectMeta {
+                name: Some("c".into()),
+                ..Default::default()
+            }),
+            spec: Some(pbcore::PersistentVolumeClaimSpec {
+                storage_class_name: Some(String::new()),
+                volume_name: Some(String::new()),
+                ..Default::default()
+            }),
+            status: None,
+        };
+        let body = envelope("v1", "PersistentVolumeClaim", pvc.encode_to_vec());
+
+        let v = decode_k8s_protobuf_to_json(&body).expect("decode");
+        assert_eq!(v["spec"]["storageClassName"], "");
+        assert!(v["spec"].get("volumeName").is_none(), "{v}");
     }
 
     #[test]

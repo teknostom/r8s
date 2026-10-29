@@ -1,15 +1,17 @@
-//! ClusterIP and LoadBalancer DNAT via nftables. The DNAT chains are rebuilt
-//! from the store on every Service or Endpoints event and every `RESYNC`,
-//! and swapped in as one `nft -f` transaction.
+//! ClusterIP, LoadBalancer and pod hostPort DNAT via nftables. The DNAT
+//! chains are rebuilt from the store on every Service, Endpoints or Pod
+//! event and every `RESYNC`, and swapped in as one `nft -f` transaction.
 
 use std::io::Write;
-use std::net::SocketAddrV4;
+use std::net::{Ipv4Addr, SocketAddrV4};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use r8s_store::Store;
 use r8s_store::watch::WatchEvent;
-use r8s_types::{BRIDGE_NAME, GroupVersionResource, POD_CIDR, Service, nft_table_name};
+use r8s_types::{
+    BRIDGE_NAME, GroupVersionResource, POD_CIDR, Pod, SERVICE_CIDR, Service, nft_table_name,
+};
 use tokio::sync::broadcast;
 use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
@@ -84,32 +86,66 @@ pub fn setup_nat_table(cluster: &str) -> Result<()> {
         "masquerade",
     ])?;
 
+    // Loopback-sourced traffic DNATed to a pod by a 127.0.0.1 hostPort needs
+    // a routable source for the reply.
+    nft(&[
+        "add",
+        "rule",
+        "ip",
+        &table,
+        "postrouting",
+        "ip",
+        "saddr",
+        "127.0.0.0/8",
+        "oifname",
+        BRIDGE_NAME,
+        "masquerade",
+    ])?;
+
     tracing::info!(table, "nftables NAT table ready");
     Ok(())
 }
 
-/// Sync on every Service/Endpoints event, and every `RESYNC` regardless.
+/// Apply the rules on every Service/Endpoints/Pod event that changes them,
+/// and every `RESYNC` regardless.
 pub async fn run(store: Store, shutdown: CancellationToken, cluster: String) -> Result<()> {
     let mut svc_rx = store.watch(&GroupVersionResource::services());
     let mut ep_rx = store.watch(&GroupVersionResource::endpoints());
+    let mut pod_rx = store.watch(&GroupVersionResource::pods());
     let mut resync = tokio::time::interval(RESYNC);
     resync.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut applied = String::new();
 
     loop {
-        tokio::select! {
+        let forced = tokio::select! {
             _ = shutdown.cancelled() => return Ok(()),
-            _ = resync.tick() => {}
+            _ = resync.tick() => true,
             r = svc_rx.recv() => if matches!(r, Err(broadcast::error::RecvError::Closed)) {
                 return Ok(());
+            } else {
+                false
             },
             r = ep_rx.recv() => if matches!(r, Err(broadcast::error::RecvError::Closed)) {
                 return Ok(());
+            } else {
+                false
             },
-        }
+            r = pod_rx.recv() => if matches!(r, Err(broadcast::error::RecvError::Closed)) {
+                return Ok(());
+            } else {
+                false
+            },
+        };
         drain(&mut svc_rx);
         drain(&mut ep_rx);
-        if let Err(e) = sync_service_rules(&store, &cluster) {
-            tracing::warn!("service proxy sync: {e}");
+        drain(&mut pod_rx);
+        let ruleset = render_rules(&store, &cluster);
+        if !forced && ruleset == applied {
+            continue;
+        }
+        match nft_apply(&ruleset) {
+            Ok(()) => applied = ruleset,
+            Err(e) => tracing::warn!("service proxy sync: {e}"),
         }
     }
 }
@@ -121,12 +157,81 @@ fn drain(rx: &mut broadcast::Receiver<WatchEvent>) {
 }
 
 pub fn sync_service_rules(store: &Store, cluster: &str) -> Result<()> {
+    nft_apply(&render_rules(store, cluster))
+}
+
+/// The complete DNAT ruleset for the store's current Services and Pods.
+fn render_rules(store: &Store, cluster: &str) -> String {
     let table = nft_table_name(cluster);
     let services: Vec<Service> = store
         .list_as::<Service>(&GroupVersionResource::services(), None)
         .unwrap_or_default();
     let forwards = collect_forwards(store, &services);
-    nft_apply(&render_ruleset(&table, &forwards))
+    let host_ports = collect_host_ports(store);
+    render_ruleset(&table, &forwards, &host_ports)
+}
+
+/// One container hostPort and the pod address behind it.
+#[derive(Debug, PartialEq, Eq)]
+struct HostPortForward {
+    /// `hostIP`; `None` means every local address.
+    host_ip: Option<Ipv4Addr>,
+    proto: String,
+    host_port: i32,
+    backend: SocketAddrV4,
+}
+
+/// hostPorts of pods that hold a pod IP and are neither finished nor being
+/// deleted. hostNetwork pods listen on the host directly.
+fn collect_host_ports(store: &Store) -> Vec<HostPortForward> {
+    let pods: Vec<Pod> = store
+        .list_as::<Pod>(&GroupVersionResource::pods(), None)
+        .unwrap_or_default();
+    let mut out = Vec::new();
+    for pod in &pods {
+        let Some(spec) = pod.spec.as_ref() else {
+            continue;
+        };
+        if spec.host_network == Some(true) || pod.metadata.deletion_timestamp.is_some() {
+            continue;
+        }
+        let Some(status) = pod.status.as_ref() else {
+            continue;
+        };
+        if matches!(status.phase.as_deref(), Some("Succeeded" | "Failed")) {
+            continue;
+        }
+        let Some(pod_ip) = status
+            .pod_ip
+            .as_deref()
+            .and_then(|ip| ip.parse::<Ipv4Addr>().ok())
+        else {
+            continue;
+        };
+        for port in spec
+            .containers
+            .iter()
+            .flat_map(|c| c.ports.iter().flatten())
+        {
+            let Some(host_port) = port.host_port.filter(|p| *p > 0) else {
+                continue;
+            };
+            let host_ip = match port.host_ip.as_deref().filter(|ip| !ip.is_empty()) {
+                None | Some("0.0.0.0") => None,
+                Some(ip) => match ip.parse::<Ipv4Addr>() {
+                    Ok(ip) => Some(ip),
+                    Err(_) => continue,
+                },
+            };
+            out.push(HostPortForward {
+                host_ip,
+                proto: port.protocol.as_deref().unwrap_or("TCP").to_lowercase(),
+                host_port,
+                backend: SocketAddrV4::new(pod_ip, port.container_port as u16),
+            });
+        }
+    }
+    out
 }
 
 /// One Service port and its backends.
@@ -135,6 +240,11 @@ struct Forward {
     proto: String,
     port: i32,
     load_balancer: bool,
+    /// `nodePort` of a NodePort or LoadBalancer Service: reachable on every
+    /// local address.
+    node_port: Option<i32>,
+    /// `sessionAffinity: ClientIP`: a client keeps its backend.
+    client_ip_affinity: bool,
     backends: Vec<SocketAddrV4>,
 }
 
@@ -159,7 +269,10 @@ fn collect_forwards(store: &Store, services: &[Service]) -> Vec<Forward> {
         if addrs.is_empty() {
             continue;
         }
-        let load_balancer = spec.type_.as_deref() == Some("LoadBalancer");
+        let svc_type = spec.type_.as_deref().unwrap_or("ClusterIP");
+        let load_balancer = svc_type == "LoadBalancer";
+        let node_ports = matches!(svc_type, "NodePort" | "LoadBalancer");
+        let client_ip_affinity = spec.session_affinity.as_deref() == Some("ClientIP");
 
         for (index, port) in ports.iter().enumerate() {
             let name = port.name.as_deref().filter(|n| !n.is_empty());
@@ -172,6 +285,8 @@ fn collect_forwards(store: &Store, services: &[Service]) -> Vec<Forward> {
                 proto: port.protocol.as_deref().unwrap_or("TCP").to_lowercase(),
                 port: port.port,
                 load_balancer,
+                node_port: port.node_port.filter(|p| *p > 0 && node_ports),
+                client_ip_affinity,
                 backends,
             });
         }
@@ -188,8 +303,10 @@ fn backends_for(addrs: &[ReadyAddr], index: usize, name: Option<&str>) -> Vec<So
         .collect()
 }
 
-/// nft script that flushes both DNAT chains and refills them.
-fn render_ruleset(table: &str, forwards: &[Forward]) -> String {
+/// nft script that flushes both DNAT chains and refills them: Service rules
+/// first, then hostPorts, which on an unspecified hostIP take any local
+/// address outside the Service range.
+fn render_ruleset(table: &str, forwards: &[Forward], host_ports: &[HostPortForward]) -> String {
     let mut out = format!("flush chain ip {table} prerouting\nflush chain ip {table} output\n");
     for f in forwards {
         let Forward {
@@ -198,19 +315,43 @@ fn render_ruleset(table: &str, forwards: &[Forward]) -> String {
             port,
             ..
         } = f;
-        let target = build_dnat_target(&f.backends);
+        let target = build_dnat_target(&f.backends, f.client_ip_affinity);
         out.push_str(&format!(
             "add rule ip {table} prerouting ip daddr {cluster_ip} {proto} dport {port} dnat to {target}\n"
         ));
         out.push_str(&format!(
             "add rule ip {table} output ip daddr {cluster_ip} {proto} dport {port} dnat to {target}\n"
         ));
+        if let Some(node_port) = f.node_port {
+            for chain in ["prerouting", "output"] {
+                out.push_str(&format!(
+                    "add rule ip {table} {chain} fib daddr type local ip daddr != {SERVICE_CIDR} {proto} dport {node_port} dnat to {target}\n"
+                ));
+            }
+        }
         if f.load_balancer {
             out.push_str(&format!(
                 "add rule ip {table} prerouting iifname != {BRIDGE_NAME} {proto} dport {port} dnat to {target}\n"
             ));
             out.push_str(&format!(
                 "add rule ip {table} output {proto} dport {port} dnat to {target}\n"
+            ));
+        }
+    }
+    for h in host_ports {
+        let HostPortForward {
+            proto,
+            host_port,
+            backend,
+            ..
+        } = h;
+        let dst = match h.host_ip {
+            Some(ip) => format!("ip daddr {ip}"),
+            None => format!("fib daddr type local ip daddr != {SERVICE_CIDR}"),
+        };
+        for chain in ["prerouting", "output"] {
+            out.push_str(&format!(
+                "add rule ip {table} {chain} {dst} {proto} dport {host_port} dnat to {backend}\n"
             ));
         }
     }
@@ -223,9 +364,10 @@ pub fn cleanup(cluster: &str) {
     tracing::info!(table, "nftables table removed");
 }
 
-/// `ip:port` for one backend, else a `numgen` round-robin map of
-/// `ip . port` concatenations.
-fn build_dnat_target(backends: &[SocketAddrV4]) -> String {
+/// `ip:port` for one backend, else a map of `ip . port` concatenations
+/// picked round-robin, or by a hash of the client address when the Service
+/// wants ClientIP affinity.
+fn build_dnat_target(backends: &[SocketAddrV4], client_ip_affinity: bool) -> String {
     if let [only] = backends {
         return only.to_string();
     }
@@ -234,8 +376,13 @@ fn build_dnat_target(backends: &[SocketAddrV4]) -> String {
         .enumerate()
         .map(|(i, addr)| format!("{i} : {} . {}", addr.ip(), addr.port()))
         .collect();
+    let pick = if client_ip_affinity {
+        "jhash ip saddr"
+    } else {
+        "numgen inc"
+    };
     format!(
-        "numgen inc mod {} map {{ {} }}",
+        "{pick} mod {} map {{ {} }}",
         backends.len(),
         addrs.join(", ")
     )
@@ -292,16 +439,52 @@ mod tests {
 
     #[test]
     fn single_backend_is_a_plain_dnat_target() {
-        assert_eq!(build_dnat_target(&[sock(10, 8080)]), "10.244.0.10:8080");
+        assert_eq!(
+            build_dnat_target(&[sock(10, 8080)], false),
+            "10.244.0.10:8080"
+        );
+        assert_eq!(
+            build_dnat_target(&[sock(10, 8080)], true),
+            "10.244.0.10:8080"
+        );
     }
 
     #[test]
     fn multiple_backends_load_balance_via_numgen_map() {
-        let got = build_dnat_target(&[sock(10, 80), sock(11, 80), sock(12, 80)]);
+        let got = build_dnat_target(&[sock(10, 80), sock(11, 80), sock(12, 80)], false);
         assert_eq!(
             got,
             "numgen inc mod 3 map { 0 : 10.244.0.10 . 80, 1 : 10.244.0.11 . 80, 2 : 10.244.0.12 . 80 }"
         );
+    }
+
+    #[test]
+    fn client_ip_affinity_hashes_the_source_address() {
+        let got = build_dnat_target(&[sock(10, 80), sock(11, 80)], true);
+        assert_eq!(
+            got,
+            "jhash ip saddr mod 2 map { 0 : 10.244.0.10 . 80, 1 : 10.244.0.11 . 80 }"
+        );
+    }
+
+    #[test]
+    fn node_port_forwards_on_every_local_address() {
+        let forwards = vec![Forward {
+            cluster_ip: "10.96.0.40".into(),
+            proto: "tcp".into(),
+            port: 80,
+            load_balancer: false,
+            node_port: Some(31000),
+            client_ip_affinity: false,
+            backends: vec![sock(5, 9376)],
+        }];
+        let got = render_ruleset("r8s_t", &forwards, &[]);
+        assert!(got.contains(
+            "add rule ip r8s_t prerouting fib daddr type local ip daddr != 10.96.0.0/16 tcp dport 31000 dnat to 10.244.0.5:9376\n"
+        ));
+        assert!(got.contains(
+            "add rule ip r8s_t output fib daddr type local ip daddr != 10.96.0.0/16 tcp dport 31000 dnat to 10.244.0.5:9376\n"
+        ));
     }
 
     #[test]
@@ -312,6 +495,8 @@ mod tests {
                 proto: "tcp".into(),
                 port: 443,
                 load_balancer: false,
+                node_port: None,
+                client_ip_affinity: false,
                 backends: vec![sock(5, 6443)],
             },
             Forward {
@@ -319,10 +504,12 @@ mod tests {
                 proto: "udp".into(),
                 port: 53,
                 load_balancer: true,
+                node_port: None,
+                client_ip_affinity: false,
                 backends: vec![sock(6, 5353), sock(7, 5353)],
             },
         ];
-        let got = render_ruleset("r8s_t", &forwards);
+        let got = render_ruleset("r8s_t", &forwards, &[]);
         let expected = "\
 flush chain ip r8s_t prerouting
 flush chain ip r8s_t output
@@ -339,8 +526,112 @@ add rule ip r8s_t output udp dport 53 dnat to numgen inc mod 2 map { 0 : 10.244.
     #[test]
     fn empty_ruleset_only_flushes() {
         assert_eq!(
-            render_ruleset("r8s_t", &[]),
+            render_ruleset("r8s_t", &[], &[]),
             "flush chain ip r8s_t prerouting\nflush chain ip r8s_t output\n"
+        );
+    }
+
+    #[test]
+    fn host_ports_dnat_on_both_chains() {
+        let host_ports = vec![
+            HostPortForward {
+                host_ip: Some(Ipv4Addr::new(127, 0, 0, 1)),
+                proto: "tcp".into(),
+                host_port: 54321,
+                backend: sock(5, 8080),
+            },
+            HostPortForward {
+                host_ip: None,
+                proto: "udp".into(),
+                host_port: 54321,
+                backend: sock(6, 8080),
+            },
+        ];
+        let got = render_ruleset("r8s_t", &[], &host_ports);
+        let expected = "\
+flush chain ip r8s_t prerouting
+flush chain ip r8s_t output
+add rule ip r8s_t prerouting ip daddr 127.0.0.1 tcp dport 54321 dnat to 10.244.0.5:8080
+add rule ip r8s_t output ip daddr 127.0.0.1 tcp dport 54321 dnat to 10.244.0.5:8080
+add rule ip r8s_t prerouting fib daddr type local ip daddr != 10.96.0.0/16 udp dport 54321 dnat to 10.244.0.6:8080
+add rule ip r8s_t output fib daddr type local ip daddr != 10.96.0.0/16 udp dport 54321 dnat to 10.244.0.6:8080
+";
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn host_ports_come_from_running_pods_with_an_address() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("test.db")).unwrap();
+        let pods = GroupVersionResource::pods();
+        let pod = |name: &str, host_ip: &str, proto: &str, status: serde_json::Value| {
+            json!({
+                "apiVersion": "v1", "kind": "Pod",
+                "metadata": {"name": name, "namespace": "default"},
+                "spec": {"containers": [{"name": "c", "image": "i", "ports": [
+                    {"containerPort": 8080, "hostPort": 54321, "hostIP": host_ip, "protocol": proto}
+                ]}]},
+                "status": status,
+            })
+        };
+        seed(
+            &store,
+            &pods,
+            "tcp-local",
+            pod(
+                "tcp-local",
+                "127.0.0.1",
+                "TCP",
+                json!({"phase": "Running", "podIP": "10.244.0.5"}),
+            ),
+        );
+        seed(
+            &store,
+            &pods,
+            "udp-any",
+            pod(
+                "udp-any",
+                "",
+                "UDP",
+                json!({"phase": "Running", "podIP": "10.244.0.6"}),
+            ),
+        );
+        seed(
+            &store,
+            &pods,
+            "pending",
+            pod("pending", "", "TCP", json!({"phase": "Pending"})),
+        );
+        seed(
+            &store,
+            &pods,
+            "done",
+            pod(
+                "done",
+                "",
+                "TCP",
+                json!({"phase": "Succeeded", "podIP": "10.244.0.7"}),
+            ),
+        );
+
+        let mut got = collect_host_ports(&store);
+        got.sort_by_key(|h| h.backend);
+        assert_eq!(
+            got,
+            vec![
+                HostPortForward {
+                    host_ip: Some(Ipv4Addr::new(127, 0, 0, 1)),
+                    proto: "tcp".into(),
+                    host_port: 54321,
+                    backend: sock(5, 8080),
+                },
+                HostPortForward {
+                    host_ip: None,
+                    proto: "udp".into(),
+                    host_port: 54321,
+                    backend: sock(6, 8080),
+                },
+            ]
         );
     }
 

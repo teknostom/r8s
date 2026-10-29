@@ -96,6 +96,7 @@ impl ResourceRegistry {
         let r = Self::new();
         for b in builtins() {
             let schema = crate::openapi::schema_for(&b.gvr.group, &b.gvr.version, b.kind);
+            let shared_events = b.gvr.group == "events.k8s.io" && b.gvr.resource == "events";
             r.register(ResourceType {
                 gvr: b.gvr,
                 kind: b.kind.to_string(),
@@ -104,6 +105,8 @@ impl ResourceRegistry {
                 short_names: b.short_names.iter().map(|s| s.to_string()).collect(),
                 subresources: b.subresources.iter().map(|s| s.to_string()).collect(),
                 schema,
+                // events.k8s.io Events are stored as core Events.
+                storage_gvr: shared_events.then(GroupVersionResource::events),
             });
         }
         r
@@ -135,12 +138,14 @@ fn builtins() -> Vec<Builtin> {
         Builtin { gvr: G::endpoints(), kind: "Endpoints", namespaced: true, singular: "endpoints", short_names: &["ep"], subresources: &[] },
         Builtin { gvr: G::nodes(), kind: "Node", namespaced: false, singular: "node", short_names: &["no"], subresources: &[] },
         Builtin { gvr: G::new("", "v1", "events"), kind: "Event", namespaced: true, singular: "event", short_names: &["ev"], subresources: &[] },
+        Builtin { gvr: G::new("", "v1", "limitranges"), kind: "LimitRange", namespaced: true, singular: "limitrange", short_names: &["limits"], subresources: &[] },
         Builtin { gvr: G::resource_quotas(), kind: "ResourceQuota", namespaced: true, singular: "resourcequota", short_names: &["quota"], subresources: &[] },
         Builtin { gvr: G::pod_templates(), kind: "PodTemplate", namespaced: true, singular: "podtemplate", short_names: &[], subresources: &[] },
         Builtin { gvr: G::deployments(), kind: "Deployment", namespaced: true, singular: "deployment", short_names: &["deploy"], subresources: &["scale"] },
         Builtin { gvr: G::replica_sets(), kind: "ReplicaSet", namespaced: true, singular: "replicaset", short_names: &["rs"], subresources: &["scale"] },
         Builtin { gvr: G::stateful_sets(), kind: "StatefulSet", namespaced: true, singular: "statefulset", short_names: &["sts"], subresources: &["scale"] },
         Builtin { gvr: G::daemon_sets(), kind: "DaemonSet", namespaced: true, singular: "daemonset", short_names: &["ds"], subresources: &[] },
+        Builtin { gvr: G::controller_revisions(), kind: "ControllerRevision", namespaced: true, singular: "controllerrevision", short_names: &[], subresources: &[] },
         Builtin { gvr: G::ingresses(), kind: "Ingress", namespaced: true, singular: "ingress", short_names: &["ing"], subresources: &[] },
         Builtin { gvr: G::ingress_classes(), kind: "IngressClass", namespaced: false, singular: "ingressclass", short_names: &[], subresources: &[] },
         // Inert: no CNI policy enforcement.
@@ -160,17 +165,27 @@ fn builtins() -> Vec<Builtin> {
         Builtin { gvr: G::new("apiregistration.k8s.io", "v1", "apiservices"), kind: "APIService", namespaced: false, singular: "apiservice", short_names: &[], subresources: &[] },
         // Stored; admission webhooks are not dialed yet.
         Builtin { gvr: G::new("admissionregistration.k8s.io", "v1", "validatingwebhookconfigurations"), kind: "ValidatingWebhookConfiguration", namespaced: false, singular: "validatingwebhookconfiguration", short_names: &[], subresources: &[] },
+        Builtin { gvr: G::new("admissionregistration.k8s.io", "v1", "validatingadmissionpolicies"), kind: "ValidatingAdmissionPolicy", namespaced: false, singular: "validatingadmissionpolicy", short_names: &[], subresources: &[] },
+        Builtin { gvr: G::new("admissionregistration.k8s.io", "v1", "validatingadmissionpolicybindings"), kind: "ValidatingAdmissionPolicyBinding", namespaced: false, singular: "validatingadmissionpolicybinding", short_names: &[], subresources: &[] },
         Builtin { gvr: G::new("admissionregistration.k8s.io", "v1", "mutatingwebhookconfigurations"), kind: "MutatingWebhookConfiguration", namespaced: false, singular: "mutatingwebhookconfiguration", short_names: &[], subresources: &[] },
         // Inert: registered only to appear in discovery.
         Builtin { gvr: G::new("authentication.k8s.io", "v1", "tokenreviews"), kind: "TokenReview", namespaced: false, singular: "tokenreview", short_names: &[], subresources: &[] },
         Builtin { gvr: G::new("authorization.k8s.io", "v1", "selfsubjectaccessreviews"), kind: "SelfSubjectAccessReview", namespaced: false, singular: "selfsubjectaccessreview", short_names: &[], subresources: &[] },
         Builtin { gvr: G::new("authorization.k8s.io", "v1", "selfsubjectrulesreviews"), kind: "SelfSubjectRulesReview", namespaced: false, singular: "selfsubjectrulesreview", short_names: &[], subresources: &[] },
+        Builtin { gvr: G::new("authorization.k8s.io", "v1", "subjectaccessreviews"), kind: "SubjectAccessReview", namespaced: false, singular: "subjectaccessreview", short_names: &[], subresources: &[] },
+        Builtin { gvr: G::new("authorization.k8s.io", "v1", "localsubjectaccessreviews"), kind: "LocalSubjectAccessReview", namespaced: true, singular: "localsubjectaccessreview", short_names: &[], subresources: &[] },
         Builtin { gvr: G::new("autoscaling", "v1", "horizontalpodautoscalers"), kind: "HorizontalPodAutoscaler", namespaced: true, singular: "horizontalpodautoscaler", short_names: &[], subresources: &[] },
-        Builtin { gvr: G::new("certificates.k8s.io", "v1", "certificatesigningrequests"), kind: "CertificateSigningRequest", namespaced: false, singular: "certificatesigningrequest", short_names: &["csr"], subresources: &[] },
+        Builtin { gvr: G::new("certificates.k8s.io", "v1", "certificatesigningrequests"), kind: "CertificateSigningRequest", namespaced: false, singular: "certificatesigningrequest", short_names: &["csr"], subresources: &["approval"] },
         Builtin { gvr: G::new("events.k8s.io", "v1", "events"), kind: "Event", namespaced: true, singular: "event", short_names: &["ev"], subresources: &[] },
         Builtin { gvr: G::new("node.k8s.io", "v1", "runtimeclasses"), kind: "RuntimeClass", namespaced: false, singular: "runtimeclass", short_names: &[], subresources: &[] },
         Builtin { gvr: G::new("scheduling.k8s.io", "v1", "priorityclasses"), kind: "PriorityClass", namespaced: false, singular: "priorityclass", short_names: &["pc"], subresources: &[] },
+        // Stored only: extension apiservers' flow-control informers must sync before they report ready.
+        Builtin { gvr: G::new("flowcontrol.apiserver.k8s.io", "v1", "flowschemas"), kind: "FlowSchema", namespaced: false, singular: "flowschema", short_names: &[], subresources: &[] },
+        Builtin { gvr: G::new("flowcontrol.apiserver.k8s.io", "v1", "prioritylevelconfigurations"), kind: "PriorityLevelConfiguration", namespaced: false, singular: "prioritylevelconfiguration", short_names: &[], subresources: &[] },
         Builtin { gvr: G::new("storage.k8s.io", "v1", "csinodes"), kind: "CSINode", namespaced: false, singular: "csinode", short_names: &[], subresources: &[] },
+        Builtin { gvr: G::new("storage.k8s.io", "v1", "csidrivers"), kind: "CSIDriver", namespaced: false, singular: "csidriver", short_names: &[], subresources: &[] },
+        Builtin { gvr: G::new("storage.k8s.io", "v1", "csistoragecapacities"), kind: "CSIStorageCapacity", namespaced: true, singular: "csistoragecapacity", short_names: &[], subresources: &[] },
+        Builtin { gvr: G::new("storage.k8s.io", "v1", "volumeattachments"), kind: "VolumeAttachment", namespaced: false, singular: "volumeattachment", short_names: &[], subresources: &[] },
         Builtin { gvr: G::persistent_volume_claims(), kind: "PersistentVolumeClaim", namespaced: true, singular: "persistentvolumeclaim", short_names: &["pvc"], subresources: &[] },
         Builtin { gvr: G::persistent_volumes(), kind: "PersistentVolume", namespaced: false, singular: "persistentvolume", short_names: &["pv"], subresources: &[] },
         Builtin { gvr: G::storage_classes(), kind: "StorageClass", namespaced: false, singular: "storageclass", short_names: &["sc"], subresources: &[] },
@@ -191,6 +206,7 @@ mod tests {
             short_names: vec![],
             subresources: vec![],
             schema: None,
+            storage_gvr: None,
         }
     }
 

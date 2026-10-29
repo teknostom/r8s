@@ -21,6 +21,10 @@ rustls.workspace = true
 tokio-rustls.workspace = true
 axum.workspace = true
 axum-server.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+http-body-util.workspace = true
+futures-util = "0.3"
 
 [dev-dependencies]
 tempfile.workspace = true

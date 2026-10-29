@@ -27,15 +27,22 @@ pub fn list_response(
     kind: &str,
     rv: u64,
     continue_token: Option<&str>,
+    remaining_item_count: Option<u64>,
     items: Vec<Value>,
 ) -> Response {
     let mut metadata = serde_json::json!({
         "resourceVersion": rv.to_string(),
     });
-    if let Some(token) = continue_token
-        && let Some(obj) = metadata.as_object_mut()
-    {
-        obj.insert("continue".to_string(), serde_json::json!(token));
+    if let Some(obj) = metadata.as_object_mut() {
+        if let Some(token) = continue_token {
+            obj.insert("continue".to_string(), serde_json::json!(token));
+        }
+        if let Some(remaining) = remaining_item_count {
+            obj.insert(
+                "remainingItemCount".to_string(),
+                serde_json::json!(remaining),
+            );
+        }
     }
 
     let body = serde_json::json!({
@@ -61,12 +68,34 @@ pub fn status_error(status: StatusCode, reason: &str, message: &str) -> Response
     json_response(status.as_u16(), &body)
 }
 
+/// Upstream's wording for a continue token that outlived the consistency
+/// window; `metadata.continue` carries the token that resumes inconsistently.
+const INCONSISTENT_CONTINUE: &str = "The provided continue parameter is too old to display a \
+consistent list result. You can start a new list without the continue parameter, or use the \
+continue token in this response to retrieve the remainder of the results. Continuing with the \
+provided token results in an inconsistent list - objects that were created, modified, or deleted \
+between the time the first chunk was returned and now may show up in the list.";
+
 pub fn store_error_response(err: &StoreError) -> Response {
+    if let StoreError::ContinueExpired { inconsistent_token } = err {
+        let body = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Status",
+            "status": "Failure",
+            "metadata": {"continue": inconsistent_token},
+            "message": INCONSISTENT_CONTINUE,
+            "reason": "Expired",
+            "code": StatusCode::GONE.as_u16(),
+        });
+        return json_response(StatusCode::GONE.as_u16(), &body);
+    }
     let (status, reason) = match err {
         StoreError::AlreadyExists { .. } => (StatusCode::CONFLICT, "AlreadyExists"),
         StoreError::NotFound { .. } => (StatusCode::NOT_FOUND, "NotFound"),
         StoreError::Conflict { .. } => (StatusCode::CONFLICT, "Conflict"),
-        StoreError::TooOld { .. } => (StatusCode::GONE, "Expired"),
+        StoreError::TooOld { .. } | StoreError::ContinueExpired { .. } => {
+            (StatusCode::GONE, "Expired")
+        }
         StoreError::InvalidMetadata
         | StoreError::InvalidContinueToken
         | StoreError::InvalidSelector(..) => (StatusCode::BAD_REQUEST, "BadRequest"),

@@ -12,12 +12,14 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::{Router, extract::State, response::IntoResponse, routing::get};
 use axum_server::tls_rustls::RustlsConfig;
 use r8s_runtime::{ContainerId, ContainerRuntime};
 use r8s_store::Store;
 use r8s_types::{GroupVersionResource, KUBELET_PORT, NODE_INTERNAL_IP};
+use tokio_util::sync::CancellationToken;
 
 /// USER_HZ on Linux (clock ticks per second for /proc/stat).
 const USER_HZ: f64 = 100.0;
@@ -32,6 +34,7 @@ pub async fn run<R: ContainerRuntime + 'static>(
     runtime: Arc<R>,
     cert_pem: Vec<u8>,
     key_pem: Vec<u8>,
+    shutdown: CancellationToken,
 ) -> anyhow::Result<()> {
     // rustls needs a process-wide crypto provider. The API server installs one
     // too, but this server starts first — install_default is idempotent (Err
@@ -46,7 +49,16 @@ pub async fn run<R: ContainerRuntime + 'static>(
         .with_state(state);
     let addr: SocketAddr = format!("{NODE_INTERNAL_IP}:{KUBELET_PORT}").parse()?;
     tracing::info!(%addr, "kubelet metrics server listening");
+    // Without a handle this serve loop never returns and the daemon's final
+    // task join hangs until the CLI's SIGKILL.
+    let handle = axum_server::Handle::new();
+    let shutdown_handle = handle.clone();
+    tokio::spawn(async move {
+        shutdown.cancelled().await;
+        shutdown_handle.graceful_shutdown(Some(Duration::from_secs(2)));
+    });
     axum_server::bind_rustls(addr, config)
+        .handle(handle)
         .serve(app.into_make_service())
         .await?;
     Ok(())
@@ -134,7 +146,7 @@ fn running_containers(store: &Store) -> Vec<(String, String, String, String)> {
                     namespace.to_string(),
                     pod_name.to_string(),
                     cname.to_string(),
-                    format!("{pod_name}_{cname}"),
+                    r8s_runtime::ContainerId::derive(namespace, pod_name, cname).0,
                 ));
             }
         }

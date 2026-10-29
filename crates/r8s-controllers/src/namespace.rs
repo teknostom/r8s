@@ -24,11 +24,47 @@ pub async fn run(
     reconcile_all(&store, &ns_gvr, &sa_gvr, &cm_gvr, &ca_pem, &registry);
 
     let mut rx = store.watch(&ns_gvr);
+    let mut cm_rx = store.watch(&cm_gvr);
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => {
                 tracing::info!("namespace controller shutting down");
                 return Ok(());
+            }
+            // The root CA ConfigMap comes back when deleted and is restored
+            // when edited, as the root-ca-cert-publisher keeps it.
+            event = cm_rx.recv() => {
+                match event {
+                    Ok(event) => {
+                        let meta = event.object.get("metadata");
+                        let name = meta.and_then(|m| m.get("name")).and_then(|v| v.as_str());
+                        let Some(namespace) = meta
+                            .and_then(|m| m.get("namespace"))
+                            .and_then(|v| v.as_str())
+                        else {
+                            continue;
+                        };
+                        if name != Some(KUBE_ROOT_CA_CONFIGMAP) {
+                            continue;
+                        }
+                        let ns_live = store
+                            .get(&ResourceRef { gvr: &ns_gvr, namespace: None, name: namespace })
+                            .ok()
+                            .flatten()
+                            .is_some_and(|ns| {
+                                ns.get("metadata")
+                                    .and_then(|m| m.get("deletionTimestamp"))
+                                    .is_none()
+                            });
+                        if ns_live {
+                            ensure_kube_root_ca(&store, &cm_gvr, namespace, &ca_pem);
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        reconcile_all(&store, &ns_gvr, &sa_gvr, &cm_gvr, &ca_pem, &registry);
+                    }
+                    Err(broadcast::error::RecvError::Closed) => return Ok(()),
+                }
             }
             event = rx.recv() => {
                 match event {
@@ -93,19 +129,28 @@ fn reconcile_all(
 
 /// Delete every namespaced object whose namespace isn't in `live`. Backstops
 /// [`cascade_delete`] for namespaces whose deletion event we missed.
-fn sweep_orphaned(store: &Store, registry: &ResourceRegistry, live: &rustc_hash::FxHashSet<String>) {
+fn sweep_orphaned(
+    store: &Store,
+    registry: &ResourceRegistry,
+    live: &rustc_hash::FxHashSet<String>,
+) {
     let mut deleted = 0u32;
+    let mut seen = rustc_hash::FxHashSet::default();
     for rt in registry.iter() {
-        if !rt.namespaced {
+        let gvr = rt.storage_gvr();
+        if !rt.namespaced || !seen.insert(gvr.key_prefix()) {
             continue;
         }
-        let items = match store.list(&rt.gvr, None, None, None, None, None) {
+        let items = match store.list(gvr, None, None, None, None, None) {
             Ok(r) => r.items,
             Err(_) => continue,
         };
         for item in &items {
             let meta = item.get("metadata");
-            let Some(ns) = meta.and_then(|m| m.get("namespace")).and_then(|v| v.as_str()) else {
+            let Some(ns) = meta
+                .and_then(|m| m.get("namespace"))
+                .and_then(|v| v.as_str())
+            else {
                 continue;
             };
             if live.contains(ns) {
@@ -116,7 +161,7 @@ fn sweep_orphaned(store: &Store, registry: &ResourceRegistry, live: &rustc_hash:
             };
             if matches!(
                 store.delete(&ResourceRef {
-                    gvr: &rt.gvr,
+                    gvr,
                     namespace: Some(ns),
                     name,
                 }),
@@ -140,11 +185,13 @@ fn sweep_orphaned(store: &Store, registry: &ResourceRegistry, live: &rustc_hash:
 /// Deleted event and reaps promptly; absent-owner GC mops up anything missed.
 fn cascade_delete(store: &Store, registry: &ResourceRegistry, namespace: &str) {
     let mut deleted = 0u32;
+    let mut seen = rustc_hash::FxHashSet::default();
     for rt in registry.iter() {
-        if !rt.namespaced {
+        let gvr = rt.storage_gvr();
+        if !rt.namespaced || !seen.insert(gvr.key_prefix()) {
             continue;
         }
-        let items = match store.list(&rt.gvr, Some(namespace), None, None, None, None) {
+        let items = match store.list(gvr, Some(namespace), None, None, None, None) {
             Ok(r) => r.items,
             Err(_) => continue,
         };
@@ -157,7 +204,7 @@ fn cascade_delete(store: &Store, registry: &ResourceRegistry, namespace: &str) {
                 continue;
             };
             let rref = ResourceRef {
-                gvr: &rt.gvr,
+                gvr,
                 namespace: Some(namespace),
                 name,
             };
@@ -219,7 +266,24 @@ fn ensure_kube_root_ca(
         name: KUBE_ROOT_CA_CONFIGMAP,
     };
     match store.get(&resource_ref) {
-        Ok(Some(_)) => {}
+        Ok(Some(mut existing)) => {
+            let current = existing
+                .get("data")
+                .and_then(|d| d.get("ca.crt"))
+                .and_then(|v| v.as_str());
+            if current == Some(ca_pem) {
+                return;
+            }
+            existing["data"] = serde_json::json!({"ca.crt": ca_pem});
+            match store.update(&resource_ref, &existing) {
+                Ok(_) => {
+                    tracing::info!("restored {KUBE_ROOT_CA_CONFIGMAP} in namespace '{namespace}'")
+                }
+                Err(e) => tracing::warn!(
+                    "failed to restore {KUBE_ROOT_CA_CONFIGMAP} in '{namespace}': {e}"
+                ),
+            }
+        }
         Ok(None) => {
             let mut data = BTreeMap::new();
             data.insert(

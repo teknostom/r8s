@@ -1,7 +1,5 @@
 use r8s_store::{Store, backend::ResourceRef, watch::WatchEventType};
-use r8s_types::{
-    GroupVersionResource, ObjectMeta, Pod, PodTemplateSpec, ReplicaSetStatus,
-};
+use r8s_types::{GroupVersionResource, ObjectMeta, Pod, PodTemplateSpec, ReplicaSetStatus};
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
@@ -51,6 +49,15 @@ pub async fn run(store: Store, shutdown: CancellationToken) -> anyhow::Result<()
                                 name: &owner.name,
                             };
                             if let Ok(Some(rs)) = store.get(&resource_ref) {
+                                let _ = reconcile_rs(&store, &rs);
+                            }
+                        } else {
+                            for rs in crate::orphan_candidates(
+                                &store,
+                                &GroupVersionResource::replica_sets(),
+                                &pod,
+                                crate::spec_selector,
+                            ) {
                                 let _ = reconcile_rs(&store, &rs);
                             }
                         }
@@ -124,19 +131,29 @@ fn reconcile_rs(store: &Store, rs_value: &serde_json::Value) -> anyhow::Result<(
         .ok_or_else(|| anyhow::anyhow!("RS has no template"))?;
 
     let pod_gvr = GroupVersionResource::pods();
-    let owned: Vec<Pod> = store
-        .list_as::<Pod>(&pod_gvr, rs_ns)?
-        .into_iter()
-        .filter(|p| is_owned_by(&p.metadata, current_uid))
-        .collect();
+    let owner = crate::owner_reference("apps/v1", "ReplicaSet", rs_name, current_uid);
+    let selector = &current_spec.selector;
+    let terminating = current.metadata.deletion_timestamp.is_some();
+    let owned = crate::claim_pods(store, rs_ns, &owner, terminating, |p| {
+        crate::selector_matches(selector, p.metadata.labels.as_ref())
+    })?;
     let current_count = owned.len() as u64;
 
+    let mut create_failure: Option<String> = None;
     if current_count < desired {
         let to_create = desired - current_count;
+        let mut created = 0;
         for _ in 0..to_create {
-            create_pod(store, rs_name, current_uid, rs_ns, template)?;
+            match create_pod(store, rs_name, current_uid, rs_ns, template) {
+                Ok(()) => created += 1,
+                Err(e) => {
+                    tracing::warn!("rs '{rs_name}': create pod: {e}");
+                    create_failure = Some(format!("Error creating: {e}"));
+                    break;
+                }
+            }
         }
-        tracing::info!("rs '{rs_name}': created {to_create} pods ({current_count} -> {desired})");
+        tracing::info!("rs '{rs_name}': created {created} pods ({current_count} -> {desired})");
     } else if current_count > desired {
         let to_delete = current_count - desired;
         for pod in owned.iter().rev().take(to_delete as usize) {
@@ -159,7 +176,14 @@ fn reconcile_rs(store: &Store, rs_value: &serde_json::Value) -> anyhow::Result<(
         .collect();
     let final_count = final_pods.len() as i32;
     let ready_count = final_pods.iter().filter(|p| crate::pod_ready(p)).count() as i32;
-    update_rs_status(store, rs_name, rs_ns, final_count, ready_count)?;
+    update_rs_status(
+        store,
+        rs_name,
+        rs_ns,
+        final_count,
+        ready_count,
+        create_failure.as_deref(),
+    )?;
 
     Ok(())
 }
@@ -197,17 +221,25 @@ fn create_pod(
         name: &pod_name,
     };
     let mut pod_value = serde_json::to_value(&pod)?;
-    crate::pod_admission::inject_sa_token(store, &mut pod_value);
+    crate::pod_admission::admit_pod(store, &mut pod_value);
+    if let Some(ns) = namespace
+        && let Err(msg) = crate::quota::check_admission(store, &gvr, ns, &pod_value)
+    {
+        anyhow::bail!("pods \"{pod_name}\" is forbidden: {msg}");
+    }
     store.create(resource_ref, &pod_value)?;
     Ok(())
 }
 
+/// Store the counts, `observedGeneration`, and a `ReplicaFailure` condition
+/// while pod creation is being refused (cleared once it succeeds again).
 fn update_rs_status(
     store: &Store,
     rs_name: &str,
     rs_ns: Option<&str>,
     replica_count: i32,
     ready_count: i32,
+    create_failure: Option<&str>,
 ) -> anyhow::Result<()> {
     let gvr = GroupVersionResource::replica_sets();
     let resource_ref = ResourceRef {
@@ -225,9 +257,14 @@ fn update_rs_status(
         replicas: replica_count,
         ready_replicas: Some(ready_count),
         available_replicas: Some(ready_count),
+        observed_generation: current["metadata"]["generation"].as_i64(),
         ..Default::default()
     };
-    let new_status_val = serde_json::to_value(&status)?;
+    let mut new_status_val = serde_json::to_value(&status)?;
+    if let Some(message) = create_failure {
+        new_status_val["conditions"] =
+            serde_json::json!([crate::replica_failure_condition(&current, message)]);
+    }
     if current.get("status") == Some(&new_status_val) {
         return Ok(());
     }

@@ -8,6 +8,7 @@ pub mod traits;
 pub use error::RuntimeError;
 pub use mock::MockRuntime;
 pub use traits::{
-    ContainerConfig, ContainerId, ContainerRuntime, ContainerStatus, ExecConfig, ExecRuntime,
+    ContainerConfig, ContainerId, ContainerRuntime, ContainerStatus, DnsConfig, ExecConfig,
+    ExecRuntime,
     ExecStreams, ImageId, Mount, OwnedContainer, RegistryAuth,
 };

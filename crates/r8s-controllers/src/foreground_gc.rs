@@ -56,7 +56,14 @@ fn reconcile(
     registry: &ResourceRegistry,
     prev_orphans: &FxHashSet<String>,
 ) -> FxHashSet<String> {
-    let gvrs: Vec<GroupVersionResource> = registry.iter().iter().map(|rt| rt.gvr.clone()).collect();
+    // Dedupe: served versions of a CRD share one storage GVR.
+    let gvrs: Vec<GroupVersionResource> = registry
+        .iter()
+        .iter()
+        .map(|rt| rt.storage_gvr().clone())
+        .collect::<FxHashSet<_>>()
+        .into_iter()
+        .collect();
     // Build a fresh UID set: every object that currently exists in any
     // registered GVR. Used by both passes — foreground (to know which other
     // owners are still alive) and orphan-by-absence (to find dependents
@@ -203,9 +210,7 @@ fn is_deletion_finalized(obj: &Value) -> bool {
         Some(m) => m,
         None => return false,
     };
-    let marked = meta
-        .get("deletionTimestamp")
-        .is_some_and(|v| !v.is_null());
+    let marked = meta.get("deletionTimestamp").is_some_and(|v| !v.is_null());
     if !marked {
         return false;
     }
@@ -612,7 +617,8 @@ mod tests {
             .map(|v| v.as_str().unwrap())
             .collect();
         assert_eq!(
-            fins, ["example.com/keep"],
+            fins,
+            ["example.com/keep"],
             "only the foreground finalizer is stripped"
         );
     }

@@ -4,13 +4,15 @@ use std::sync::Arc;
 use r8s_store::Store;
 use r8s_store::backend::ResourceRef;
 use r8s_types::{GroupVersionResource, NODE_INTERNAL_IP, Service};
-use tokio::net::UdpSocket;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, UdpSocket};
 use tokio_util::sync::CancellationToken;
 
 use crate::endpoints::ready_endpoint_addresses;
 use crate::error::Result;
 
 const QTYPE_A: u16 = 1;
+const QTYPE_CNAME: u16 = 5;
 
 pub async fn run_dns_server(
     store: Store,
@@ -23,6 +25,7 @@ pub async fn run_dns_server(
 
     let bind_addr = format!("{NODE_INTERNAL_IP}:53");
     let socket = Arc::new(UdpSocket::bind(bind_addr.as_str()).await?);
+    let listener = TcpListener::bind(bind_addr.as_str()).await?;
     tracing::info!(upstream, %bind_addr, "DNS server listening");
 
     let mut buf = [0u8; 512];
@@ -44,27 +47,50 @@ pub async fn run_dns_server(
                 let socket = socket.clone();
                 let upstream = upstream.clone();
                 tokio::spawn(async move {
-                    // Anything under `cluster.local` is our zone and answered
-                    // authoritatively — including NXDOMAIN. Forwarding those
-                    // upstream would leak cluster names and add a 2s-timeout
-                    // round-trip to every ndots:5 search expansion of an external
-                    // lookup (`github.com.cluster.local` and friends).
-                    let response = match parse_query(&query) {
-                        Some((name, qtype)) if is_cluster_local(&name) => {
-                            answer_cluster_query(&store, &query, &name, qtype)
-                        }
-                        _ => match forward_query(&query, &upstream).await {
-                            Ok(r) => r,
-                            Err(e) => {
-                                tracing::debug!("DNS forward error: {e}");
-                                build_nxdomain(&query)
-                            }
-                        },
-                    };
+                    let response = respond(&store, &upstream, &query).await;
                     let _ = socket.send_to(&response, src).await;
                 });
             }
+            accepted = listener.accept() => {
+                let (mut conn, _) = accepted?;
+                let store = store.clone();
+                let upstream = upstream.clone();
+                tokio::spawn(async move {
+                    // One length-prefixed query per connection, as `dig +tcp` sends.
+                    let mut len = [0u8; 2];
+                    if conn.read_exact(&mut len).await.is_err() {
+                        return;
+                    }
+                    let mut query = vec![0u8; u16::from_be_bytes(len) as usize];
+                    if conn.read_exact(&mut query).await.is_err() {
+                        return;
+                    }
+                    let response = respond(&store, &upstream, &query).await;
+                    let mut framed = (response.len() as u16).to_be_bytes().to_vec();
+                    framed.extend_from_slice(&response);
+                    let _ = conn.write_all(&framed).await;
+                });
+            }
         }
+    }
+}
+
+/// The response to one query. Anything under `cluster.local` is our zone and
+/// answered authoritatively — including NXDOMAIN. Forwarding those upstream
+/// would leak cluster names and add a 2s-timeout round-trip to every ndots:5
+/// search expansion of an external lookup (`github.com.cluster.local`).
+async fn respond(store: &Store, upstream: &str, query: &[u8]) -> Vec<u8> {
+    match parse_query(query) {
+        Some((name, qtype)) if is_cluster_local(&name) => {
+            answer_cluster_query(store, query, &name, qtype)
+        }
+        _ => match forward_query(query, upstream).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::debug!("DNS forward error: {e}");
+                build_nxdomain(query)
+            }
+        },
     }
 }
 
@@ -115,12 +141,27 @@ fn parse_query(packet: &[u8]) -> Option<(String, u16)> {
 /// NXDOMAIN for everything else.
 fn answer_cluster_query(store: &Store, query: &[u8], name: &str, qtype: u16) -> Vec<u8> {
     match resolve_cluster_name(store, name) {
-        Some(ips) => {
+        Some(Resolved::Ips(ips)) => {
             let ips = if qtype == QTYPE_A { ips } else { Vec::new() };
             build_answer(query, &ips)
         }
+        Some(Resolved::Cname(target)) => {
+            if qtype == QTYPE_A || qtype == QTYPE_CNAME {
+                build_cname_answer(query, &target)
+            } else {
+                build_answer(query, &[])
+            }
+        }
         None => build_nxdomain(query),
     }
+}
+
+/// What a `cluster.local` name resolves to.
+#[derive(Debug, PartialEq, Eq)]
+enum Resolved {
+    Ips(Vec<Ipv4Addr>),
+    /// An ExternalName Service: its target, as a CNAME.
+    Cname(String),
 }
 
 /// Resolve a `cluster.local` name to IPs, or `None` if the name doesn't exist.
@@ -131,7 +172,7 @@ fn answer_cluster_query(store: &Store, query: &[u8], name: &str, qtype: u16) -> 
 ///   `<hostname>.<svc>.<ns>.svc.cluster.local` — the single pod published
 ///       under that endpoint hostname. This is how StatefulSet peers find
 ///       each other (`redis-master-0.redis-headless.<ns>.svc.cluster.local`).
-fn resolve_cluster_name(store: &Store, name: &str) -> Option<Vec<Ipv4Addr>> {
+fn resolve_cluster_name(store: &Store, name: &str) -> Option<Resolved> {
     let parts: Vec<&str> = name.split('.').collect();
     match parts.as_slice() {
         [svc, ns, "svc", "cluster", "local"] => {
@@ -143,14 +184,23 @@ fn resolve_cluster_name(store: &Store, name: &str) -> Option<Vec<Ipv4Addr>> {
                     name: svc,
                 })
                 .ok()??;
-            match service.spec.as_ref().and_then(|s| s.cluster_ip.as_deref()) {
-                Some(ip) if !ip.is_empty() && ip != "None" => Some(vec![ip.parse().ok()?]),
+            let spec = service.spec.as_ref();
+            if spec.and_then(|s| s.type_.as_deref()) == Some("ExternalName")
+                && let Some(target) = spec.and_then(|s| s.external_name.as_deref())
+                && !target.is_empty()
+            {
+                return Some(Resolved::Cname(target.trim_end_matches('.').to_string()));
+            }
+            match spec.and_then(|s| s.cluster_ip.as_deref()) {
+                Some(ip) if !ip.is_empty() && ip != "None" => {
+                    Some(Resolved::Ips(vec![ip.parse().ok()?]))
+                }
                 // Headless: the Service name resolves straight to the pods.
-                _ => non_empty(endpoint_ips(store, ns, svc, None)),
+                _ => non_empty(endpoint_ips(store, ns, svc, None)).map(Resolved::Ips),
             }
         }
         [host, svc, ns, "svc", "cluster", "local"] => {
-            non_empty(endpoint_ips(store, ns, svc, Some(host)))
+            non_empty(endpoint_ips(store, ns, svc, Some(host))).map(Resolved::Ips)
         }
         _ => None,
     }
@@ -215,6 +265,35 @@ fn build_answer(query: &[u8], ips: &[Ipv4Addr]) -> Vec<u8> {
         resp.extend_from_slice(&ip.octets());
     }
 
+    resp
+}
+
+/// A NOERROR response with one CNAME record pointing at `target`.
+fn build_cname_answer(query: &[u8], target: &str) -> Vec<u8> {
+    let Some(q_end) = question_end(query) else {
+        return build_nxdomain(query);
+    };
+    let mut rdata = Vec::new();
+    for label in target.split('.').filter(|l| !l.is_empty()) {
+        let bytes = &label.as_bytes()[..label.len().min(63)];
+        rdata.push(bytes.len() as u8);
+        rdata.extend_from_slice(bytes);
+    }
+    rdata.push(0);
+
+    let mut resp = Vec::with_capacity(q_end + 12 + rdata.len());
+    resp.extend_from_slice(&query[..q_end]);
+    // QR=1, AA=1, RCODE=0; ANCOUNT=1, NSCOUNT=0, ARCOUNT=0
+    resp[2] = 0x84;
+    resp[3] = 0x00;
+    resp[6..12].copy_from_slice(&[0x00, 0x01, 0x00, 0x00, 0x00, 0x00]);
+    // Answer: pointer to QNAME, TYPE=CNAME, CLASS=IN, TTL=5s
+    resp.extend_from_slice(&[0xC0, 0x0C]);
+    resp.extend_from_slice(&QTYPE_CNAME.to_be_bytes());
+    resp.extend_from_slice(&[0x00, 0x01]);
+    resp.extend_from_slice(&5u32.to_be_bytes());
+    resp.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+    resp.extend_from_slice(&rdata);
     resp
 }
 
@@ -319,6 +398,36 @@ mod tests {
 
     fn rcode(resp: &[u8]) -> u8 {
         resp[3] & 0x0F
+    }
+
+    #[test]
+    fn external_name_service_answers_with_a_cname() {
+        let (_dir, store) = temp_store();
+        create(
+            &store,
+            &GroupVersionResource::services(),
+            "ns1",
+            "ext",
+            json!({
+                "apiVersion": "v1", "kind": "Service",
+                "metadata": {"name": "ext", "namespace": "ns1"},
+                "spec": {"type": "ExternalName", "externalName": "foo.example.com"}
+            }),
+        );
+        for qtype in [QTYPE_A, QTYPE_CNAME] {
+            let q = query_packet("ext.ns1.svc.cluster.local", qtype);
+            let resp = answer_cluster_query(&store, &q, "ext.ns1.svc.cluster.local", qtype);
+            assert_eq!(rcode(&resp), 0);
+            assert_eq!(&resp[6..8], &[0, 1], "one answer");
+            let answer = &resp[q.len()..];
+            assert_eq!(&answer[2..4], &QTYPE_CNAME.to_be_bytes());
+            let rdata = &answer[12..];
+            assert_eq!(rdata, b"\x03foo\x07example\x03com\x00");
+        }
+        assert_eq!(
+            resolve_cluster_name(&store, "ext.ns1.svc.cluster.local"),
+            Some(Resolved::Cname("foo.example.com".into()))
+        );
     }
 
     fn answer_ips(query: &[u8], resp: &[u8]) -> Vec<Ipv4Addr> {

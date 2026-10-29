@@ -663,7 +663,7 @@ fn field_selector_not_equals() {
 /// test, not the store, decides what `spec.unschedulable` defaults to.
 #[test]
 fn field_selector_applies_injected_defaults() {
-    fn defaults(_gvr: &str, field: &str) -> Option<String> {
+    fn defaults(_object: &serde_json::Value, _gvr: &str, field: &str) -> Option<String> {
         (field == "spec.unschedulable").then(|| "false".to_string())
     }
 
@@ -872,7 +872,10 @@ async fn list_pagination_survives_deleted_continue_key() {
         .unwrap();
     assert_eq!(page1.items.len(), 2);
     assert_eq!(page1.items[1]["metadata"]["name"], "b");
-    let token = page1.continue_token.clone().expect("expected continue token");
+    let token = page1
+        .continue_token
+        .clone()
+        .expect("expected continue token");
 
     // Delete the row the token points at, then resume.
     store
@@ -891,7 +894,11 @@ async fn list_pagination_survives_deleted_continue_key() {
         .iter()
         .map(|i| i["metadata"]["name"].as_str().unwrap())
         .collect();
-    assert_eq!(names, vec!["c", "d"], "must not skip 'c' after 'b' was deleted");
+    assert_eq!(
+        names,
+        vec!["c", "d"],
+        "must not skip 'c' after 'b' was deleted"
+    );
 }
 
 // ── Store: no-op detection ignores resourceVersion ───────────────────
@@ -931,4 +938,232 @@ async fn update_ignoring_resource_version_is_a_noop() {
     };
     let again = store.update(&rref, &incoming).unwrap();
     assert_eq!(again["metadata"]["resourceVersion"].as_str().unwrap(), rv);
+}
+
+// ── Store: apiserver-shaped continue tokens and remainingItemCount ─────────
+
+mod paging_tokens {
+    use base64::prelude::*;
+    use r8s_store::{Store, StoreError, backend::ResourceRef};
+    use r8s_types::GroupVersionResource;
+
+    fn store_with(n: usize) -> (tempfile::TempDir, Store, GroupVersionResource) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("s.db")).unwrap();
+        let gvr = GroupVersionResource::new("", "v1", "podtemplates");
+        for i in 0..n {
+            let name = format!("template-{i:04}");
+            store
+                .create(
+                    ResourceRef {
+                        gvr: &gvr,
+                        namespace: Some("default"),
+                        name: &name,
+                    },
+                    &serde_json::json!({"metadata": {"name": name, "namespace": "default"}}),
+                )
+                .unwrap();
+        }
+        (dir, store, gvr)
+    }
+
+    fn decode(token: &str) -> serde_json::Value {
+        serde_json::from_slice(&BASE64_URL_SAFE_NO_PAD.decode(token).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn pages_carry_remaining_count_and_one_resource_version() {
+        let (_d, store, gvr) = store_with(5);
+        let page1 = store
+            .list(&gvr, Some("default"), None, None, Some(2), None)
+            .unwrap();
+        assert_eq!(page1.items.len(), 2);
+        assert_eq!(page1.remaining_item_count, Some(3));
+        let token = page1.continue_token.clone().expect("more pages");
+        let decoded = decode(&token);
+        assert_eq!(decoded["v"], "meta.k8s.io/v1");
+        assert_eq!(decoded["rv"], page1.resource_version);
+        assert_eq!(decoded["start"], "template-0001");
+
+        let page2 = store
+            .list(&gvr, Some("default"), None, None, Some(2), Some(&token))
+            .unwrap();
+        assert_eq!(page2.items.len(), 2);
+        assert_eq!(page2.remaining_item_count, Some(1));
+        assert_eq!(page2.resource_version, page1.resource_version);
+
+        let page3 = store
+            .list(
+                &gvr,
+                Some("default"),
+                None,
+                None,
+                Some(2),
+                page2.continue_token.as_deref(),
+            )
+            .unwrap();
+        assert_eq!(page3.items.len(), 1);
+        assert!(page3.continue_token.is_none(), "last page has no continue");
+        assert!(page3.remaining_item_count.is_none());
+        let names: Vec<_> = [&page1, &page2, &page3]
+            .iter()
+            .flat_map(|p| {
+                p.items
+                    .iter()
+                    .map(|i| i["metadata"]["name"].as_str().unwrap().to_string())
+            })
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "template-0000",
+                "template-0001",
+                "template-0002",
+                "template-0003",
+                "template-0004"
+            ]
+        );
+    }
+
+    #[test]
+    fn exact_fit_page_has_no_continue() {
+        let (_d, store, gvr) = store_with(4);
+        let page = store
+            .list(&gvr, Some("default"), None, None, Some(4), None)
+            .unwrap();
+        assert_eq!(page.items.len(), 4);
+        assert!(page.continue_token.is_none());
+        assert!(page.remaining_item_count.is_none());
+    }
+
+    #[test]
+    fn selector_suppresses_remaining_count() {
+        let (_d, store, gvr) = store_with(5);
+        let sel = r8s_store::index::LabelSelector::parse("").unwrap();
+        let page = store
+            .list(&gvr, Some("default"), Some(&sel), None, Some(2), None)
+            .unwrap();
+        assert!(page.continue_token.is_some());
+        assert!(page.remaining_item_count.is_none());
+    }
+
+    #[test]
+    fn bad_tokens_are_rejected() {
+        let (_d, store, gvr) = store_with(2);
+        for token in [
+            "not-base64!",
+            &BASE64_URL_SAFE_NO_PAD.encode(r#"{"v":"meta.k8s.io/v1","rv":0,"start":"a"}"#),
+            &BASE64_URL_SAFE_NO_PAD.encode(r#"{"v":"other","rv":5,"start":"a"}"#),
+        ] {
+            assert!(matches!(
+                store.list(&gvr, Some("default"), None, None, Some(1), Some(token)),
+                Err(StoreError::InvalidContinueToken)
+            ));
+        }
+    }
+
+    #[test]
+    fn pruned_revision_expires_the_token_into_an_inconsistent_one() {
+        let (_d, store, gvr) = store_with(3);
+        let page1 = store
+            .list(&gvr, Some("default"), None, None, Some(1), None)
+            .unwrap();
+        let token = page1.continue_token.unwrap();
+        // Push the revision log past its retention window so page1's revision is gone.
+        let cm = GroupVersionResource::new("", "v1", "configmaps");
+        for i in 0..1100 {
+            let name = format!("churn-{i}");
+            store
+                .create(
+                    ResourceRef {
+                        gvr: &cm,
+                        namespace: Some("default"),
+                        name: &name,
+                    },
+                    &serde_json::json!({"metadata": {"name": name, "namespace": "default"}}),
+                )
+                .unwrap();
+        }
+        let err = store
+            .list(&gvr, Some("default"), None, None, Some(1), Some(&token))
+            .err()
+            .expect("expired token");
+        let StoreError::ContinueExpired { inconsistent_token } = err else {
+            panic!("unexpected error: {err}");
+        };
+        let decoded = decode(&inconsistent_token);
+        assert_eq!(decoded["rv"], -1);
+        assert_eq!(decoded["start"], "template-0000");
+
+        let resumed = store
+            .list(
+                &gvr,
+                Some("default"),
+                None,
+                None,
+                Some(1),
+                Some(&inconsistent_token),
+            )
+            .unwrap();
+        assert_eq!(resumed.items[0]["metadata"]["name"], "template-0001");
+        assert!(
+            resumed.resource_version > page1.resource_version,
+            "served at the latest revision"
+        );
+    }
+}
+
+#[tokio::test]
+async fn watch_events_carry_previous_object_and_deletion_revision() {
+    let dir = TempDir::new().unwrap();
+    let store = open_temp_store(&dir);
+    let gvr = test_gvr();
+    let mut rx = store.watch(&gvr);
+    let rref = ResourceRef {
+        gvr: &gvr,
+        namespace: Some("default"),
+        name: "nginx",
+    };
+
+    let created = store
+        .create(rref, &test_object("nginx", "default"))
+        .unwrap();
+    let added = rx.recv().await.unwrap();
+    assert!(added.prev_object.is_none());
+
+    let mut modified = created.clone();
+    modified["metadata"]["labels"] = serde_json::json!({"tier": "web"});
+    let rref = ResourceRef {
+        gvr: &gvr,
+        namespace: Some("default"),
+        name: "nginx",
+    };
+    store.update(&rref, &modified).unwrap();
+    let event = rx.recv().await.unwrap();
+    assert!(matches!(event.event_type, WatchEventType::Modified));
+    let prev = event.prev_object.as_ref().expect("previous object");
+    assert_eq!(
+        prev["metadata"]["resourceVersion"],
+        created["metadata"]["resourceVersion"]
+    );
+    assert!(prev["metadata"].get("labels").is_none());
+    assert_eq!(event.object["metadata"]["labels"]["tier"], "web");
+
+    store.delete(&rref).unwrap();
+    let deleted = rx.recv().await.unwrap();
+    assert!(matches!(deleted.event_type, WatchEventType::Deleted));
+    assert_eq!(
+        deleted.object["metadata"]["resourceVersion"],
+        deleted.resource_version.to_string(),
+        "the DELETED object carries the deletion revision"
+    );
+
+    // Replayed history carries the same previous object.
+    let (history, _rx) = store.watch_from(&gvr, added.resource_version).unwrap();
+    assert_eq!(history.len(), 2);
+    assert!(history[0].prev_object.is_some());
+    assert_eq!(
+        history[1].object["metadata"]["resourceVersion"],
+        history[1].resource_version.to_string()
+    );
 }

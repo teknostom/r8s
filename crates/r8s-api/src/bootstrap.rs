@@ -166,6 +166,44 @@ pub fn bootstrap_storage_class(store: &Store) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The system PriorityClasses the apiserver creates at start.
+pub fn bootstrap_priority_classes(store: &Store) -> anyhow::Result<()> {
+    let gvr = GroupVersionResource::new("scheduling.k8s.io", "v1", "priorityclasses");
+    for (name, value, description) in [
+        (
+            "system-node-critical",
+            2_000_001_000,
+            "Used for system critical pods that must not be moved from their current node.",
+        ),
+        (
+            "system-cluster-critical",
+            2_000_000_000,
+            "Used for system critical pods that must run in the cluster, but can be moved to another node if necessary.",
+        ),
+    ] {
+        let rref = ResourceRef {
+            gvr: &gvr,
+            namespace: None,
+            name,
+        };
+        if store.get(&rref)?.is_none() {
+            store.create(
+                rref,
+                &serde_json::json!({
+                    "apiVersion": "scheduling.k8s.io/v1",
+                    "kind": "PriorityClass",
+                    "metadata": {"name": name},
+                    "value": value,
+                    "description": description,
+                    "preemptionPolicy": "PreemptLowerPriority",
+                }),
+            )?;
+            tracing::info!("bootstrapped '{name}' PriorityClass");
+        }
+    }
+    Ok(())
+}
+
 pub fn bootstrap_ingress_class(store: &Store) -> anyhow::Result<()> {
     let gvr = GroupVersionResource::ingress_classes();
     let rref = ResourceRef {

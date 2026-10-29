@@ -15,10 +15,32 @@ use serde_json::{Map, Value};
 
 const OBJECT_META: &str = "io.k8s.apimachinery.pkg.apis.meta.v1.ObjectMeta";
 
+/// Which patch dialect's directives apply.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// Server-side apply: no directives.
+    Apply,
+    /// Strategic merge patch: `$patch`, `$retainKeys`, `$setElementOrder/*`,
+    /// `$deleteFromPrimitiveList/*`.
+    Strategic,
+}
+
 /// Merge `patch` into `target`. `schema` is the resource's root schema (a
 /// vendored definition or a CRD's structural schema); `None` merges objects
 /// structurally and replaces lists. `metadata` always follows `ObjectMeta`.
 pub fn apply(target: &mut Value, patch: &Value, schema: Option<&Value>) {
+    merge_root(target, patch, schema, Mode::Apply);
+}
+
+/// Apply an `application/strategic-merge-patch+json` body: lists with a merge
+/// key merge element-wise, lists with `patch-strategy: merge` and no key union,
+/// other lists replace; directives are honoured as in upstream's
+/// strategicpatch package.
+pub fn strategic_merge(target: &mut Value, patch: &Value, schema: Option<&Value>) {
+    merge_root(target, patch, schema, Mode::Strategic);
+}
+
+fn merge_root(target: &mut Value, patch: &Value, schema: Option<&Value>, mode: Mode) {
     let Some(patch_obj) = patch.as_object() else {
         *target = patch.clone();
         return;
@@ -30,26 +52,92 @@ pub fn apply(target: &mut Value, patch: &Value, schema: Option<&Value>) {
         return;
     };
     let schema = schema.and_then(resolve);
-    for (key, value) in patch_obj {
-        let field_schema = if key == "metadata" {
+    merge_object(target_obj, patch_obj, schema, mode, true);
+}
+
+fn merge_object(
+    target: &mut Map<String, Value>,
+    patch: &Map<String, Value>,
+    schema: Option<&Value>,
+    mode: Mode,
+    root: bool,
+) {
+    let field_schema = |key: &str| {
+        if root && key == "metadata" {
             definition(OBJECT_META)
         } else {
             property_schema(schema, key)
-        };
-        merge_field(target_obj, key, value, field_schema);
+        }
+    };
+    if mode == Mode::Strategic && patch.get("$patch").and_then(Value::as_str) == Some("replace") {
+        target.clear();
+        for (key, value) in patch.iter().filter(|(k, _)| !k.starts_with('$')) {
+            merge_field(target, key, value, field_schema(key), mode);
+        }
+        return;
+    }
+    for (key, value) in patch {
+        if mode == Mode::Strategic && key.starts_with('$') {
+            continue;
+        }
+        if mode == Mode::Strategic && value.get("$patch").and_then(Value::as_str) == Some("delete")
+        {
+            target.remove(key);
+            continue;
+        }
+        merge_field(target, key, value, field_schema(key), mode);
+    }
+    if mode != Mode::Strategic {
+        return;
+    }
+    for (key, value) in patch {
+        if let Some(field) = key.strip_prefix("$deleteFromPrimitiveList/")
+            && let Some(remove) = value.as_array()
+            && let Some(list) = target.get_mut(field).and_then(Value::as_array_mut)
+        {
+            list.retain(|item| !remove.contains(item));
+        }
+        if let Some(field) = key.strip_prefix("$setElementOrder/")
+            && let Some(order) = value.as_array()
+            && let Some(list) = target.get_mut(field).and_then(Value::as_array_mut)
+        {
+            let keys = match list_kind(field_schema(field).and_then(resolve)) {
+                ListKind::Map(keys) => keys,
+                _ => Vec::new(),
+            };
+            let position = |item: &Value| {
+                order.iter().position(|o| {
+                    if keys.is_empty() {
+                        o == item
+                    } else {
+                        keys.iter().all(|k| o.get(k) == item.get(k))
+                    }
+                })
+            };
+            list.sort_by_key(|item| position(item).unwrap_or(usize::MAX));
+        }
+    }
+    if let Some(retain) = patch.get("$retainKeys").and_then(Value::as_array) {
+        target.retain(|key, _| retain.iter().any(|r| r.as_str() == Some(key)));
     }
 }
 
-fn merge_field(target: &mut Map<String, Value>, key: &str, value: &Value, schema: Option<&Value>) {
+fn merge_field(
+    target: &mut Map<String, Value>,
+    key: &str,
+    value: &Value,
+    schema: Option<&Value>,
+    mode: Mode,
+) {
     if value.is_null() {
         target.remove(key);
         return;
     }
     let entry = target.entry(key).or_insert(Value::Null);
-    merge(entry, value, schema);
+    merge(entry, value, schema, mode);
 }
 
-fn merge(target: &mut Value, patch: &Value, schema: Option<&Value>) {
+fn merge(target: &mut Value, patch: &Value, schema: Option<&Value>, mode: Mode) {
     let schema = schema.and_then(resolve);
     match patch {
         Value::Object(patch_obj) => {
@@ -59,16 +147,14 @@ fn merge(target: &mut Value, patch: &Value, schema: Option<&Value>) {
             let Some(target_obj) = target.as_object_mut() else {
                 return;
             };
-            for (key, value) in patch_obj {
-                merge_field(target_obj, key, value, property_schema(schema, key));
-            }
+            merge_object(target_obj, patch_obj, schema, mode, false);
         }
         Value::Array(items) => match list_kind(schema) {
             ListKind::Map(keys) => {
                 let item_schema = schema.and_then(|s| s.get("items"));
-                merge_list_map(target, items, &keys, item_schema);
+                merge_list_map(target, items, &keys, item_schema, mode);
             }
-            ListKind::Set => merge_list_set(target, items),
+            ListKind::Set => merge_list_set(target, items, mode),
             ListKind::Atomic => *target = patch.clone(),
         },
         _ => *target = patch.clone(),
@@ -119,6 +205,10 @@ fn list_kind(schema: Option<&Value>) -> ListKind {
         .get("x-kubernetes-patch-merge-key")
         .and_then(Value::as_str)
         .map(|k| vec![k.to_string()]);
+    let merge_strategy = schema
+        .get("x-kubernetes-patch-strategy")
+        .and_then(Value::as_str)
+        .is_some_and(|s| s.split(',').any(|p| p == "merge"));
     let keys = match schema.get("x-kubernetes-list-type").and_then(Value::as_str) {
         Some("map") => schema
             .get("x-kubernetes-list-map-keys")
@@ -133,6 +223,7 @@ fn list_kind(schema: Option<&Value>) -> ListKind {
             .or(merge_key),
         Some("set") => return ListKind::Set,
         Some(_) => None,
+        None if merge_key.is_none() && merge_strategy => return ListKind::Set,
         None => merge_key,
     };
     match keys {
@@ -146,6 +237,7 @@ fn merge_list_map(
     items: &[Value],
     keys: &[String],
     item_schema: Option<&Value>,
+    mode: Mode,
 ) {
     if !target.is_array() {
         *target = Value::Array(Vec::new());
@@ -154,8 +246,19 @@ fn merge_list_map(
         return;
     };
     let item_schema = item_schema.and_then(resolve);
+    let live_order: Vec<Vec<Value>> = existing
+        .iter()
+        .filter_map(|element| key_of(element, keys, item_schema))
+        .collect();
     for item in items {
         if item.is_null() {
+            continue;
+        }
+        let directive = (mode == Mode::Strategic)
+            .then(|| item.get("$patch").and_then(Value::as_str))
+            .flatten();
+        if directive == Some("replace") {
+            existing.clear();
             continue;
         }
         let position = key_of(item, keys, item_schema).and_then(|key| {
@@ -163,15 +266,75 @@ fn merge_list_map(
                 .iter()
                 .position(|e| key_of(e, keys, item_schema).as_ref() == Some(&key))
         });
+        if directive == Some("delete") {
+            if let Some(i) = position {
+                existing.remove(i);
+            }
+            continue;
+        }
         match position {
-            Some(i) => merge(&mut existing[i], item, item_schema),
+            Some(i) => merge(&mut existing[i], item, item_schema, mode),
             None => {
                 let mut fresh = Value::Null;
-                merge(&mut fresh, item, item_schema);
+                merge(&mut fresh, item, item_schema, mode);
                 existing.push(fresh);
             }
         }
     }
+    if mode == Mode::Strategic {
+        let patch_order: Vec<Vec<Value>> = items
+            .iter()
+            .filter(|item| !item.is_null() && item.get("$patch").is_none())
+            .filter_map(|item| key_of(item, keys, item_schema))
+            .collect();
+        let merged = std::mem::take(existing);
+        *existing = strategic_order(merged, &patch_order, &live_order, |element| {
+            key_of(element, keys, item_schema)
+        });
+    }
+}
+
+/// Upstream's order for a strategically merged list: the patch's elements
+/// in patch order and the other live elements in live order, interleaved
+/// so a live element keeps preceding a patched one it preceded before,
+/// while a new element goes where the patch lists it.
+fn strategic_order(
+    merged: Vec<Value>,
+    patch_order: &[Vec<Value>],
+    live_order: &[Vec<Value>],
+    key: impl Fn(&Value) -> Option<Vec<Value>>,
+) -> Vec<Value> {
+    let mut patched: Vec<(usize, Value)> = Vec::new();
+    let mut live_only: std::collections::VecDeque<Value> = std::collections::VecDeque::new();
+    for element in merged {
+        match key(&element).and_then(|k| patch_order.iter().position(|o| *o == k)) {
+            Some(position) => patched.push((position, element)),
+            None => live_only.push_back(element),
+        }
+    }
+    patched.sort_by_key(|(position, _)| *position);
+    let mut patched: std::collections::VecDeque<Value> =
+        patched.into_iter().map(|(_, element)| element).collect();
+    let live_index =
+        |element: &Value| key(element).and_then(|k| live_order.iter().position(|o| *o == k));
+    let mut out = Vec::with_capacity(live_only.len() + patched.len());
+    while !live_only.is_empty() || !patched.is_empty() {
+        let live_first = match (live_only.front(), patched.front()) {
+            (Some(_), None) => true,
+            (None, _) => false,
+            (Some(live), Some(patch)) => match (live_index(live), live_index(patch)) {
+                (Some(l), Some(p)) => l < p,
+                _ => false,
+            },
+        };
+        let next = if live_first {
+            live_only.pop_front()
+        } else {
+            patched.pop_front()
+        };
+        out.extend(next);
+    }
+    out
 }
 
 /// Key tuple of a list-map element, taking absent keys from the item schema's
@@ -187,7 +350,7 @@ fn key_of(item: &Value, keys: &[String], item_schema: Option<&Value>) -> Option<
         .collect()
 }
 
-fn merge_list_set(target: &mut Value, items: &[Value]) {
+fn merge_list_set(target: &mut Value, items: &[Value], mode: Mode) {
     if !target.is_array() {
         *target = Value::Array(Vec::new());
     }
@@ -195,6 +358,11 @@ fn merge_list_set(target: &mut Value, items: &[Value]) {
         return;
     };
     for item in items {
+        if mode == Mode::Strategic && item.get("$patch").and_then(Value::as_str) == Some("replace")
+        {
+            existing.clear();
+            continue;
+        }
         if !existing.contains(item) {
             existing.push(item.clone());
         }
@@ -420,5 +588,154 @@ mod tests {
             stored["byName"]["k"]["xs"],
             json!([{"id": 1, "a": 1, "b": 2}])
         );
+    }
+
+    fn pod_schema() -> &'static Value {
+        definition_for("", "v1", "Pod").unwrap()
+    }
+
+    #[test]
+    fn strategic_merge_lists_patched_elements_first() {
+        let mut stored = json!({"spec": {"containers": [
+            {"name": "webserver", "image": "httpd"},
+            {"name": "sidecar", "image": "side"}
+        ]}});
+        let patch = json!({"spec": {"containers": [{"name": "test-ss", "image": "pause"}]}});
+        strategic_merge(&mut stored, &patch, Some(pod_schema()));
+        let names: Vec<&str> = stored["spec"]["containers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["test-ss", "webserver", "sidecar"]);
+
+        // Patching an element that exists keeps the live order around it.
+        let patch = json!({"spec": {"containers": [{"name": "sidecar", "image": "side2"}]}});
+        strategic_merge(&mut stored, &patch, Some(pod_schema()));
+        let containers = stored["spec"]["containers"].as_array().unwrap();
+        assert_eq!(containers[2]["name"], "sidecar");
+        assert_eq!(containers[2]["image"], "side2");
+        assert_eq!(containers[0]["name"], "test-ss");
+
+        // Live elements keep their order among themselves; a patched one moves
+        // only past elements that were not ahead of it.
+        let mut swapped = json!({"spec": {"containers": [
+            {"name": "a", "image": "a"}, {"name": "b", "image": "b"}, {"name": "c", "image": "c"}
+        ]}});
+        let patch = json!({"spec": {"containers": [{"name": "c"}, {"name": "a"}]}});
+        strategic_merge(&mut swapped, &patch, Some(pod_schema()));
+        let names: Vec<&str> = swapped["spec"]["containers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["b", "c", "a"]);
+
+        // Server-side apply keeps the stored order.
+        let mut applied = json!({"spec": {"containers": [
+            {"name": "a", "image": "a"}, {"name": "b", "image": "b"}
+        ]}});
+        apply(
+            &mut applied,
+            &json!({"spec": {"containers": [{"name": "b", "image": "b2"}]}}),
+            Some(pod_schema()),
+        );
+        assert_eq!(applied["spec"]["containers"][0]["name"], "a");
+    }
+
+    #[test]
+    fn strategic_merge_adds_owner_reference_by_uid() {
+        let mut stored = json!({"metadata": {"ownerReferences": [
+            {"apiVersion": "v1", "kind": "ReplicationController", "name": "rc1", "uid": "u1"}
+        ]}});
+        let patch = json!({"metadata": {"ownerReferences": [
+            {"apiVersion": "v1", "kind": "ReplicationController", "name": "rc2", "uid": "u2"}
+        ]}});
+        strategic_merge(&mut stored, &patch, Some(pod_schema()));
+        let refs = stored["metadata"]["ownerReferences"].as_array().unwrap();
+        assert_eq!(refs.len(), 2);
+        // A new element goes where the patch lists it: first.
+        assert_eq!(refs[0]["uid"], "u2");
+        assert_eq!(refs[1]["uid"], "u1");
+        // The same body as a JSON merge patch replaces the list.
+        let mut replaced = json!({"metadata": {"ownerReferences": [{"uid": "u1"}]}});
+        crate::patch::json_merge_patch(
+            &mut replaced,
+            &json!({"metadata": {"ownerReferences": [{"uid": "u2"}]}}),
+        );
+        assert_eq!(
+            replaced["metadata"]["ownerReferences"],
+            json!([{"uid": "u2"}])
+        );
+    }
+
+    #[test]
+    fn strategic_merge_directives() {
+        let mut stored = json!({
+            "metadata": {"finalizers": ["a", "b"], "labels": {"x": "1", "y": "2"}},
+            "spec": {"containers": [
+                {"name": "app", "image": "a:1", "env": [{"name": "A", "value": "1"}, {"name": "B", "value": "2"}]},
+                {"name": "side", "image": "s:1"}
+            ]}
+        });
+        let patch = json!({
+            "metadata": {
+                "finalizers": ["c"],
+                "$deleteFromPrimitiveList/finalizers": ["a"],
+                "labels": {"$patch": "replace", "z": "3"}
+            },
+            "spec": {"containers": [
+                {"name": "side", "$patch": "delete"},
+                {"name": "app", "env": [{"name": "A", "$patch": "delete"}], "image": "a:2"}
+            ]}
+        });
+        strategic_merge(&mut stored, &patch, Some(pod_schema()));
+        assert_eq!(stored["metadata"]["finalizers"], json!(["b", "c"]));
+        assert_eq!(stored["metadata"]["labels"], json!({"z": "3"}));
+        let containers = stored["spec"]["containers"].as_array().unwrap();
+        assert_eq!(containers.len(), 1);
+        assert_eq!(containers[0]["image"], "a:2");
+        assert_eq!(containers[0]["env"], json!([{"name": "B", "value": "2"}]));
+    }
+
+    #[test]
+    fn strategic_merge_replace_list_and_set_element_order() {
+        let mut stored = json!({"spec": {"containers": [
+            {"name": "a", "image": "a"}, {"name": "b", "image": "b"}
+        ]}});
+        let patch = json!({"spec": {
+            "$setElementOrder/containers": [{"name": "b"}, {"name": "a"}],
+            "containers": [{"name": "a", "image": "a:2"}]
+        }});
+        strategic_merge(&mut stored, &patch, Some(pod_schema()));
+        let names: Vec<&str> = stored["spec"]["containers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["b", "a"]);
+        assert_eq!(stored["spec"]["containers"][1]["image"], "a:2");
+
+        let patch = json!({"spec": {"containers": [{"$patch": "replace"}, {"name": "only", "image": "o"}]}});
+        strategic_merge(&mut stored, &patch, Some(pod_schema()));
+        assert_eq!(
+            stored["spec"]["containers"],
+            json!([{"name": "only", "image": "o"}])
+        );
+    }
+
+    #[test]
+    fn strategic_merge_retain_keys() {
+        let mut stored = json!({"spec": {"strategy": {"type": "RollingUpdate", "rollingUpdate": {"maxSurge": 1}}}});
+        let patch = json!({"spec": {"strategy": {"$retainKeys": ["type"], "type": "Recreate"}}});
+        strategic_merge(
+            &mut stored,
+            &patch,
+            definition_for("apps", "v1", "Deployment"),
+        );
+        assert_eq!(stored["spec"]["strategy"], json!({"type": "Recreate"}));
     }
 }

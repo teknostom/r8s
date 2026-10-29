@@ -67,14 +67,21 @@ jobs:
       - name: Run integration suites
         run: ./integration/run.sh
 
-      - name: Dump diagnostics on failure
-        if: failure()
+      # Per-suite pod state and logs are printed by integration/run.sh before
+      # it cleans up a failed suite. The daemon log covers the whole run.
+      - name: Collect daemon log
+        if: always()
         run: |
-          echo "===== r8sd.log (tail) ====="
-          sudo tail -n 200 /var/lib/r8s/clusters/default/r8sd.log 2>/dev/null || true
-          echo "===== cert-manager pods ====="
-          kubectl -n cert-manager get pods -o wide 2>/dev/null || true
-          for c in controller webhook cainjector; do
-            echo "===== cert-manager $c logs (tail) ====="
-            kubectl -n cert-manager logs -l app.kubernetes.io/component=$c --tail=80 2>/dev/null || true
-          done
+          sudo cp /var/lib/r8s/clusters/default/r8sd.log r8sd.log 2>/dev/null || exit 0
+          sudo chmod a+r r8sd.log
+          echo "===== r8sd.log: WARN/ERROR (tail) ====="
+          grep -aE 'WARN|ERROR' r8sd.log | tail -n 200 || true
+
+      - name: Upload daemon log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-r8sd-log
+          path: r8sd.log
+          if-no-files-found: ignore
+          retention-days: 14

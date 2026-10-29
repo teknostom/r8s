@@ -31,6 +31,11 @@ fn gvr_for(resource: &str) -> Option<GroupVersionResource> {
         "deployments" => Some(GroupVersionResource::deployments()),
         "replicasets" => Some(GroupVersionResource::replica_sets()),
         "statefulsets" => Some(GroupVersionResource::stateful_sets()),
+        "replicationcontrollers" => Some(GroupVersionResource::new(
+            "",
+            "v1",
+            "replicationcontrollers",
+        )),
         _ => None,
     }
 }
@@ -214,30 +219,33 @@ async fn apply_replicas(
         namespace: Some(ns),
         name,
     };
-    let mut parent = match state.store.get(&rref) {
-        Ok(Some(p)) => p,
-        Ok(None) => {
+    // The parent's controller writes its status concurrently; the replica
+    // count is set on the latest object, retried when another write wins.
+    let mut attempts = 0;
+    loop {
+        let mut parent = match state.store.get(&rref) {
+            Ok(Some(p)) => p,
+            Ok(None) => {
+                return status_error(
+                    StatusCode::NOT_FOUND,
+                    "NotFound",
+                    &format!("{resource}/{name} not found"),
+                );
+            }
+            Err(e) => return response::anyhow_error_response(e),
+        };
+        let Some(spec) = parent.get_mut("spec").and_then(|v| v.as_object_mut()) else {
             return status_error(
-                StatusCode::NOT_FOUND,
-                "NotFound",
-                &format!("{resource}/{name} not found"),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "InternalError",
+                &format!("{resource}/{name} has no spec"),
             );
-        }
-        Err(e) => return response::anyhow_error_response(e),
-    };
-
-    if let Some(spec) = parent.get_mut("spec").and_then(|v| v.as_object_mut()) {
+        };
         spec.insert("replicas".to_string(), serde_json::json!(replicas));
-    } else {
-        return status_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "InternalError",
-            &format!("{resource}/{name} has no spec"),
-        );
-    }
-
-    match state.store.update(&rref, &parent) {
-        Ok(updated) => object_response(&build_scale(&updated, ns, name)),
-        Err(e) => response::anyhow_error_response(e),
+        match state.store.update(&rref, &parent) {
+            Ok(updated) => return object_response(&build_scale(&updated, ns, name)),
+            Err(r8s_store::StoreError::Conflict { .. }) if attempts < 10 => attempts += 1,
+            Err(e) => return response::anyhow_error_response(e),
+        }
     }
 }

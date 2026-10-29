@@ -10,7 +10,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 
-fn resolve_port(ios: &IntOrString, ports: &[ContainerPort]) -> i32 {
+pub(crate) fn resolve_port(ios: &IntOrString, ports: &[ContainerPort]) -> i32 {
     match ios {
         IntOrString::Int(i) => *i,
         IntOrString::String(s) => {
@@ -38,8 +38,16 @@ pub async fn exec_probe<R: ContainerRuntime>(
 
     if let Some(http) = &probe.http_get {
         let port = resolve_port(&http.port, ports);
-        let path = http.path.as_deref().unwrap_or("/");
-        let host = http.host.as_deref().unwrap_or(pod_ip);
+        let path = http
+            .path
+            .as_deref()
+            .filter(|p| !p.is_empty())
+            .unwrap_or("/");
+        let host = http
+            .host
+            .as_deref()
+            .filter(|h| !h.is_empty())
+            .unwrap_or(pod_ip);
         // Kubernetes probes don't validate certificates and accept any scheme
         // value case-insensitively; default is HTTP per the v1 spec.
         let https = http
@@ -52,6 +60,10 @@ pub async fn exec_probe<R: ContainerRuntime>(
     if let Some(tcp) = &probe.tcp_socket {
         let port = resolve_port(&tcp.port, ports);
         return tcp_probe(pod_ip, port, timeout).await;
+    }
+
+    if let Some(grpc) = &probe.grpc {
+        return grpc_probe(pod_ip, grpc.port, grpc.service.as_deref(), timeout).await;
     }
 
     if let Some(exec_action) = &probe.exec
@@ -68,6 +80,53 @@ pub async fn exec_probe<R: ContainerRuntime>(
     }
 
     // No probe handler configured — treat as success
+    true
+}
+
+/// Run a lifecycle hook (postStart/preStop): exec in the container, an HTTP
+/// GET (against the pod unless a host is named), or a TCP connect. True when
+/// it succeeded.
+pub(crate) async fn run_lifecycle_handler<R: ContainerRuntime>(
+    handler: &r8s_types::LifecycleHandler,
+    pod_ip: &str,
+    runtime: &R,
+    container_id: &ContainerId,
+    ports: &[ContainerPort],
+    timeout: Duration,
+) -> bool {
+    if let Some(exec) = &handler.exec
+        && let Some(command) = &exec.command
+    {
+        return matches!(
+            runtime.exec_sync(container_id, command, timeout).await,
+            Ok(0)
+        );
+    }
+    if let Some(http) = &handler.http_get {
+        let port = resolve_port(&http.port, ports);
+        let path = http
+            .path
+            .as_deref()
+            .filter(|p| !p.is_empty())
+            .unwrap_or("/");
+        let host = http
+            .host
+            .as_deref()
+            .filter(|h| !h.is_empty())
+            .unwrap_or(pod_ip);
+        let https = http
+            .scheme
+            .as_deref()
+            .is_some_and(|s| s.eq_ignore_ascii_case("HTTPS"));
+        return http_get_probe(host, port, path, timeout, https).await;
+    }
+    if let Some(tcp) = &handler.tcp_socket {
+        let port = resolve_port(&tcp.port, ports);
+        return tcp_probe(pod_ip, port, timeout).await;
+    }
+    if let Some(sleep) = &handler.sleep {
+        tokio::time::sleep(Duration::from_secs(sleep.seconds.max(0) as u64)).await;
+    }
     true
 }
 
@@ -172,6 +231,87 @@ impl ServerCertVerifier for NoVerifier {
             SignatureScheme::RSA_PSS_SHA512,
             SignatureScheme::ED25519,
         ]
+    }
+}
+
+/// A gRPC health check (`grpc.health.v1.Health/Check`) over plain HTTP/2:
+/// succeeds when the service reports SERVING.
+async fn grpc_probe(host: &str, port: i32, service: Option<&str>, timeout: Duration) -> bool {
+    use http_body_util::{BodyExt, Full};
+    use hyper::body::Bytes;
+
+    let check = async {
+        let tcp = TcpStream::connect((host, port as u16)).await.ok()?;
+        let (mut sender, conn) = hyper::client::conn::http2::handshake(
+            hyper_util::rt::TokioExecutor::new(),
+            hyper_util::rt::TokioIo::new(tcp),
+        )
+        .await
+        .ok()?;
+        tokio::spawn(conn);
+
+        // HealthCheckRequest { service = 1 }, length-prefixed as gRPC frames it.
+        let mut message = Vec::new();
+        if let Some(service) = service.filter(|s| !s.is_empty()) {
+            message.push(0x0a);
+            message.extend(encode_varint(service.len() as u64));
+            message.extend_from_slice(service.as_bytes());
+        }
+        let mut body = vec![0u8];
+        body.extend_from_slice(&(message.len() as u32).to_be_bytes());
+        body.extend_from_slice(&message);
+
+        let req = hyper::Request::builder()
+            .method("POST")
+            .uri(format!("http://{host}:{port}/grpc.health.v1.Health/Check"))
+            .header("content-type", "application/grpc")
+            .header("te", "trailers")
+            .body(Full::new(Bytes::from(body)))
+            .ok()?;
+        let resp = sender.send_request(req).await.ok()?;
+        if resp.status() != 200 {
+            return Some(false);
+        }
+        let grpc_status = |headers: &hyper::HeaderMap| {
+            headers
+                .get("grpc-status")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s == "0")
+        };
+        if let Some(status) = grpc_status(resp.headers()) {
+            // Trailers-only response: the call failed before any body.
+            return Some(status);
+        }
+        let collected = resp.into_body().collect().await.ok()?;
+        if collected
+            .trailers()
+            .and_then(grpc_status)
+            .is_some_and(|ok| !ok)
+        {
+            return Some(false);
+        }
+        let payload = collected.to_bytes();
+        // HealthCheckResponse { status = 1 }: SERVING is 1.
+        let message = payload.get(5..)?;
+        let serving = match message.first() {
+            Some(0x08) => message.get(1) == Some(&1),
+            _ => false,
+        };
+        Some(serving)
+    };
+    matches!(tokio::time::timeout(timeout, check).await, Ok(Some(true)))
+}
+
+fn encode_varint(mut value: u64) -> Vec<u8> {
+    let mut out = Vec::new();
+    loop {
+        let byte = (value & 0x7f) as u8;
+        value >>= 7;
+        if value == 0 {
+            out.push(byte);
+            return out;
+        }
+        out.push(byte | 0x80);
     }
 }
 

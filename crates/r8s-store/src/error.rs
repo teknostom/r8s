@@ -16,13 +16,21 @@ pub enum StoreError {
     },
 
     #[error("resource version {requested} is too old; oldest available is {oldest_available}")]
-    TooOld { requested: u64, oldest_available: u64 },
+    TooOld {
+        requested: u64,
+        oldest_available: u64,
+    },
 
     #[error("metadata must be a JSON object")]
     InvalidMetadata,
 
     #[error("invalid continue token")]
     InvalidContinueToken,
+
+    /// The continue token's revision has been compacted away; the carried
+    /// token (rv = -1) resumes the list inconsistently at the latest revision.
+    #[error("the provided continue parameter is too old to display a consistent list result")]
+    ContinueExpired { inconsistent_token: String },
 
     #[error("invalid selector: {0}")]
     InvalidSelector(String),

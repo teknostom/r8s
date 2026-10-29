@@ -22,6 +22,24 @@ pub(crate) const REVISIONS: TableDefinition<u64, &[u8]> = TableDefinition::new("
 /// [`StoreError::TooOld`].
 const KEEP_REVISIONS: u64 = 1000;
 
+/// How long a paginated list's `continue` token stays consistent. Mirrors the
+/// etcd compaction interval the apiserver is bounded by; after this a resumed
+/// list is answered with [`StoreError::ContinueExpired`].
+const CONTINUE_TOKEN_TTL_MS: i64 = 5 * 60 * 1000;
+
+/// `metav1.ListMeta.continue` as the apiserver encodes it: base64url (no
+/// padding) of `{"v":"meta.k8s.io/v1","rv":<rv>,"start":"<key>"}`. `rv > 0`
+/// is the revision the first page was served at; `-1` resumes inconsistently
+/// at the latest revision; `0` is invalid.
+#[derive(Serialize, serde::Deserialize)]
+struct ContinueToken {
+    v: String,
+    rv: i64,
+    start: String,
+}
+
+const CONTINUE_TOKEN_VERSION: &str = "meta.k8s.io/v1";
+
 #[derive(Clone)]
 pub struct Store {
     db: Arc<Database>,
@@ -37,6 +55,9 @@ pub struct ListResult {
     pub items: Vec<serde_json::Value>,
     pub resource_version: u64,
     pub continue_token: Option<String>,
+    /// Items left after this page; `None` on the last page or when a selector
+    /// makes the count unknowable without scanning.
+    pub remaining_item_count: Option<u64>,
 }
 
 pub struct StoreStats {
@@ -67,6 +88,10 @@ struct RevisionEntryRef<'a> {
     event_type: WatchEventType,
     key: &'a str,
     object: &'a serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prev: Option<&'a serde_json::Value>,
+    /// Unix milliseconds the revision was committed; bounds continue tokens.
+    ts: i64,
 }
 
 #[derive(serde::Deserialize)]
@@ -75,6 +100,10 @@ struct RevisionEntry {
     event_type: WatchEventType,
     key: String,
     object: serde_json::Value,
+    #[serde(default)]
+    prev: Option<serde_json::Value>,
+    #[serde(default)]
+    ts: i64,
 }
 
 impl Store {
@@ -122,7 +151,10 @@ impl Store {
             .and_then(|v| v.as_str())
             .is_none()
         {
-            metadata.insert("creationTimestamp".into(), chrono::Utc::now().to_rfc3339().into());
+            metadata.insert(
+                "creationTimestamp".into(),
+                chrono::Utc::now().to_rfc3339().into(),
+            );
         }
 
         let _guard = self.view_lock.write();
@@ -142,7 +174,15 @@ impl Store {
             rev
         };
 
-        self.record(txn, &gvr_prefix, &key, rev, WatchEventType::Added, obj)
+        self.record(
+            txn,
+            &gvr_prefix,
+            &key,
+            rev,
+            WatchEventType::Added,
+            obj,
+            None,
+        )
     }
 
     pub fn get(&self, resource: &ResourceRef) -> Result<Option<serde_json::Value>> {
@@ -184,7 +224,9 @@ impl Store {
             return Err(StoreError::Conflict {
                 gvr: gvr_prefix,
                 name: resource.name.to_string(),
-                message: format!("resourceVersion mismatch: stored={stored_rv}, incoming={incoming_rv}"),
+                message: format!(
+                    "resourceVersion mismatch: stored={stored_rv}, incoming={incoming_rv}"
+                ),
             });
         }
 
@@ -200,7 +242,15 @@ impl Store {
             table.insert(key.as_str(), serde_json::to_vec(&obj)?.as_slice())?;
         }
 
-        self.record(txn, &gvr_prefix, &key, rev, WatchEventType::Modified, obj)
+        self.record(
+            txn,
+            &gvr_prefix,
+            &key,
+            rev,
+            WatchEventType::Modified,
+            obj,
+            Some(existing),
+        )
     }
 
     pub fn delete(&self, resource: &ResourceRef) -> Result<Option<serde_json::Value>> {
@@ -219,13 +269,25 @@ impl Store {
         };
 
         let rev = self.revision.next();
-        let object = self.record(txn, &gvr_prefix, &key, rev, WatchEventType::Deleted, object)?;
+        // The DELETED event carries the deletion revision, as upstream does.
+        let mut object = object;
+        set_resource_version(&mut object, rev);
+        let object = self.record(
+            txn,
+            &gvr_prefix,
+            &key,
+            rev,
+            WatchEventType::Deleted,
+            object,
+            None,
+        )?;
         Ok(Some(object))
     }
 
     /// Commits the revision-log entry for an already-staged resource mutation,
     /// then publishes the event to live watchers. Runs under the write guard
     /// held by the calling mutation.
+    #[allow(clippy::too_many_arguments)]
     fn record(
         &self,
         txn: redb::WriteTransaction,
@@ -234,6 +296,7 @@ impl Store {
         rev: u64,
         event_type: WatchEventType,
         object: serde_json::Value,
+        prev: Option<serde_json::Value>,
     ) -> Result<serde_json::Value> {
         {
             let mut table = txn.open_table(REVISIONS)?;
@@ -241,6 +304,8 @@ impl Store {
                 event_type,
                 key,
                 object: &object,
+                prev: prev.as_ref(),
+                ts: chrono::Utc::now().timestamp_millis(),
             })?;
             table.insert(rev, entry.as_slice())?;
             prune_revisions(&mut table, rev)?;
@@ -254,6 +319,7 @@ impl Store {
                 event_type,
                 resource_version: rev,
                 object: object.clone(),
+                prev_object: prev.map(Arc::new),
             },
         );
         Ok(Arc::unwrap_or_clone(object))
@@ -268,21 +334,69 @@ impl Store {
         limit: Option<usize>,
         continue_token: Option<&str>,
     ) -> Result<ListResult> {
-        let (txn, resource_version) = self.snapshot()?;
-        let (items, continue_token) = list_scan(
+        let prefix = scan_prefix(gvr, namespace);
+        // A resumed page reports the revision its first page was served at,
+        // so a client sees one resourceVersion across the whole list. The
+        // store keeps no point-in-time snapshots, so the page content is the
+        // current state; once the token outlives the consistency window the
+        // client is told to resume inconsistently (rv = -1) instead.
+        let (resume_after, reported_rv) = match continue_token {
+            None => (None, None),
+            Some(token) => {
+                let (rv, start) = decode_continue(token)?;
+                let resume = format!("{prefix}{start}");
+                if rv > 0 {
+                    if self.revision_expired(rv as u64)? {
+                        return Err(StoreError::ContinueExpired {
+                            inconsistent_token: encode_continue(-1, &start),
+                        });
+                    }
+                    (Some(resume), Some(rv as u64))
+                } else {
+                    (Some(resume), None)
+                }
+            }
+        };
+        let (txn, current_rv) = self.snapshot()?;
+        let scan = list_scan(
             &txn,
-            gvr,
-            namespace,
+            &prefix,
+            &gvr.key_prefix(),
             label_selector,
             field_selector,
-            limit,
-            continue_token,
+            limit.filter(|l| *l > 0),
+            resume_after.as_deref(),
         )?;
+        let resource_version = reported_rv.unwrap_or(current_rv);
+        let continue_token = match (&scan.last_key, scan.has_more) {
+            (Some(key), true) => Some(encode_continue(
+                resource_version as i64,
+                &key[prefix.len()..],
+            )),
+            _ => None,
+        };
         Ok(ListResult {
-            items,
+            items: scan.items,
             resource_version,
             continue_token,
+            remaining_item_count: scan.remaining,
         })
+    }
+
+    /// True once `rv` has been pruned from the revision log or is older than
+    /// [`CONTINUE_TOKEN_TTL_MS`]; a revision not yet written counts as live.
+    fn revision_expired(&self, rv: u64) -> Result<bool> {
+        if rv > self.revision.current() {
+            return Ok(false);
+        }
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(REVISIONS)?;
+        let Some(bytes) = table.get(rv)? else {
+            return Ok(true);
+        };
+        let entry: RevisionEntry = serde_json::from_slice(bytes.value())?;
+        let age = chrono::Utc::now().timestamp_millis() - entry.ts;
+        Ok(entry.ts == 0 || age > CONTINUE_TOKEN_TTL_MS)
     }
 
     pub fn stats(&self) -> Result<StoreStats> {
@@ -339,13 +453,21 @@ impl Store {
             let txn = self.db.begin_read()?;
             (txn, resource_version, receiver)
         };
-        let (items, continue_token) =
-            list_scan(&txn, gvr, namespace, label_selector, field_selector, None, None)?;
+        let scan = list_scan(
+            &txn,
+            &scan_prefix(gvr, namespace),
+            &gvr.key_prefix(),
+            label_selector,
+            field_selector,
+            None,
+            None,
+        )?;
         Ok((
             ListResult {
-                items,
+                items: scan.items,
                 resource_version,
-                continue_token,
+                continue_token: None,
+                remaining_item_count: None,
             },
             receiver,
         ))
@@ -397,38 +519,72 @@ impl Store {
     }
 }
 
+/// Key prefix every stored object of `gvr` (in `namespace`, when given) shares.
+fn scan_prefix(gvr: &GroupVersionResource, namespace: Option<&str>) -> String {
+    let gvr_prefix = gvr.key_prefix();
+    match namespace {
+        Some(ns) => format!("{gvr_prefix}/{ns}/"),
+        None => format!("{gvr_prefix}/"),
+    }
+}
+
+struct Scan {
+    items: Vec<serde_json::Value>,
+    /// Key of the last item returned, the resume point for the next page.
+    last_key: Option<String>,
+    /// More keys follow under the prefix after a page filled to `limit`.
+    has_more: bool,
+    /// Keys left after the page, counted only when no selector filters; a
+    /// selector would make the count a lie, so upstream omits it too.
+    remaining: Option<u64>,
+}
+
 fn list_scan(
     txn: &redb::ReadTransaction,
-    gvr: &GroupVersionResource,
-    namespace: Option<&str>,
+    scan_prefix: &str,
+    gvr_prefix: &str,
     label_selector: Option<&LabelSelector>,
     field_selector: Option<&FieldSelector>,
     limit: Option<usize>,
-    continue_token: Option<&str>,
-) -> Result<(Vec<serde_json::Value>, Option<String>)> {
-    let gvr_prefix = gvr.key_prefix();
-    let scan_prefix = match namespace {
-        Some(ns) => format!("{gvr_prefix}/{ns}/"),
-        None => format!("{gvr_prefix}/"),
-    };
-
-    // The continue token is the last key of the previous page. Start strictly
-    // after it: if that key still exists it was already returned, and if it was
-    // deleted between pages the next key is correctly included rather than skipped.
-    let resume_after = continue_token.map(decode_continue_token).transpose()?;
-    let lower = match &resume_after {
-        Some(key) => Bound::Excluded(key.as_str()),
-        None => Bound::Included(scan_prefix.as_str()),
+    resume_after: Option<&str>,
+) -> Result<Scan> {
+    // Resume strictly after the last returned key: if it still exists it was
+    // already returned, and if it was deleted between pages the next key is
+    // correctly included rather than skipped.
+    let lower = match resume_after {
+        Some(key) => Bound::Excluded(key),
+        None => Bound::Included(scan_prefix),
     };
 
     let table = txn.open_table(RESOURCES)?;
-    let mut items = Vec::new();
-    let mut last_key: Option<String> = None;
-
-    for entry in table.range::<&str>((lower, Bound::Unbounded))? {
+    let mut scan = Scan {
+        items: Vec::new(),
+        last_key: None,
+        has_more: false,
+        remaining: None,
+    };
+    let mut iter = table.range::<&str>((lower, Bound::Unbounded))?;
+    while let Some(entry) = iter.next() {
         let (key, value) = entry?;
         let key = key.value();
-        if !key.starts_with(scan_prefix.as_str()) {
+        if !key.starts_with(scan_prefix) {
+            break;
+        }
+        if let Some(limit) = limit
+            && scan.items.len() >= limit
+        {
+            scan.has_more = true;
+            if label_selector.is_none() && field_selector.is_none() {
+                let mut rest = 1u64;
+                for entry in iter.by_ref() {
+                    let (key, _) = entry?;
+                    if !key.value().starts_with(scan_prefix) {
+                        break;
+                    }
+                    rest += 1;
+                }
+                scan.remaining = Some(rest);
+            }
             break;
         }
 
@@ -439,25 +595,15 @@ fn list_scan(
             continue;
         }
         if let Some(selector) = field_selector
-            && !selector.matches(&item, &gvr_prefix)
+            && !selector.matches(&item, gvr_prefix)
         {
             continue;
         }
 
-        last_key = Some(key.to_string());
-        items.push(item);
-        if let Some(limit) = limit
-            && items.len() >= limit
-        {
-            break;
-        }
+        scan.last_key = Some(key.to_string());
+        scan.items.push(item);
     }
-
-    let continue_token = match limit {
-        Some(limit) if items.len() >= limit => last_key.map(encode_continue_token),
-        _ => None,
-    };
-    Ok((items, continue_token))
+    Ok(scan)
 }
 
 fn replay_since(
@@ -478,6 +624,7 @@ fn replay_since(
             event_type: stored.event_type,
             resource_version: rev.value(),
             object: Arc::new(stored.object),
+            prev_object: stored.prev.map(Arc::new),
         });
     }
     Ok(events)
@@ -539,13 +686,26 @@ fn equal_metadata_ignoring_revision(a: &serde_json::Value, b: &serde_json::Value
             .all(|(key, value)| b.get(key) == Some(value))
 }
 
-fn encode_continue_token(key: String) -> String {
-    BASE64_STANDARD.encode(key)
+fn encode_continue(rv: i64, start: &str) -> String {
+    let token = ContinueToken {
+        v: CONTINUE_TOKEN_VERSION.to_string(),
+        rv,
+        start: start.to_string(),
+    };
+    BASE64_URL_SAFE_NO_PAD.encode(serde_json::to_vec(&token).unwrap_or_default())
 }
 
-fn decode_continue_token(token: &str) -> Result<String> {
-    let bytes = BASE64_STANDARD
+/// `(rv, start)` of a client-supplied token. Rejects foreign versions, an rv
+/// of 0 and an empty start key, as the apiserver does.
+fn decode_continue(token: &str) -> Result<(i64, String)> {
+    let bytes = BASE64_URL_SAFE_NO_PAD
         .decode(token)
+        .or_else(|_| BASE64_STANDARD.decode(token))
         .map_err(|_| StoreError::InvalidContinueToken)?;
-    String::from_utf8(bytes).map_err(|_| StoreError::InvalidContinueToken)
+    let parsed: ContinueToken =
+        serde_json::from_slice(&bytes).map_err(|_| StoreError::InvalidContinueToken)?;
+    if parsed.v != CONTINUE_TOKEN_VERSION || parsed.rv == 0 || parsed.start.is_empty() {
+        return Err(StoreError::InvalidContinueToken);
+    }
+    Ok((parsed.rv, parsed.start))
 }

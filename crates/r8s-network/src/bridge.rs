@@ -30,6 +30,15 @@ pub fn setup_bridge(data_dir: &Path) -> Result<()> {
     run("ip", &["link", "set", BRIDGE_NAME, "up"])?;
 
     run("sysctl", &["-w", "net.ipv4.ip_forward=1"])?;
+    // hostPorts bound to 127.0.0.1 are DNATed onto the bridge; the kernel
+    // drops loopback-sourced packets there unless told otherwise.
+    let _ = run(
+        "sysctl",
+        &[
+            "-w",
+            &format!("net.ipv4.conf.{BRIDGE_NAME}.route_localnet=1"),
+        ],
+    );
     // Prevent bridge traffic between pods from being filtered by iptables/nftables
     let _ = run("sysctl", &["-w", "net.bridge.bridge-nf-call-iptables=0"]);
     let _ = run("sysctl", &["-w", "net.bridge.bridge-nf-call-ip6tables=0"]);
@@ -49,22 +58,35 @@ pub fn setup_bridge(data_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Configure the host-side veth and its peer inside the pod's netns.
+/// Name of the pod's network namespace under `/var/run/netns`.
+pub fn netns_name(pod_uid: &str) -> String {
+    format!("r8s-{pod_uid}")
+}
+
+/// Path every container of the pod joins as its network namespace.
+pub fn netns_path(pod_uid: &str) -> String {
+    format!("/var/run/netns/{}", netns_name(pod_uid))
+}
+
+/// Create the pod's network namespace with a veth into the bridge, `lo` up
+/// and a default route; returns the namespace path containers join.
 ///
 /// `cluster` and `pod_uid` are written into the host-side veth's interface
 /// alias so `list_owned_veths` can sweep stale links after a crash without
 /// needing to trust the store.
 pub fn setup_pod_network(
-    pid: u32,
+    pod_uid: &str,
     pod_ip: &str,
     pod_name: &str,
     cluster: &str,
-    pod_uid: &str,
-) -> Result<()> {
-    let veth_host = veth_name(pod_name);
+) -> Result<String> {
+    let ns = netns_name(pod_uid);
+    let veth_host = veth_name(pod_uid);
     let veth_peer = format!("{veth_host}p");
-    let pid_str = pid.to_string();
 
+    let _ = run("ip", &["netns", "delete", &ns]);
+    run("ip", &["netns", "add", &ns])?;
+    delete_link(&veth_host);
     run(
         "ip",
         &[
@@ -79,27 +101,36 @@ pub fn setup_pod_network(
         tracing::warn!(pod_name, "failed to set veth alias: {e}");
     }
 
-    run("ip", &["link", "set", &veth_peer, "netns", &pid_str])?;
-    nsenter(pid, &["ip", "link", "set", &veth_peer, "name", "eth0"])?;
+    run("ip", &["link", "set", &veth_peer, "netns", &ns])?;
+    in_netns(&ns, &["ip", "link", "set", &veth_peer, "name", "eth0"])?;
 
     run("ip", &["link", "set", &veth_host, "master", BRIDGE_NAME])?;
     run("ip", &["link", "set", &veth_host, "up"])?;
 
+    // A neighbor entry left by the address's previous pod would send the
+    // first packets to its MAC.
+    let _ = run("ip", &["neigh", "flush", "to", pod_ip, "dev", BRIDGE_NAME]);
+
     let ip_cidr = format!("{pod_ip}/{POD_PREFIX}");
-    nsenter(pid, &["ip", "addr", "add", &ip_cidr, "dev", "eth0"])?;
-    nsenter(pid, &["ip", "link", "set", "eth0", "up"])?;
-    nsenter(pid, &["ip", "link", "set", "lo", "up"])?;
-    nsenter(
-        pid,
+    in_netns(&ns, &["ip", "addr", "add", &ip_cidr, "dev", "eth0"])?;
+    in_netns(&ns, &["ip", "link", "set", "eth0", "up"])?;
+    in_netns(&ns, &["ip", "link", "set", "lo", "up"])?;
+    in_netns(
+        &ns,
         &["ip", "route", "add", "default", "via", NODE_INTERNAL_IP],
     )?;
 
-    tracing::info!(pod_name, pod_ip, pid, "pod network configured");
-    Ok(())
+    tracing::info!(pod_name, pod_ip, netns = %ns, "pod network configured");
+    Ok(netns_path(pod_uid))
 }
 
-pub fn teardown_pod_network(pod_name: &str) {
-    delete_link(&veth_name(pod_name));
+/// Remove the pod's veth and network namespace. Best-effort and idempotent.
+pub fn teardown_pod_network(pod_uid: &str) {
+    delete_link(&veth_name(pod_uid));
+    let ns = netns_name(pod_uid);
+    if let Err(e) = run("ip", &["netns", "delete", &ns]) {
+        tracing::debug!(netns = %ns, "netns cleanup (may already be gone): {e}");
+    }
 }
 
 /// Delete a host-side veth by its exact link name. Best-effort and idempotent —
@@ -188,6 +219,14 @@ pub fn cleanup() {
     );
     let _ = run("ip", &["link", "delete", BRIDGE_NAME]);
     let _ = run("ip", &["link", "delete", "r8s-svc"]);
+    if let Ok(entries) = std::fs::read_dir("/var/run/netns") {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with("r8s-") {
+                let _ = run("ip", &["netns", "delete", &name]);
+            }
+        }
+    }
     tracing::info!("bridge {BRIDGE_NAME} removed");
 }
 
@@ -197,9 +236,11 @@ pub fn cleanup() {
 /// releases: a rustc upgrade could rename the veth for an existing pod and
 /// strand it. The alias sweep (`list_owned_veths`) is the teardown source of
 /// truth regardless, but the name itself should not depend on the toolchain.
-fn veth_name(pod_name: &str) -> String {
+/// The host-side veth of a pod, by its uid: pods of the same name in two
+/// namespaces, or a replacement of the same name, never share one.
+fn veth_name(pod_uid: &str) -> String {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in pod_name.as_bytes() {
+    for b in pod_uid.as_bytes() {
         hash ^= *b as u64;
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
@@ -246,11 +287,10 @@ fn command_error(cmd: &str, args: &[&str], stderr: &[u8]) -> NetworkError {
     }
 }
 
-fn nsenter(pid: u32, cmd_args: &[&str]) -> Result<()> {
-    let pid_str = pid.to_string();
-    let mut args = vec!["-t", &pid_str, "-n", "--"];
+fn in_netns(ns: &str, cmd_args: &[&str]) -> Result<()> {
+    let mut args = vec!["netns", "exec", ns];
     args.extend_from_slice(cmd_args);
-    run("nsenter", &args)
+    run("ip", &args)
 }
 
 #[cfg(test)]

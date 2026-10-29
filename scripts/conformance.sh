@@ -40,6 +40,31 @@ if [ ! -f "$RESULTS_DIR/e2e.test" ]; then
     echo "Extracted to $RESULTS_DIR/e2e.test"
 fi
 
+# The image's kubectl: the kubectl specs expect its version's output (a host
+# kubectl of another minor version prints differently).
+if [ ! -f "$RESULTS_DIR/kubectl" ] && command -v docker > /dev/null; then
+    echo "Extracting kubectl from $CONFORMANCE_IMAGE..."
+    container_id=$(docker create "$CONFORMANCE_IMAGE")
+    docker cp "$container_id:/usr/local/bin/kubectl" "$RESULTS_DIR/kubectl"
+    docker rm "$container_id" > /dev/null
+    chmod +x "$RESULTS_DIR/kubectl"
+fi
+# Without docker: the same release's kubectl from dl.k8s.io, checksum-verified.
+if [ ! -f "$RESULTS_DIR/kubectl" ]; then
+    k8s_version="${CONFORMANCE_IMAGE##*:}"
+    arch=$(uname -m); case "$arch" in x86_64) arch=amd64 ;; aarch64) arch=arm64 ;; esac
+    url="https://dl.k8s.io/release/$k8s_version/bin/linux/$arch/kubectl"
+    echo "Downloading kubectl $k8s_version..."
+    if curl -fsSL -o "$RESULTS_DIR/kubectl.tmp" "$url" \
+        && echo "$(curl -fsSL "$url.sha256")  $RESULTS_DIR/kubectl.tmp" | sha256sum --check --quiet; then
+        mv "$RESULTS_DIR/kubectl.tmp" "$RESULTS_DIR/kubectl"
+        chmod +x "$RESULTS_DIR/kubectl"
+    else
+        rm -f "$RESULTS_DIR/kubectl.tmp"
+        echo "Could not fetch kubectl $k8s_version; using the host kubectl."
+    fi
+fi
+
 # Build focus/skip based on tier
 case "$TIER" in
     api)
@@ -120,6 +145,9 @@ ARGS=(
     --ginkgo.poll-progress-after="$SPEC_POLL"
     --report-dir="$RESULTS_DIR"
 )
+if [ -x "$RESULTS_DIR/kubectl" ]; then
+    ARGS+=(--kubectl-path="$RESULTS_DIR/kubectl")
+fi
 if [ -n "${SKIP:-}" ]; then
     ARGS+=(--ginkgo.skip="$SKIP")
 fi

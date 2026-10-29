@@ -274,6 +274,14 @@ fn stop_daemon(dir: &Path) -> anyhow::Result<bool> {
 
     eprintln!("warning: r8sd (pid {pid}) did not exit, sending SIGKILL");
     let _ = unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+    // The store's file lock is released only once the process is gone; a
+    // following `up` must not race it.
+    for _ in 0..50 {
+        if !is_running(pid) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
     let _ = std::fs::remove_file(pid_file(dir));
     Ok(true)
 }

@@ -40,6 +40,7 @@ async fn main() -> anyhow::Result<()> {
     bootstrap_namespaces(&store)?;
     bootstrap_ingress_class(&store)?;
     bootstrap_storage_class(&store)?;
+    r8s_api::bootstrap::bootstrap_priority_classes(&store)?;
 
     let certs = r8s_controllers::certs::ensure_cluster_certs(&data_dir)?;
     bootstrap_apiserver_authentication(&store, &certs.ca_pem)?;
@@ -94,6 +95,19 @@ async fn main() -> anyhow::Result<()> {
         "service-proxy",
         r8s_network::proxy::run(store.clone(), shutdown.clone(), cluster.clone()),
     );
+    spawn(
+        &mut tasks,
+        "apiservice-availability",
+        r8s_api::aggregation::run_availability(store.clone(), data_dir.clone(), shutdown.clone()),
+    );
+    spawn(&mut tasks, "event-expiry", {
+        let store = store.clone();
+        let shutdown = shutdown.clone();
+        async move {
+            r8s_store::events::expire(store, std::time::Duration::from_secs(300), shutdown).await;
+            Ok::<(), std::convert::Infallible>(())
+        }
+    });
 
     // Exec backend for the API server's `kubectl exec` endpoint. Only the
     // containerd runtime supports it; under mock it stays None.
@@ -139,6 +153,7 @@ async fn main() -> anyhow::Result<()> {
                     runtime.clone(),
                     certs.server_cert_pem.clone().into_bytes(),
                     certs.server_key_pem.clone().into_bytes(),
+                    shutdown.clone(),
                 ),
             );
             spawn(

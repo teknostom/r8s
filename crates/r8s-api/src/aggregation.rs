@@ -95,45 +95,189 @@ pub async fn try_proxy(
 fn find_backend(state: &AppState, group: &str, version: &str) -> Option<Backend> {
     let gvr = GroupVersionResource::new("apiregistration.k8s.io", "v1", "apiservices");
     let list = state.store.list(&gvr, None, None, None, None, None).ok()?;
-    for item in &list.items {
-        let Some(spec) = item.get("spec") else {
-            continue;
-        };
+    list.items.iter().find_map(|item| {
+        let spec = item.get("spec")?;
         if spec.get("group").and_then(|v| v.as_str()) != Some(group)
             || spec.get("version").and_then(|v| v.as_str()) != Some(version)
         {
-            continue;
+            return None;
         }
-        // A `service` is what makes this an *aggregated* (proxied) API; local
-        // APIServices (the built-in groups) have none.
-        let Some(svc) = spec.get("service").and_then(|v| v.as_object()) else {
+        backend_of(spec)
+    })
+}
+
+/// The service behind an APIService spec; `None` for a local one (the
+/// built-in groups), which has no `service`.
+fn backend_of(spec: &serde_json::Value) -> Option<Backend> {
+    let svc = spec.get("service").and_then(|v| v.as_object())?;
+    let name = svc.get("name").and_then(|v| v.as_str())?;
+    let namespace = svc.get("namespace").and_then(|v| v.as_str())?;
+    let port = svc.get("port").and_then(|v| v.as_u64()).unwrap_or(443) as u16;
+    let insecure = spec
+        .get("insecureSkipTLSVerify")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let ca_pem = spec
+        .get("caBundle")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .and_then(|b64| base64::engine::general_purpose::STANDARD.decode(b64).ok());
+    Some(Backend {
+        namespace: namespace.to_string(),
+        name: name.to_string(),
+        port,
+        ca_pem,
+        insecure,
+    })
+}
+
+const AVAILABILITY_PERIOD: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Keep every APIService's `Available` condition current, as upstream's
+/// availability controller does: a local one is always available; a
+/// service-backed one must answer its group-version discovery request.
+pub async fn run_availability(
+    store: r8s_store::Store,
+    data_dir: std::path::PathBuf,
+    shutdown: tokio_util::sync::CancellationToken,
+) -> anyhow::Result<()> {
+    let gvr = GroupVersionResource::new("apiregistration.k8s.io", "v1", "apiservices");
+    let mut rx = store.watch(&gvr);
+    // A backend becomes reachable when its Endpoints do.
+    let mut ep_rx = store.watch(&GroupVersionResource::endpoints());
+    let mut tick = tokio::time::interval(AVAILABILITY_PERIOD);
+    loop {
+        tokio::select! {
+            _ = shutdown.cancelled() => return Ok(()),
+            _ = tick.tick() => {}
+            r = rx.recv() => if matches!(r, Err(tokio::sync::broadcast::error::RecvError::Closed)) {
+                return Ok(());
+            },
+            r = ep_rx.recv() => if matches!(r, Err(tokio::sync::broadcast::error::RecvError::Closed)) {
+                return Ok(());
+            },
+        }
+        let Ok(list) = store.list(&gvr, None, None, None, None, None) else {
             continue;
         };
-        let (Some(name), Some(namespace)) = (
-            svc.get("name").and_then(|v| v.as_str()),
-            svc.get("namespace").and_then(|v| v.as_str()),
-        ) else {
-            continue;
-        };
-        let port = svc.get("port").and_then(|v| v.as_u64()).unwrap_or(443) as u16;
-        let insecure = spec
-            .get("insecureSkipTLSVerify")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        let ca_pem = spec
-            .get("caBundle")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-            .and_then(|b64| base64::engine::general_purpose::STANDARD.decode(b64).ok());
-        return Some(Backend {
-            namespace: namespace.to_string(),
-            name: name.to_string(),
-            port,
-            ca_pem,
-            insecure,
-        });
+        for item in list.items {
+            let (available, reason, message) = check_availability(&store, &data_dir, &item).await;
+            set_available_condition(&store, &gvr, item, available, reason, &message);
+        }
     }
-    None
+}
+
+async fn check_availability(
+    store: &r8s_store::Store,
+    data_dir: &std::path::Path,
+    item: &serde_json::Value,
+) -> (bool, &'static str, String) {
+    let spec = &item["spec"];
+    let Some(backend) = backend_of(spec) else {
+        return (
+            true,
+            "Local",
+            "Local APIServices are always available".into(),
+        );
+    };
+    let (ip, port) =
+        match resolve_service_endpoint(store, &backend.namespace, &backend.name, backend.port) {
+            Ok(ep) => ep,
+            Err(e) => {
+                return (
+                    false,
+                    "MissingEndpoints",
+                    format!(
+                        "endpoints for service/{} in \"{}\" are unavailable: {e}",
+                        backend.name, backend.namespace
+                    ),
+                );
+            }
+        };
+    let path = format!(
+        "/apis/{}/{}",
+        spec["group"].as_str().unwrap_or(""),
+        spec["version"].as_str().unwrap_or("")
+    );
+    let url = format!("https://{}:{port}{path}", backend.host());
+    let resp = proxy(
+        ip,
+        port,
+        &backend,
+        data_dir,
+        &Method::GET,
+        &path,
+        &HeaderMap::new(),
+        &[],
+    )
+    .await;
+    if resp.status().is_success() {
+        (true, "Passed", "all checks passed".into())
+    } else {
+        (
+            false,
+            "FailedDiscoveryCheck",
+            format!(
+                "failing or missing response from {url}: bad status from {url}: {}",
+                resp.status().as_u16()
+            ),
+        )
+    }
+}
+
+/// Store the `Available` condition when it changed, keeping the other
+/// conditions and the transition time of an unchanged status.
+fn set_available_condition(
+    store: &r8s_store::Store,
+    gvr: &GroupVersionResource,
+    mut item: serde_json::Value,
+    available: bool,
+    reason: &str,
+    message: &str,
+) {
+    let status = if available { "True" } else { "False" };
+    let conditions = item["status"]["conditions"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let existing = conditions.iter().find(|c| c["type"] == "Available");
+    if existing
+        .is_some_and(|c| c["status"] == status && c["reason"] == reason && c["message"] == message)
+    {
+        return;
+    }
+    let now = serde_json::json!(r8s_types::Time(chrono::Utc::now()));
+    let transition = match existing {
+        Some(c) if c["status"] == status => c["lastTransitionTime"].clone(),
+        _ => now,
+    };
+    let mut updated: Vec<serde_json::Value> = conditions
+        .into_iter()
+        .filter(|c| c["type"] != "Available")
+        .collect();
+    updated.insert(
+        0,
+        serde_json::json!({
+            "type": "Available",
+            "status": status,
+            "reason": reason,
+            "message": message,
+            "lastTransitionTime": transition,
+        }),
+    );
+    if !item["status"].is_object() {
+        item["status"] = serde_json::json!({});
+    }
+    item["status"]["conditions"] = serde_json::Value::Array(updated);
+    let name = item["metadata"]["name"].as_str().unwrap_or("").to_string();
+    let rref = r8s_store::backend::ResourceRef {
+        gvr,
+        namespace: None,
+        name: &name,
+    };
+    if let Err(e) = store.update(&rref, &item) {
+        tracing::debug!("apiservice '{name}': availability update skipped: {e}");
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -344,8 +488,10 @@ fn proxy_tls_config(
     }
 }
 
+/// A certificate verifier that accepts anything, for backends whose
+/// certificate is not checked.
 #[derive(Debug)]
-struct NoVerify(Arc<rustls::crypto::CryptoProvider>);
+pub(crate) struct NoVerify(pub(crate) Arc<rustls::crypto::CryptoProvider>);
 
 impl rustls::client::danger::ServerCertVerifier for NoVerify {
     fn verify_server_cert(

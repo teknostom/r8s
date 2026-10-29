@@ -130,11 +130,14 @@ jobs:
             exit 1
           fi
 
-      - name: Dump r8sd log on failure
-        if: failure()
+      # Copied into RESULTS_DIR so the upload below carries the full daemon log.
+      - name: Collect daemon log
+        if: always()
         run: |
-          echo "===== r8sd.log ====="
-          sudo cat /var/lib/r8s/clusters/default/r8sd.log 2>/dev/null || true
+          sudo cp /var/lib/r8s/clusters/default/r8sd.log "$RESULTS_DIR/r8sd.log" 2>/dev/null || exit 0
+          sudo chmod a+r "$RESULTS_DIR/r8sd.log"
+          echo "===== r8sd.log: WARN/ERROR (tail) ====="
+          grep -aE 'WARN|ERROR' "$RESULTS_DIR/r8sd.log" | tail -n 200 || true
 
       - name: Upload results
         if: always()

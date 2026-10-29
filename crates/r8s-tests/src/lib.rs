@@ -6,7 +6,7 @@ use r8s_store::backend::{ResourceRef, Store};
 use r8s_types::{
     Container, CronJob, CronJobSpec, DaemonSet, DaemonSetSpec, Deployment, DeploymentSpec,
     GroupVersionResource, Job, JobSpec, JobTemplateSpec, LabelSelector, ObjectMeta, Pod, PodSpec,
-    PodTemplateSpec, Service, ServicePort, ServiceSpec, StatefulSet, StatefulSetSpec,
+    PodTemplateSpec, Service, ServicePort, ServiceSpec, StatefulSet, StatefulSetSpec, Time,
     registry::ResourceRegistry,
 };
 use tempfile::TempDir;
@@ -611,11 +611,14 @@ pub fn make_job(name: &str) -> Job {
     }
 }
 
+/// Backdated two minutes: the first slot of a `* * * * *` schedule is already
+/// due on the controller's first reconcile instead of at the next minute mark.
 pub fn make_cronjob(name: &str, schedule: &str) -> CronJob {
     CronJob {
         metadata: ObjectMeta {
             name: Some(name.into()),
             namespace: Some("default".into()),
+            creation_timestamp: Some(Time(chrono::Utc::now() - chrono::Duration::minutes(2))),
             ..Default::default()
         },
         spec: Some(CronJobSpec {

@@ -35,14 +35,17 @@ pub enum Operation {
     Create,
     Update,
     Delete,
+    /// Streaming subresources: `pods/exec`, `pods/attach`, `pods/portforward`.
+    Connect,
 }
 
 impl Operation {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Operation::Create => "CREATE",
             Operation::Update => "UPDATE",
             Operation::Delete => "DELETE",
+            Operation::Connect => "CONNECT",
         }
     }
 }
@@ -55,6 +58,8 @@ pub struct AdmissionCtx<'a> {
     pub operation: Operation,
     pub namespace: Option<&'a str>,
     pub name: &'a str,
+    /// `exec`, `attach`, `status`...; `None` for the main resource.
+    pub subresource: Option<&'a str>,
     pub dry_run: bool,
     pub user_info: Value,
 }
@@ -78,6 +83,13 @@ pub enum AdmissionError {
     InvalidResponse { webhook: String, error: String },
     #[error("internal admission error: {0}")]
     Internal(String),
+    /// A ValidatingAdmissionPolicy denied the request; `reason` is the
+    /// metav1 StatusReason it carries.
+    #[error("{message}")]
+    PolicyDenied { message: String, reason: String },
+    /// A webhook's matchCondition failed to evaluate under failurePolicy Fail.
+    #[error("{0}")]
+    MatchConditionFailed(String),
 }
 
 /// Run mutating webhooks, applying each patch in turn. Returns the (possibly
@@ -87,7 +99,12 @@ pub async fn invoke_mutating(
     object: &mut Value,
     old_object: Option<&Value>,
 ) -> Result<(), AdmissionError> {
-    let matches = matching_webhooks(ctx, "mutatingwebhookconfigurations")?;
+    let matches = matching_webhooks(
+        ctx,
+        "mutatingwebhookconfigurations",
+        Some(object),
+        old_object,
+    )?;
     tracing::debug!(
         gvr = %ctx.gvr.key_prefix(),
         dry_run = ctx.dry_run,
@@ -149,13 +166,19 @@ pub async fn invoke_validating(
     object: &Value,
     old_object: Option<&Value>,
 ) -> Result<(), AdmissionError> {
-    let matches = matching_webhooks(ctx, "validatingwebhookconfigurations")?;
+    let matches = matching_webhooks(
+        ctx,
+        "validatingwebhookconfigurations",
+        Some(object),
+        old_object,
+    )?;
     tracing::debug!(
         gvr = %ctx.gvr.key_prefix(),
         dry_run = ctx.dry_run,
         matched = matches.len(),
         "invoke_validating: matched webhooks"
     );
+    crate::vap::validate(ctx, object, old_object)?;
     let mut owned = object.clone();
     for m in matches {
         match call_webhook(ctx, &m, &mut owned, old_object).await {
@@ -201,11 +224,20 @@ struct MatchedWebhook {
     fail_closed: bool,
 }
 
+/// Group whose objects are never sent to webhooks, so a misconfigured or
+/// unreachable webhook can't lock its own configuration in place.
+const ADMISSION_REGISTRATION_GROUP: &str = "admissionregistration.k8s.io";
+
 fn matching_webhooks(
     ctx: &AdmissionCtx<'_>,
     resource: &str,
+    object: Option<&Value>,
+    old_object: Option<&Value>,
 ) -> Result<Vec<MatchedWebhook>, AdmissionError> {
-    let configs_gvr = GroupVersionResource::new("admissionregistration.k8s.io", "v1", resource);
+    if ctx.gvr.group == ADMISSION_REGISTRATION_GROUP {
+        return Ok(Vec::new());
+    }
+    let configs_gvr = GroupVersionResource::new(ADMISSION_REGISTRATION_GROUP, "v1", resource);
     let list = ctx
         .store
         .list(&configs_gvr, None, None, None, None, None)
@@ -228,12 +260,29 @@ fn matching_webhooks(
             if !matches_rules(wh.get("rules"), ctx) {
                 continue;
             }
-            if !matches_namespace_selector(ctx, wh.get("namespaceSelector")) {
+            if !matches_namespace_selector(ctx, wh.get("namespaceSelector"), object) {
                 continue;
             }
-            // objectSelector is a labelSelector against the resource's labels.
-            // Cheap to apply since we have the object in hand.
-            // (Pass through default-match for create flows.)
+            if let Some(sel) = wh.get("objectSelector")
+                && !object_selector_matches(sel, object, old_object)
+            {
+                continue;
+            }
+            let fail_closed_policy = wh
+                .get("failurePolicy")
+                .and_then(|v| v.as_str())
+                .map(|s| !s.eq_ignore_ascii_case("Ignore"))
+                .unwrap_or(true);
+            match match_conditions_hold(ctx, wh.get("matchConditions"), object, old_object) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(e) if fail_closed_policy => {
+                    return Err(AdmissionError::MatchConditionFailed(format!(
+                        "failed to evaluate match condition for webhook \"{name}\": {e}"
+                    )));
+                }
+                Err(_) => continue,
+            }
             let cc = match wh.get("clientConfig").and_then(|v| v.as_object()) {
                 Some(c) => c,
                 None => continue,
@@ -296,6 +345,85 @@ fn matching_webhooks(
     Ok(out)
 }
 
+/// A webhook's `matchConditions`: all must hold for it to be called.
+fn match_conditions_hold(
+    ctx: &AdmissionCtx<'_>,
+    conditions: Option<&Value>,
+    object: Option<&Value>,
+    old_object: Option<&Value>,
+) -> Result<bool, String> {
+    let Some(conditions) = conditions
+        .and_then(|c| c.as_array())
+        .filter(|c| !c.is_empty())
+    else {
+        return Ok(true);
+    };
+    let activation = crate::cel::Activation::default()
+        .with(
+            "object",
+            object
+                .map(crate::cel::from_json)
+                .unwrap_or(cel_interpreter::Value::Null),
+        )
+        .with(
+            "oldObject",
+            old_object
+                .map(crate::cel::from_json)
+                .unwrap_or(cel_interpreter::Value::Null),
+        )
+        .with("request", crate::cel::from_json(&request_json(ctx)));
+    for condition in conditions {
+        let expression = condition
+            .get("expression")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if !crate::cel::check(expression, &activation)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// The AdmissionRequest a webhook would get, without the objects, as CEL's
+/// `request`.
+pub(crate) fn request_json(ctx: &AdmissionCtx<'_>) -> Value {
+    let mut request = build_admission_review("", ctx, &Value::Null, None)["request"].take();
+    if let Some(obj) = request.as_object_mut() {
+        obj.remove("object");
+        obj.remove("oldObject");
+        obj.remove("uid");
+    }
+    request
+}
+
+/// Whether `rules` (rules with operations) select the request, honoring
+/// `resourceNames`.
+pub(crate) fn rules_match(rules: &Value, ctx: &AdmissionCtx<'_>, object: Option<&Value>) -> bool {
+    let name = object
+        .and_then(|o| o.pointer("/metadata/name"))
+        .and_then(|v| v.as_str())
+        .unwrap_or(ctx.name);
+    rules.as_array().into_iter().flatten().any(|rule| {
+        let names = string_list(rule.get("resourceNames"));
+        matches_rules(Some(&Value::Array(vec![rule.clone()])), ctx)
+            && (names.is_empty() || names.iter().any(|n| n == name))
+    })
+}
+
+/// A namespace selector and an object selector both matching.
+pub(crate) fn selectors_match(
+    ctx: &AdmissionCtx<'_>,
+    namespace_selector: Option<&Value>,
+    object_selector: Option<&Value>,
+    object: Option<&Value>,
+    old_object: Option<&Value>,
+) -> bool {
+    matches_namespace_selector(ctx, namespace_selector.filter(|v| !v.is_null()), object)
+        && object_selector
+            .filter(|v| !v.is_null())
+            .is_none_or(|sel| object_selector_matches(sel, object, old_object))
+}
+
 fn matches_rules(rules: Option<&Value>, ctx: &AdmissionCtx<'_>) -> bool {
     let Some(rules) = rules.and_then(|v| v.as_array()) else {
         return false;
@@ -319,18 +447,36 @@ fn matches_rules(rules: Option<&Value>, ctx: &AdmissionCtx<'_>) -> bool {
             continue;
         }
         let resources = string_list(rule.get("resources"));
-        // Each entry may be "resource" or "resource/subresource". We don't
-        // currently dispatch subresource calls through admission, so an entry
-        // like "*/*" or "*/status" should still match our base resource.
-        if !resources.iter().any(|s| {
-            let base = s.split('/').next().unwrap_or(s);
-            base == "*" || base == ctx.gvr.resource
-        }) {
+        if !resources
+            .iter()
+            .any(|entry| resource_entry_matches(entry, &ctx.gvr.resource, ctx.subresource))
+        {
             continue;
         }
         return true;
     }
     false
+}
+
+/// A rule's `resources` entry: `r` is the main resource only, `r/s` one
+/// subresource, `r/*` any subresource of `r`, `*` every main resource, `*/*`
+/// everything, `*/s` subresource `s` of every resource.
+fn resource_entry_matches(entry: &str, resource: &str, subresource: Option<&str>) -> bool {
+    let (base, sub) = match entry.split_once('/') {
+        Some((base, sub)) => (base, Some(sub)),
+        None => (entry, None),
+    };
+    if base != "*" && base != resource {
+        return false;
+    }
+    match (sub, subresource) {
+        (None, None) => true,
+        (Some(want), Some(have)) => want == "*" || want == have,
+        // `*/*` is every resource and every subresource; `r/*` is only r's
+        // subresources.
+        (Some("*"), None) => base == "*",
+        _ => false,
+    }
 }
 
 fn string_list(v: Option<&Value>) -> Vec<String> {
@@ -343,12 +489,21 @@ fn string_list(v: Option<&Value>) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn matches_namespace_selector(ctx: &AdmissionCtx<'_>, selector: Option<&Value>) -> bool {
+/// A Namespace object is matched on its own labels; other cluster-scoped
+/// objects always match; namespaced ones on their namespace's labels.
+fn matches_namespace_selector(
+    ctx: &AdmissionCtx<'_>,
+    selector: Option<&Value>,
+    object: Option<&Value>,
+) -> bool {
     let Some(sel) = selector else {
         return true;
     };
     if sel.as_object().map(|o| o.is_empty()).unwrap_or(true) {
         return true;
+    }
+    if ctx.gvr.group.is_empty() && ctx.gvr.resource == "namespaces" {
+        return label_selector_matches(sel, &labels_of(object));
     }
     let Some(ns_name) = ctx.namespace else {
         return true;
@@ -370,21 +525,67 @@ fn matches_namespace_selector(ctx: &AdmissionCtx<'_>, selector: Option<&Value>) 
     label_selector_matches(sel, &ns_labels)
 }
 
+/// `metadata.labels` of an object, `{}` when absent.
+fn labels_of(object: Option<&Value>) -> Value {
+    object
+        .and_then(|o| o.get("metadata"))
+        .and_then(|m| m.get("labels"))
+        .cloned()
+        .unwrap_or(json!({}))
+}
+
+/// `objectSelector`: matched against the object's labels, or the old object's
+/// for an update or delete whose new state no longer matches.
+fn object_selector_matches(
+    selector: &Value,
+    object: Option<&Value>,
+    old_object: Option<&Value>,
+) -> bool {
+    if selector.as_object().map(|o| o.is_empty()).unwrap_or(true) {
+        return true;
+    }
+    label_selector_matches(selector, &labels_of(object))
+        || (old_object.is_some() && label_selector_matches(selector, &labels_of(old_object)))
+}
+
+/// `metav1.LabelSelector` against a label map: every `matchLabels` entry must
+/// be present with that value and every `matchExpressions` requirement must
+/// hold. An absent key satisfies `NotIn` and `DoesNotExist`.
 fn label_selector_matches(selector: &Value, labels: &Value) -> bool {
-    let labels_obj = labels.as_object();
+    let label = |key: &str| labels.get(key).and_then(|v| v.as_str());
     if let Some(match_labels) = selector.get("matchLabels").and_then(|v| v.as_object()) {
-        for (k, v) in match_labels {
-            let want = v.as_str().unwrap_or("");
-            let got = labels_obj
-                .and_then(|o| o.get(k))
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            if got != want {
+        for (key, want) in match_labels {
+            if label(key) != want.as_str() {
                 return false;
             }
         }
     }
-    // matchExpressions left for follow-up.
+    let requirements = selector
+        .get("matchExpressions")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten();
+    for req in requirements {
+        let key = req.get("key").and_then(|v| v.as_str()).unwrap_or("");
+        let values: Vec<&str> = req
+            .get("values")
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|v| v.as_str())
+            .collect();
+        let actual = label(key);
+        let holds = match req.get("operator").and_then(|v| v.as_str()) {
+            Some("In") => actual.is_some_and(|a| values.contains(&a)),
+            Some("NotIn") => !actual.is_some_and(|a| values.contains(&a)),
+            Some("Exists") => actual.is_some(),
+            Some("DoesNotExist") => actual.is_none(),
+            _ => false,
+        };
+        if !holds {
+            return false;
+        }
+    }
     true
 }
 
@@ -392,7 +593,7 @@ fn label_selector_matches(selector: &Value, labels: &Value) -> bool {
 // CA resolution
 // ---------------------------------------------------------------------------
 
-fn resolve_ca(
+pub(crate) fn resolve_ca(
     store: &Store,
     cabundle: Option<&Value>,
     inject_secret: Option<&str>,
@@ -467,6 +668,13 @@ async fn call_webhook(
         m.service_port,
     )?;
     let host = format!("{}.{}.svc", m.service_name, m.service_namespace);
+    // The URL as upstream would dial it; clients match on it in error text.
+    let url = format!(
+        "https://{host}:{}{}?timeout={}s",
+        m.service_port,
+        m.service_path,
+        m.timeout.as_secs()
+    );
 
     let raw = timeout(
         m.timeout,
@@ -475,11 +683,11 @@ async fn call_webhook(
     .await
     .map_err(|_| AdmissionError::CallFailed {
         webhook: m.name.clone(),
-        error: format!("timeout after {}s", m.timeout.as_secs()),
+        error: format!("failed to call webhook: Post \"{url}\": context deadline exceeded"),
     })?
     .map_err(|e| AdmissionError::CallFailed {
         webhook: m.name.clone(),
-        error: e,
+        error: format!("failed to call webhook: Post \"{url}\": {e}"),
     })?;
 
     let parsed: Value =
@@ -505,13 +713,20 @@ async fn call_webhook(
     })
 }
 
+/// The denial text is `status.message`, else `status.reason`; the response
+/// layer words an empty result as "without explanation", like upstream.
 fn denied_from(webhook: &str, status: Option<Value>) -> AdmissionError {
-    let message = status
-        .as_ref()
-        .and_then(|s| s.get("message"))
-        .and_then(|v| v.as_str())
-        .unwrap_or_default()
-        .to_string();
+    let text = |field: &str| {
+        status
+            .as_ref()
+            .and_then(|s| s.get(field))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    let message = text("message")
+        .or_else(|| text("reason"))
+        .unwrap_or_default();
     AdmissionError::Denied {
         webhook: webhook.to_string(),
         message,
@@ -567,6 +782,8 @@ fn build_admission_review(
             // and some webhook implementations nil-deref if they are omitted.
             "requestKind": kind,
             "requestResource": resource,
+            "subResource": ctx.subresource.unwrap_or(""),
+            "requestSubResource": ctx.subresource.unwrap_or(""),
             "name": ctx.name,
             "namespace": ctx.namespace.unwrap_or(""),
             "operation": ctx.operation.as_str(),
@@ -713,7 +930,7 @@ pub(crate) fn resolve_service_endpoint(
     Ok((pod_ip, target_port_num))
 }
 
-async fn do_https_post(
+pub(crate) async fn do_https_post(
     ip: IpAddr,
     port: u16,
     host: &str,
@@ -845,7 +1062,7 @@ pub(crate) fn tls_config(ca_pem: Option<&[u8]>) -> Result<ClientConfig, String> 
         .with_no_client_auth())
 }
 
-fn uuid_like() -> String {
+pub(crate) fn uuid_like() -> String {
     use rand::Rng;
     let mut rng = rand::rng();
     let bytes: [u8; 16] = rng.random();
@@ -892,6 +1109,7 @@ mod tests {
             operation: op,
             namespace: ns,
             name: "x",
+            subresource: None,
             dry_run: false,
             user_info: json!({}),
         }
@@ -963,8 +1181,8 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let store = Store::open(&dir.path().join("t.db")).unwrap();
         let c = ctx(&store, "", "v1", "pods", Operation::Create, None);
-        assert!(matches_namespace_selector(&c, None));
-        assert!(matches_namespace_selector(&c, Some(&json!({}))));
+        assert!(matches_namespace_selector(&c, None, None));
+        assert!(matches_namespace_selector(&c, Some(&json!({})), None));
     }
 
     #[tokio::test]
@@ -1022,5 +1240,148 @@ mod tests {
         assert_eq!(review["request"]["resource"]["group"], "cert-manager.io");
         assert_eq!(review["request"]["object"], obj);
         assert_eq!(review["request"]["dryRun"], false);
+    }
+
+    #[tokio::test]
+    async fn webhook_configuration_objects_bypass_webhooks() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Store::open(&dir.path().join("t.db")).unwrap();
+        let cfg_gvr = GroupVersionResource::new(
+            ADMISSION_REGISTRATION_GROUP,
+            "v1",
+            "validatingwebhookconfigurations",
+        );
+        store
+            .create(
+                ResourceRef {
+                    gvr: &cfg_gvr,
+                    namespace: None,
+                    name: "catch-all",
+                },
+                &json!({
+                    "metadata": {"name": "catch-all"},
+                    "webhooks": [{
+                        "name": "deny-everything.example.com",
+                        "rules": [{
+                            "operations": ["*"],
+                            "apiGroups": ["*"],
+                            "apiVersions": ["*"],
+                            "resources": ["*/*"]
+                        }],
+                        "clientConfig": {"service": {"name": "wh", "namespace": "ns"}},
+                        "sideEffects": "None"
+                    }]
+                }),
+            )
+            .unwrap();
+
+        let pods = ctx(&store, "", "v1", "pods", Operation::Delete, Some("ns"));
+        assert_eq!(
+            matching_webhooks(&pods, "validatingwebhookconfigurations", None, None)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let cfg = ctx(
+            &store,
+            ADMISSION_REGISTRATION_GROUP,
+            "v1",
+            "validatingwebhookconfigurations",
+            Operation::Delete,
+            None,
+        );
+        assert!(
+            matching_webhooks(&cfg, "validatingwebhookconfigurations", None, None)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn label_selector_match_expressions() {
+        let labels = json!({"env": "prod", "skip-webhook-admission": "yes"});
+        let m = |sel: Value| label_selector_matches(&sel, &labels);
+        assert!(!m(json!({"matchExpressions": [
+            {"key": "skip-webhook-admission", "operator": "NotIn", "values": ["yes"]}]})));
+        assert!(m(json!({"matchExpressions": [
+            {"key": "skip-webhook-admission", "operator": "In", "values": ["yes", "true"]}]})));
+        assert!(m(
+            json!({"matchExpressions": [{"key": "env", "operator": "Exists"}]})
+        ));
+        assert!(!m(
+            json!({"matchExpressions": [{"key": "env", "operator": "DoesNotExist"}]})
+        ));
+        assert!(m(
+            json!({"matchExpressions": [{"key": "team", "operator": "DoesNotExist"}]})
+        ));
+        // An absent key satisfies NotIn; a bogus operator never matches.
+        assert!(m(json!({"matchExpressions": [
+            {"key": "team", "operator": "NotIn", "values": ["core"]}]})));
+        assert!(!m(
+            json!({"matchExpressions": [{"key": "env", "operator": "Equals"}]})
+        ));
+        assert!(m(json!({"matchLabels": {"env": "prod"},
+            "matchExpressions": [{"key": "team", "operator": "DoesNotExist"}]})));
+    }
+
+    #[test]
+    fn object_selector_consults_old_object_too() {
+        let sel = json!({"matchLabels": {"webhook-e2e-test": "skip-me"}});
+        let skip = json!({"metadata": {"labels": {"webhook-e2e-test": "skip-me"}}});
+        let other = json!({"metadata": {"labels": {"app": "x"}}});
+        assert!(object_selector_matches(&sel, Some(&skip), None));
+        assert!(!object_selector_matches(&sel, Some(&other), None));
+        assert!(object_selector_matches(&sel, Some(&other), Some(&skip)));
+        assert!(!object_selector_matches(&sel, None, None));
+        assert!(object_selector_matches(&json!({}), Some(&other), None));
+    }
+
+    #[test]
+    fn resource_entries_distinguish_subresources() {
+        let m = resource_entry_matches;
+        assert!(m("pods", "pods", None));
+        assert!(!m("pods", "pods", Some("attach")));
+        assert!(m("pods/attach", "pods", Some("attach")));
+        assert!(!m("pods/attach", "pods", None));
+        assert!(!m("pods/attach", "pods", Some("exec")));
+        assert!(m("pods/*", "pods", Some("exec")));
+        assert!(!m("pods/*", "pods", None));
+        assert!(m("*", "deployments", None));
+        assert!(!m("*", "deployments", Some("status")));
+        assert!(m("*/*", "deployments", Some("status")));
+        assert!(m("*/*", "deployments", None));
+        assert!(m("*/status", "deployments", Some("status")));
+        assert!(!m("*/status", "deployments", Some("scale")));
+        assert!(!m("configmaps", "pods", None));
+    }
+
+    #[test]
+    fn denial_text_falls_back_to_reason() {
+        let text = |status: Option<Value>| match denied_from("w", status) {
+            AdmissionError::Denied { message, .. } => message,
+            other => panic!("{other}"),
+        };
+        assert_eq!(text(Some(json!({"message": "m", "reason": "r"}))), "m");
+        assert_eq!(
+            text(Some(json!({"reason": "the pod is unwanted"}))),
+            "the pod is unwanted"
+        );
+        assert_eq!(text(Some(json!({"message": "", "reason": "r"}))), "r");
+        assert_eq!(text(Some(json!({"code": 403}))), "");
+        assert_eq!(text(None), "");
+    }
+
+    #[tokio::test]
+    async fn admission_review_carries_subresource_and_connect() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Store::open(&dir.path().join("t.db")).unwrap();
+        let mut c = ctx(&store, "", "v1", "pods", Operation::Connect, Some("ns"));
+        c.subresource = Some("attach");
+        let review = build_admission_review("u", &c, &json!({"kind": "PodAttachOptions"}), None);
+        assert_eq!(review["request"]["operation"], "CONNECT");
+        assert_eq!(review["request"]["subResource"], "attach");
+        assert_eq!(review["request"]["requestSubResource"], "attach");
+        assert_eq!(review["request"]["object"]["kind"], "PodAttachOptions");
     }
 }

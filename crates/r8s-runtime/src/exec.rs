@@ -227,7 +227,12 @@ async fn build_exec_session(
             stdin: true,
         };
         if let Err(e) = tasks.close_io(with_namespace!(close_req, NAMESPACE)).await {
-            tracing::warn!(error = %e, "exec CloseIO(stdin) failed");
+            // A command that already exited has no process left to close.
+            if e.message().contains("process does not exist") {
+                tracing::debug!(error = %e, "exec CloseIO(stdin): process already exited");
+            } else {
+                tracing::warn!(error = %e, "exec CloseIO(stdin) failed");
+            }
         }
     });
 

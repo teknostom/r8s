@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 r8s-types.workspace = true
+rustc-hash.workspace = true
 r8s-store.workspace = true
 
 tokio.workspace = true

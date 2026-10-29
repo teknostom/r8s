@@ -10,6 +10,7 @@
 
 pub mod backend;
 pub mod error;
+pub mod events;
 pub mod index;
 pub mod revision;
 pub mod watch;

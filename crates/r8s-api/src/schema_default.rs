@@ -1,16 +1,10 @@
 //! Apply `default` values from a CRD's openAPIV3Schema to a custom resource.
 //!
-//! Kubernetes' apiserver fills in schema defaults for absent fields at admission
-//! time (and on read from storage). Operators rely on this heavily — e.g. the
-//! prometheus-operator reads `spec.scrapeInterval` expecting the CRD's
-//! `default: "30s"` to be present; without defaulting it sees an empty string
-//! and emits `scrape_interval: ""`, which Prometheus then rejects.
-//!
-//! We walk the structural schema recursively: for object schemas, every
-//! property that's absent but has a `default` is inserted (then descended into,
-//! so nested defaults under that default also land); present properties are
-//! descended into so their own nested defaults fill in. Array `items` schemas
-//! are applied to each element.
+//! Walks the schema alongside the object: an absent property with a `default`
+//! is inserted and then descended into, present properties are descended into,
+//! and `additionalProperties` / `items` schemas apply to every value / element.
+//! `x-kubernetes-preserve-unknown-fields` only affects pruning, so declared
+//! properties under it still get their defaults.
 
 use serde_json::Value;
 
@@ -23,47 +17,38 @@ fn walk(value: &mut Value, schema: &Value) {
         return;
     };
 
-    // Don't descend into opaque subtrees — we can't reason about their shape.
-    if schema_obj
-        .get("x-kubernetes-preserve-unknown-fields")
-        .and_then(|v| v.as_bool())
-        == Some(true)
+    if let Some(props) = schema_obj.get("properties").and_then(|p| p.as_object())
+        && let Some(obj) = value.as_object_mut()
     {
-        return;
-    }
-
-    match schema_obj.get("type").and_then(|t| t.as_str()) {
-        Some("object") => {
-            let Some(props) = schema_obj.get("properties").and_then(|p| p.as_object()) else {
-                return;
-            };
-            let Some(obj) = value.as_object_mut() else {
-                return;
-            };
-            for (key, prop_schema) in props {
-                match obj.get_mut(key) {
-                    Some(child) => walk(child, prop_schema),
-                    None => {
-                        if let Some(default) = prop_schema.get("default") {
-                            obj.insert(key.clone(), default.clone());
-                            if let Some(child) = obj.get_mut(key) {
-                                walk(child, prop_schema);
-                            }
+        for (key, prop_schema) in props {
+            match obj.get_mut(key) {
+                Some(child) => walk(child, prop_schema),
+                None => {
+                    if let Some(default) = prop_schema.get("default") {
+                        obj.insert(key.clone(), default.clone());
+                        if let Some(child) = obj.get_mut(key) {
+                            walk(child, prop_schema);
                         }
                     }
                 }
             }
         }
-        Some("array") => {
-            if let Some(item_schema) = schema_obj.get("items")
-                && let Some(arr) = value.as_array_mut()
-            {
-                for item in arr.iter_mut() {
-                    walk(item, item_schema);
-                }
-            }
+    }
+    if let Some(value_schema) = schema_obj
+        .get("additionalProperties")
+        .filter(|s| s.is_object())
+        && let Some(obj) = value.as_object_mut()
+    {
+        for child in obj.values_mut() {
+            walk(child, value_schema);
         }
-        _ => {}
+    }
+    if let Some(item_schema) = schema_obj.get("items")
+        && let Some(arr) = value.as_array_mut()
+    {
+        for item in arr.iter_mut() {
+            walk(item, item_schema);
+        }
     }
 }
 
@@ -125,6 +110,36 @@ mod tests {
         apply_defaults(&mut obj, &schema);
         assert_eq!(obj["items"][0]["weight"], 1);
         assert_eq!(obj["items"][1]["weight"], 5);
+    }
+
+    #[test]
+    fn preserve_unknown_fields_root_still_defaults_declared_properties() {
+        let schema = json!({
+            "type": "object",
+            "x-kubernetes-preserve-unknown-fields": true,
+            "properties": {
+                "a": {"type": "string", "default": "A"}
+            }
+        });
+        let mut obj = json!({"unknown": 1});
+        apply_defaults(&mut obj, &schema);
+        assert_eq!(obj["a"], "A");
+        assert_eq!(obj["unknown"], 1);
+    }
+
+    #[test]
+    fn defaults_apply_inside_additional_properties_values() {
+        let schema = json!({
+            "type": "object",
+            "additionalProperties": {
+                "type": "object",
+                "properties": {"enabled": {"type": "boolean", "default": true}}
+            }
+        });
+        let mut obj = json!({"x": {}, "y": {"enabled": false}});
+        apply_defaults(&mut obj, &schema);
+        assert_eq!(obj["x"]["enabled"], true);
+        assert_eq!(obj["y"]["enabled"], false);
     }
 
     #[test]

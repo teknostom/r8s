@@ -32,6 +32,7 @@ fn main() {
         "k8s.io/api/apps/v1/generated.proto",
         "k8s.io/api/coordination/v1/generated.proto",
         "k8s.io/api/admissionregistration/v1/generated.proto",
+        "k8s.io/kube-aggregator/pkg/apis/apiregistration/v1/generated.proto",
     ];
     for p in &k8s_protos {
         println!("cargo:rerun-if-changed=proto/{p}");

@@ -34,6 +34,9 @@ pub struct WatchEvent {
     pub event_type: WatchEventType,
     pub resource_version: u64,
     pub object: Arc<serde_json::Value>,
+    /// The object before a MODIFIED event; lets a filtered watcher tell an
+    /// object leaving its selector (DELETED) from one changing inside it.
+    pub prev_object: Option<Arc<serde_json::Value>>,
 }
 
 /// Live fan-out of mutations, keyed by GVR prefix. Replay of past events is

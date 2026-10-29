@@ -148,8 +148,25 @@ fn register_crd(registry: &ResourceRegistry, crd: &CustomResourceDefinition) {
             namespaced,
             singular: spec.names.singular.clone().unwrap_or_default(),
             short_names: spec.names.short_names.clone().unwrap_or_default(),
-            subresources: vec![],
+            subresources: ver
+                .subresources
+                .as_ref()
+                .map(|s| {
+                    let mut out = Vec::new();
+                    if s.status.is_some() {
+                        out.push("status".to_string());
+                    }
+                    if s.scale.is_some() {
+                        out.push("scale".to_string());
+                    }
+                    out
+                })
+                .unwrap_or_default(),
             schema,
+            storage_gvr: Some(GroupVersionResource::storage(
+                &spec.group,
+                &spec.names.plural,
+            )),
         };
         tracing::info!(
             "registered CRD resource {}/{}/{}",
@@ -167,28 +184,28 @@ fn register_crd(registry: &ResourceRegistry, crd: &CustomResourceDefinition) {
 fn delete_instances(store: &Store, crd: &CustomResourceDefinition) {
     let spec = &crd.spec;
     let mut deleted = 0u32;
-    for ver in &spec.versions {
-        let gvr = GroupVersionResource::new(&spec.group, &ver.name, &spec.names.plural);
-        let items = match store.list(&gvr, None, None, None, None, None) {
-            Ok(r) => r.items,
-            Err(_) => continue,
+    let gvr = GroupVersionResource::storage(&spec.group, &spec.names.plural);
+    let items = store
+        .list(&gvr, None, None, None, None, None)
+        .map(|r| r.items)
+        .unwrap_or_default();
+    for item in &items {
+        let meta = item.get("metadata");
+        let Some(name) = meta.and_then(|m| m.get("name")).and_then(|v| v.as_str()) else {
+            continue;
         };
-        for item in &items {
-            let meta = item.get("metadata");
-            let Some(name) = meta.and_then(|m| m.get("name")).and_then(|v| v.as_str()) else {
-                continue;
-            };
-            let namespace = meta.and_then(|m| m.get("namespace")).and_then(|v| v.as_str());
-            if matches!(
-                store.delete(&ResourceRef {
-                    gvr: &gvr,
-                    namespace,
-                    name,
-                }),
-                Ok(Some(_))
-            ) {
-                deleted += 1;
-            }
+        let namespace = meta
+            .and_then(|m| m.get("namespace"))
+            .and_then(|v| v.as_str());
+        if matches!(
+            store.delete(&ResourceRef {
+                gvr: &gvr,
+                namespace,
+                name,
+            }),
+            Ok(Some(_))
+        ) {
+            deleted += 1;
         }
     }
     if deleted > 0 {
@@ -243,7 +260,7 @@ mod tests {
         }))
         .unwrap();
 
-        let gvr = GroupVersionResource::new("example.com", "v1", "widgets");
+        let gvr = GroupVersionResource::storage("example.com", "widgets");
         for name in ["w1", "w2"] {
             store
                 .create(
@@ -263,9 +280,56 @@ mod tests {
         delete_instances(&store, &crd);
 
         assert_eq!(
-            store.list(&gvr, None, None, None, None, None).unwrap().items.len(),
+            store
+                .list(&gvr, None, None, None, None, None)
+                .unwrap()
+                .items
+                .len(),
             0,
             "all custom resources reaped on CRD deletion"
+        );
+    }
+
+    #[test]
+    fn served_versions_share_one_storage_gvr() {
+        let crd: CustomResourceDefinition = serde_json::from_value(json!({
+            "apiVersion": "apiextensions.k8s.io/v1", "kind": "CustomResourceDefinition",
+            "metadata": {"name": "widgets.example.com"},
+            "spec": {
+                "group": "example.com",
+                "names": {"plural": "widgets", "singular": "widget", "kind": "Widget"},
+                "scope": "Cluster",
+                "versions": [
+                    {"name": "v1beta1", "served": true, "storage": false},
+                    {"name": "v1", "served": true, "storage": true},
+                    {"name": "v2alpha1", "served": false, "storage": false}
+                ]
+            }
+        }))
+        .unwrap();
+        let registry = ResourceRegistry::new();
+        register_crd(&registry, &crd);
+
+        let storage = GroupVersionResource::storage("example.com", "widgets");
+        for version in ["v1beta1", "v1"] {
+            let rt = registry
+                .get_by_gvr(&GroupVersionResource::new(
+                    "example.com",
+                    version,
+                    "widgets",
+                ))
+                .unwrap_or_else(|| panic!("{version} registered"));
+            assert_eq!(rt.storage_gvr(), &storage);
+        }
+        assert!(
+            registry
+                .get_by_gvr(&GroupVersionResource::new(
+                    "example.com",
+                    "v2alpha1",
+                    "widgets"
+                ))
+                .is_none(),
+            "unserved versions are not registered"
         );
     }
 }

@@ -9,6 +9,7 @@ use axum::{
 
 use rustc_hash::FxHashSet;
 
+use crate::handler::{RouteContext, has_status_subresource};
 use crate::response::object_response;
 use r8s_store::Store;
 use r8s_types::registry::ResourceRegistry;
@@ -398,6 +399,13 @@ fn aggregated_non_legacy_groups(state: &ApiState) -> serde_json::Value {
     })
 }
 
+/// Whether the type serves a `status` subresource, as the handlers decide it.
+fn has_status(rt: &Arc<r8s_types::ResourceType>) -> bool {
+    has_status_subresource(&RouteContext {
+        resource_type: rt.clone(),
+    })
+}
+
 /// Build the `items` entry for a single group, collapsing all served versions
 /// and listing each resource with the metadata clients need to route to it.
 fn aggregated_items_for_group(state: &ApiState, group: &str) -> Vec<serde_json::Value> {
@@ -406,6 +414,21 @@ fn aggregated_items_for_group(state: &ApiState, group: &str) -> Vec<serde_json::
     for rt in state.registry.iter() {
         if rt.gvr.group != group {
             continue;
+        }
+        let mut subresources = Vec::new();
+        if has_status(&rt) {
+            subresources.push(serde_json::json!({
+                "subresource": "status",
+                "responseKind": {"group": "", "version": "", "kind": rt.kind},
+                "verbs": ["get", "patch", "update"],
+            }));
+        }
+        if rt.subresources.iter().any(|s| s == "scale") {
+            subresources.push(serde_json::json!({
+                "subresource": "scale",
+                "responseKind": {"group": "autoscaling", "version": "v1", "kind": "Scale"},
+                "verbs": ["get", "patch", "update"],
+            }));
         }
         let resource = serde_json::json!({
             "resource": rt.gvr.resource,
@@ -418,6 +441,7 @@ fn aggregated_items_for_group(state: &ApiState, group: &str) -> Vec<serde_json::
             "singularResource": rt.singular,
             "shortNames": rt.short_names,
             "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"],
+            "subresources": subresources,
         });
         versions_map
             .entry(rt.gvr.version.clone())
@@ -463,6 +487,15 @@ fn api_resource_list(state: &ApiState, group: &str, version: &str) -> Response {
             "verbs": ["create","delete","get","list","patch","update","watch"],
             "shortNames": rt.short_names,
         }));
+        if has_status(&rt) {
+            resources.push(serde_json::json!({
+                "name": format!("{}/status", rt.gvr.resource),
+                "singularName": "",
+                "namespaced": rt.namespaced,
+                "kind": rt.kind,
+                "verbs": ["get", "patch", "update"],
+            }));
+        }
         for sub in &rt.subresources {
             // The `scale` subresource is special: it's defined as a Scale kind
             // in the autoscaling/v1 group, but advertised under the parent's
@@ -475,6 +508,18 @@ fn api_resource_list(state: &ApiState, group: &str, version: &str) -> Response {
                     "group": "autoscaling",
                     "version": "v1",
                     "kind": "Scale",
+                    "verbs": ["get", "patch", "update"],
+                }));
+            } else if sub != "status"
+                && !crate::handler::is_custom_resource(&RouteContext {
+                    resource_type: rt.clone(),
+                })
+            {
+                resources.push(serde_json::json!({
+                    "name": format!("{}/{sub}", rt.gvr.resource),
+                    "singularName": "",
+                    "namespaced": rt.namespaced,
+                    "kind": rt.kind,
                     "verbs": ["get", "patch", "update"],
                 }));
             }

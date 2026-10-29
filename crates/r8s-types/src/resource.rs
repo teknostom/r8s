@@ -16,6 +16,22 @@ impl GroupVersionResource {
         }
     }
 
+    /// Version-agnostic store coordinate shared by every served version of a
+    /// resource, so an object written through one version is readable through
+    /// the others.
+    pub fn storage(group: &str, resource: &str) -> Self {
+        Self::new(group, "", resource)
+    }
+
+    /// `group/version`, or bare `version` for the core group.
+    pub fn api_version(&self) -> String {
+        if self.group.is_empty() {
+            self.version.clone()
+        } else {
+            format!("{}/{}", self.group, self.version)
+        }
+    }
+
     pub fn key_prefix(&self) -> String {
         format!("{}/{}/{}", self.group, self.version, self.resource)
     }
@@ -44,6 +60,9 @@ impl GroupVersionResource {
     pub fn service_accounts() -> Self {
         Self::new("", "v1", "serviceaccounts")
     }
+    pub fn events() -> Self {
+        Self::new("", "v1", "events")
+    }
     pub fn resource_quotas() -> Self {
         Self::new("", "v1", "resourcequotas")
     }
@@ -71,6 +90,15 @@ impl GroupVersionResource {
     }
     pub fn daemon_sets() -> Self {
         Self::new("apps", "v1", "daemonsets")
+    }
+    pub fn controller_revisions() -> Self {
+        Self::new("apps", "v1", "controllerrevisions")
+    }
+    pub fn replication_controllers() -> Self {
+        Self::new("", "v1", "replicationcontrollers")
+    }
+    pub fn pod_disruption_budgets() -> Self {
+        Self::new("policy", "v1", "poddisruptionbudgets")
     }
 
     pub fn ingresses() -> Self {
@@ -106,4 +134,14 @@ pub struct ResourceType {
     pub subresources: Vec<String>,
     /// OpenAPI v3 schema for validation; `None` if the kind has no schema.
     pub schema: Option<serde_json::Value>,
+    /// Store coordinate shared with the other served versions of a CRD;
+    /// `None` stores under `gvr`.
+    pub storage_gvr: Option<GroupVersionResource>,
+}
+
+impl ResourceType {
+    /// Where objects of this type live in the store.
+    pub fn storage_gvr(&self) -> &GroupVersionResource {
+        self.storage_gvr.as_ref().unwrap_or(&self.gvr)
+    }
 }

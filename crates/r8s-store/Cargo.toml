@@ -8,6 +8,8 @@ r8s-types.workspace = true
 
 redb.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 rustc-hash.workspace = true

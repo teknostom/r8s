@@ -288,21 +288,14 @@ fn compute_chain_id(diff_ids: &[String]) -> anyhow::Result<String> {
 fn build_container_mounts(
     config: &ContainerConfig,
     data_dir: &std::path::Path,
+    hostname: &str,
 ) -> anyhow::Result<Vec<OciMount>> {
     let mut mounts = get_default_mounts();
-    let pod_name = config.pod_name.as_str();
 
     let resolv_dir = data_dir.join("resolv");
     std::fs::create_dir_all(&resolv_dir)?;
     let resolv_path = resolv_dir.join(format!("{}.conf", config.name));
-    // 10.244.0.1 = r8s_types::NODE_INTERNAL_IP, inlined to avoid the dep.
-    std::fs::write(
-        &resolv_path,
-        format!(
-            "nameserver 10.244.0.1\nsearch {ns}.svc.cluster.local svc.cluster.local cluster.local\noptions ndots:5\n",
-            ns = config.namespace,
-        ),
-    )?;
+    std::fs::write(&resolv_path, config.dns.render())?;
     mounts.push(
         MountBuilder::default()
             .destination("/etc/resolv.conf")
@@ -312,14 +305,17 @@ fn build_container_mounts(
             .build()?,
     );
 
-    // /etc/hosts: map localhost and the pod hostname.
-    let hosts_dir = data_dir.join("hosts");
-    std::fs::create_dir_all(&hosts_dir)?;
-    let hosts_path = hosts_dir.join(format!("{}.hosts", config.name));
-    std::fs::write(
-        &hosts_path,
-        format!("127.0.0.1\tlocalhost\n::1\tlocalhost\n127.0.0.1\t{pod_name}\n"),
-    )?;
+    // /etc/hosts: the kubelet-managed file, as upstream writes it; a
+    // hostNetwork pod sees the host's own.
+    let hosts_path = if config.host_network {
+        std::path::PathBuf::from("/etc/hosts")
+    } else {
+        let hosts_dir = data_dir.join("hosts");
+        std::fs::create_dir_all(&hosts_dir)?;
+        let hosts_path = hosts_dir.join(format!("{}.hosts", config.name));
+        std::fs::write(&hosts_path, managed_hosts_file(config, hostname))?;
+        hosts_path
+    };
     mounts.push(
         MountBuilder::default()
             .destination("/etc/hosts")
@@ -328,6 +324,31 @@ fn build_container_mounts(
             .options(vec!["rbind".into(), "ro".into()])
             .build()?,
     );
+
+    // The termination message file: the container writes it, the kubelet
+    // reads it after exit. World-writable so a non-root process can.
+    if let Some(dest) = config
+        .termination_message_path
+        .as_deref()
+        .filter(|p| !p.is_empty())
+    {
+        let term_dir = data_dir.join("termination");
+        std::fs::create_dir_all(&term_dir)?;
+        let term_path = term_dir.join(format!("{}.log", config.name));
+        std::fs::write(&term_path, b"")?;
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&term_path, std::fs::Permissions::from_mode(0o666))?;
+        }
+        mounts.push(
+            MountBuilder::default()
+                .destination(dest)
+                .source(term_path)
+                .typ("bind")
+                .options(vec!["rbind".into(), "rw".into()])
+                .build()?,
+        );
+    }
 
     mounts.push(
         MountBuilder::default()
@@ -354,6 +375,45 @@ fn build_container_mounts(
     }
 
     Ok(mounts)
+}
+
+/// The `/etc/hosts` upstream's kubelet manages: loopback names, the pod's
+/// own address and hostname, then the hostAliases.
+fn managed_hosts_file(config: &ContainerConfig, hostname: &str) -> String {
+    let mut out = String::from(
+        "# Kubernetes-managed hosts file.\n\
+         127.0.0.1\tlocalhost\n\
+         ::1\tlocalhost ip6-localhost ip6-loopback\n\
+         fe00::0\tip6-localnet\n\
+         fe00::0\tip6-mcastprefix\n\
+         fe00::1\tip6-allnodes\n\
+         fe00::2\tip6-allrouters\n",
+    );
+    match config.pod_ip.as_deref().filter(|ip| !ip.is_empty()) {
+        Some(ip) if !config.subdomain.is_empty() => out.push_str(&format!(
+            "{ip}\t{hostname}.{}.{}.svc.cluster.local\t{hostname}\n",
+            config.subdomain, config.namespace
+        )),
+        Some(ip) => out.push_str(&format!("{ip}\t{hostname}\n")),
+        None => out.push_str(&format!("127.0.0.1\t{hostname}\n")),
+    }
+    if !config.host_aliases.is_empty() {
+        out.push_str("\n# Entries added by HostAliases.\n");
+        for (ip, names) in &config.host_aliases {
+            out.push_str(&format!("{ip}\t{}\n", names.join("\t")));
+        }
+    }
+    out
+}
+
+/// The termination message file of a container, if the runtime made one.
+pub fn termination_message_file(
+    data_dir: &std::path::Path,
+    container_name: &str,
+) -> std::path::PathBuf {
+    data_dir
+        .join("termination")
+        .join(format!("{container_name}.log"))
 }
 
 #[allow(clippy::disallowed_types)] // oci_spec Capabilities requires std HashSet
@@ -416,6 +476,7 @@ fn build_oci_spec(
     ]
     .into_iter()
     .collect::<std::collections::HashSet<_>>();
+    let default_caps = effective_capabilities(config, default_caps);
     // Ambient caps survive the switch to a non-root user — a runAsUser != 0
     // process needs them to keep e.g. NET_BIND_SERVICE. Irrelevant for root.
     let ambient: std::collections::HashSet<Capability> = if config.run_as_user.unwrap_or(0) != 0 {
@@ -431,15 +492,21 @@ fn build_oci_spec(
         .ambient(ambient)
         .build()?;
 
-    let hostname = config.pod_name.as_str();
-    let mounts = build_container_mounts(config, data_dir)?;
+    let hostname = if config.host_network {
+        host_hostname().unwrap_or_else(|| config.pod_name.clone())
+    } else if config.hostname.is_empty() {
+        truncate_hostname(&config.pod_name)
+    } else {
+        config.hostname.clone()
+    };
+    let mounts = build_container_mounts(config, data_dir, &hostname)?;
 
     let spec = SpecBuilder::default()
-        .hostname(hostname)
+        .hostname(hostname.as_str())
         .root(
             RootBuilder::default()
                 .path("rootfs")
-                .readonly(false)
+                .readonly(config.read_only_root_fs)
                 .build()?,
         )
         .process({
@@ -448,6 +515,7 @@ fn build_oci_spec(
                 .env(env)
                 .cwd(cwd)
                 .terminal(false)
+                .no_new_privileges(config.no_new_privileges)
                 .capabilities(capabilities);
             if let Some(uid) = config.run_as_user {
                 pb = pb.user(
@@ -462,26 +530,41 @@ fn build_oci_spec(
         .mounts(mounts)
         .linux(
             LinuxBuilder::default()
-                .namespaces(vec![
-                    LinuxNamespaceBuilder::default()
-                        .typ(LinuxNamespaceType::Pid)
-                        .build()?,
-                    LinuxNamespaceBuilder::default()
-                        .typ(LinuxNamespaceType::Network)
-                        .build()?,
-                    LinuxNamespaceBuilder::default()
-                        .typ(LinuxNamespaceType::Ipc)
-                        .build()?,
-                    LinuxNamespaceBuilder::default()
-                        .typ(LinuxNamespaceType::Uts)
-                        .build()?,
-                    LinuxNamespaceBuilder::default()
-                        .typ(LinuxNamespaceType::Mount)
-                        .build()?,
-                    LinuxNamespaceBuilder::default()
-                        .typ(LinuxNamespaceType::Cgroup)
-                        .build()?,
-                ])
+                .namespaces({
+                    let mut namespaces = vec![
+                        LinuxNamespaceBuilder::default()
+                            .typ(LinuxNamespaceType::Pid)
+                            .build()?,
+                        LinuxNamespaceBuilder::default()
+                            .typ(LinuxNamespaceType::Ipc)
+                            .build()?,
+                        LinuxNamespaceBuilder::default()
+                            .typ(LinuxNamespaceType::Uts)
+                            .build()?,
+                        LinuxNamespaceBuilder::default()
+                            .typ(LinuxNamespaceType::Mount)
+                            .build()?,
+                        LinuxNamespaceBuilder::default()
+                            .typ(LinuxNamespaceType::Cgroup)
+                            .build()?,
+                    ];
+                    // No Network entry keeps the host's namespace.
+                    if !config.host_network {
+                        let mut network =
+                            LinuxNamespaceBuilder::default().typ(LinuxNamespaceType::Network);
+                        if let Some(path) = &config.netns_path {
+                            network = network.path(path.clone());
+                        }
+                        namespaces.push(network.build()?);
+                    }
+                    namespaces
+                })
+                .sysctl({
+                    #[allow(clippy::disallowed_types)] // oci_spec wants a std HashMap
+                    let sysctls: std::collections::HashMap<String, String> =
+                        config.sysctls.iter().cloned().collect();
+                    sysctls
+                })
                 .build()?,
         )
         .build()?;
@@ -489,7 +572,136 @@ fn build_oci_spec(
     Ok(serde_json::to_vec(&spec)?)
 }
 
+/// Every Linux capability, for privileged containers and `add: [ALL]`.
+const ALL_CAPABILITIES: [Capability; 41] = [
+    Capability::AuditControl,
+    Capability::AuditRead,
+    Capability::AuditWrite,
+    Capability::BlockSuspend,
+    Capability::Bpf,
+    Capability::CheckpointRestore,
+    Capability::Chown,
+    Capability::DacOverride,
+    Capability::DacReadSearch,
+    Capability::Fowner,
+    Capability::Fsetid,
+    Capability::IpcLock,
+    Capability::IpcOwner,
+    Capability::Kill,
+    Capability::Lease,
+    Capability::LinuxImmutable,
+    Capability::MacAdmin,
+    Capability::MacOverride,
+    Capability::Mknod,
+    Capability::NetAdmin,
+    Capability::NetBindService,
+    Capability::NetBroadcast,
+    Capability::NetRaw,
+    Capability::Perfmon,
+    Capability::Setgid,
+    Capability::Setfcap,
+    Capability::Setpcap,
+    Capability::Setuid,
+    Capability::SysAdmin,
+    Capability::SysBoot,
+    Capability::SysChroot,
+    Capability::SysModule,
+    Capability::SysNice,
+    Capability::SysPacct,
+    Capability::SysPtrace,
+    Capability::SysRawio,
+    Capability::SysResource,
+    Capability::SysTime,
+    Capability::SysTtyConfig,
+    Capability::Syslog,
+    Capability::WakeAlarm,
+];
+
+/// The default set adjusted by the security context: everything when
+/// privileged, else `capabilities.add` minus `capabilities.drop` (`ALL`
+/// understood in both).
+#[allow(clippy::disallowed_types)] // oci_spec Capabilities requires std HashSet
+fn effective_capabilities(
+    config: &ContainerConfig,
+    defaults: std::collections::HashSet<Capability>,
+) -> std::collections::HashSet<Capability> {
+    use std::str::FromStr;
+    if config.privileged {
+        return ALL_CAPABILITIES.into_iter().collect();
+    }
+    let parse = |name: &str| {
+        let name = name.trim_start_matches("CAP_").to_ascii_uppercase();
+        Capability::from_str(&name).ok()
+    };
+    let mut caps = defaults;
+    for name in &config.cap_add {
+        if name.eq_ignore_ascii_case("ALL") {
+            caps.extend(ALL_CAPABILITIES);
+        } else if let Some(cap) = parse(name) {
+            caps.insert(cap);
+        }
+    }
+    for name in &config.cap_drop {
+        if name.eq_ignore_ascii_case("ALL") {
+            caps.clear();
+        } else if let Some(cap) = parse(name) {
+            caps.remove(&cap);
+        }
+    }
+    caps
+}
+
+/// At most 63 characters, without a trailing `-` or `.`, as upstream's
+/// kubelet truncates pod hostnames (the kernel allows 64 bytes).
+pub fn truncate_hostname(name: &str) -> String {
+    let mut out: String = name.chars().take(63).collect();
+    while out.ends_with(['-', '.']) {
+        out.pop();
+    }
+    out
+}
+
+/// The node's hostname, which hostNetwork pods take as their own.
+fn host_hostname() -> Option<String> {
+    std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 impl ContainerRuntime for ContainerdRuntime {
+    fn exit_events(&self) -> Option<tokio::sync::mpsc::Receiver<()>> {
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let channel = self.channel.clone();
+        tokio::spawn(async move {
+            let filter = format!(r#"topic=="/tasks/exit",namespace=="{NAMESPACE}""#);
+            while !tx.is_closed() {
+                let req = SubscribeRequest {
+                    filters: vec![filter.clone()],
+                };
+                match events_client::EventsClient::new(channel.clone())
+                    .subscribe(req)
+                    .await
+                {
+                    Ok(resp) => {
+                        let mut stream = resp.into_inner();
+                        while let Ok(Some(_)) = stream.message().await {
+                            // A full channel already has a pass pending.
+                            if let Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) =
+                                tx.try_send(())
+                            {
+                                return;
+                            }
+                        }
+                    }
+                    Err(e) => tracing::warn!("containerd exit events: {e}"),
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+        });
+        Some(rx)
+    }
+
     async fn has_image(&self, image: &str) -> bool {
         let full_ref = normalize_image_ref(image);
         let req = GetImageRequest { name: full_ref };
@@ -641,7 +853,9 @@ impl ContainerRuntime for ContainerdRuntime {
                     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                 }
                 Err(e) => {
-                    return Err(anyhow::anyhow!("snapshot '{}' not found after 10s: {e}", id.0).into());
+                    return Err(
+                        anyhow::anyhow!("snapshot '{}' not found after 10s: {e}", id.0).into(),
+                    );
                 }
             }
         }
@@ -870,6 +1084,38 @@ impl ContainerRuntime for ContainerdRuntime {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn hosts_file_names_the_pod_fqdn_under_its_subdomain() {
+        use super::managed_hosts_file;
+        use crate::ContainerConfig;
+        let config = ContainerConfig {
+            namespace: "ns".into(),
+            pod_ip: Some("10.244.0.5".into()),
+            subdomain: "dns-test-service".into(),
+            ..Default::default()
+        };
+        let hosts = managed_hosts_file(&config, "dns-querier-1");
+        assert!(hosts.contains(
+            "10.244.0.5\tdns-querier-1.dns-test-service.ns.svc.cluster.local\tdns-querier-1\n"
+        ));
+        let plain = ContainerConfig {
+            pod_ip: Some("10.244.0.5".into()),
+            ..Default::default()
+        };
+        assert!(managed_hosts_file(&plain, "web-0").contains("10.244.0.5\tweb-0\n"));
+    }
+
+    #[test]
+    fn hostnames_fit_the_kernel_limit() {
+        use super::truncate_hostname;
+        assert_eq!(truncate_hostname("web-0"), "web-0");
+        let long = format!("{}-{}", "a".repeat(62), "b".repeat(10));
+        let cut = truncate_hostname(&long);
+        assert_eq!(cut.len(), 62);
+        assert!(!cut.ends_with('-'));
+        assert_eq!(truncate_hostname(&"x".repeat(70)).len(), 63);
+    }
+
     use super::{compute_chain_id, normalize_image_ref, task_lookup_err};
     use crate::error::RuntimeError;
     use containerd_client::tonic::Status;

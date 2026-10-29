@@ -4,9 +4,9 @@ use crate::error::{Result, StoreError};
 /// type key and the field path. The store is type-agnostic; the default
 /// supplies nothing, and a distribution injects this to mirror its own API
 /// defaulting (see [`FieldSelector::with_defaults`]).
-pub type FieldDefaults = fn(&str, &str) -> Option<String>;
+pub type FieldDefaults = fn(&serde_json::Value, &str, &str) -> Option<String>;
 
-fn no_field_defaults(_gvr: &str, _field: &str) -> Option<String> {
+fn no_field_defaults(_object: &serde_json::Value, _gvr: &str, _field: &str) -> Option<String> {
     None
 }
 
@@ -193,7 +193,7 @@ impl FieldSelector {
     /// to it.
     pub fn matches(&self, object: &serde_json::Value, gvr: &str) -> bool {
         let value =
-            |field: &str| extract_field(object, field).or_else(|| (self.defaults)(gvr, field));
+            |field: &str| extract_field(object, field).or_else(|| (self.defaults)(object, gvr, field));
         self.requirements.iter().all(|req| match req {
             FieldRequirement::Equals(field, expected) => value(field).as_deref() == Some(expected.as_str()),
             FieldRequirement::NotEquals(field, expected) => value(field).as_deref() != Some(expected.as_str()),
